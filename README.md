@@ -1,246 +1,137 @@
-This is a modified fork of **mspeedo** shader for G8 G85SB (should work for other 3rd gen TB400 QDs in Peak1000) to include color preserving boost slider. EOTF_BoostMod1.5.
+# EOTF Boost for the Philips Evnia 27M2N6500
 
-Second version made for Aorus FO32U/2/2P QD-OLED based on approximated and aggregated values from TFT review. Ramped down from high values. Based on F03/4 firmware, newer firmware may not behave identically. This should be somewhat accurate if your Windows Calibration Tool clips at 1080 nits. EOTF_BoostMod1.5_FO32.
+This ReShade shader offsets the automatic brightness limiter (ABL) of the **Philips Evnia 27M2N6500**, a 27-inch 1440p third-generation QD-OLED monitor, in **HDR Peak 1000** mode.
 
-19/07/26 - 3.0 Update to rolling full frame method by mspeedo, values adjusted for TB400/Peak1000 OLEDs. Minor fixes and changes. Merged FO32 and regular into a single shader, further updates will be based on this.
+QD-OLED panels get dimmer when a large part of the screen is bright. On this monitor, a small highlight reaches about 1060 nits, but a full white screen reaches only about 270 nits. The shader measures how bright each frame is and raises the HDR signal by the amount the panel is expected to dim, so bright scenes keep their intended brightness. It works much like the "EOTF Boost" option on some MSI QD-OLED monitors.
 
-# EOTF Boost for QD-OLED
+The shader file is [`Shaders/EOTF_BoostMod2.0_27M2N6500.fx`](Shaders/EOTF_BoostMod2.0_27M2N6500.fx).
 
-This shader is based on the original [QD-OLED-APL-FIXER](https://github.com/DespairArdor/QD-OLED-APL-FIXER) project by **DespairArdor**.
+## Calibration target
 
-This fork is VIBECODED.
+The built-in data matches this setup:
 
-This version is made for **QD-OLED monitors running in Peak 1000 / High Brightness mode**, and it is **modeled around the measured behavior of the specific monitor (Samsung Odyssey OLED G8 G85SB)**.
+| Setting | Value |
+|---|---|
+| Monitor | Philips Evnia 27M2N6500 |
+| Monitor HDR mode | HDR Peak 1000 |
+| Windows HDR | On |
+| Windows HDR Calibration app | 1060 nits |
 
-It is meant to help compensate for the stronger brightness limiting / ABL behavior that happens in this mode, especially in brighter HDR scenes.
+Other monitors and other HDR modes dim in a different way, so on them the shader boosts too much or too little. To use it with another display, replace the measured data as described in [Adapting to another monitor](#adapting-to-another-monitor).
 
-## What this shader does
+## Requirements
 
-OLED displays can look very bright in small highlights, but they often get dimmer when a large part of the screen is bright at the same time.
+- A game that outputs HDR as either HDR10 (PQ) or scRGB.
+- ReShade with its standard shader package, which provides `ReShade.fxh`.
+- A game that runs on DirectX 11, DirectX 12, or Vulkan. The shader uses compute shaders, which ReShade does not support on DirectX 9 or 10.
 
-This shader helps counter that by applying a controlled HDR brightness boost based on **real measured APL behavior**, instead of using a simple generic HDR boost.
+## Installation
 
-In simple terms, the shader looks at how bright the overall scene is, then adjusts the boost based on that scene brightness level.
+1. Install ReShade for the game and include the standard effects package.
+2. Copy `EOTF_BoostMod2.0_27M2N6500.fx` into the game's `reshade-shaders\Shaders` folder.
+3. Open the ReShade overlay and turn on **EOTF_Boost_1D_APL_LUT**.
+4. Move it to the bottom of the effect list, so it works on the final image that the monitor receives.
 
-## Important
+The default settings match the calibration target, so most setups need no changes.
 
-This shader is designed for **Peak 1000 / High Brightness mode** on **QD-OLED monitors**.
+## How it works
 
-It is **not a universal preset for every display**. Even if it may still be usable on other QD-OLED screens, the built-in behavior is specifically modeled around the specific monitor.
+1. **Measure the scene.** The shader builds a brightness histogram of the full frame. To save GPU time, it refreshes one of six groups of rows each frame and keeps the rest from earlier frames. From the histogram, it finds the average picture level (APL) and the scene's highlight peak. The highlight peak is the level that only the brightest 1/256 of the frame's light sits above.
+2. **Look up the compensation.** A measured table tells how much the panel dims at each APL. For example, at 25% APL the panel reaches 370 nits instead of 1060, so the scene needs about 2.86 times more signal.
+3. **Account for its own boost.** Boosting the image raises the APL, and a higher APL makes the panel dim even more. The shader solves for the APL that the panel will actually see after the boost and picks the gain from that.
+4. **Smooth the change.** The APL and the highlight peak change gradually over time, so the brightness does not jump between frames.
+5. **Apply the boost.** Shadows and midtones get the full gain. Near the top, the gain eases out in PQ space through two soft shoulders. The first shoulder leads up to the scene's highlight peak and keeps part of its contrast, set by **Highlight Contrast**. The second shoulder handles rarer, brighter content and any color channel that nears the panel peak, so they compress instead of clipping.
 
-## Monitor data used in this shader
+Luma drives the boost, and all three color channels scale by the same amount, so colors keep their hue. The shader never makes any part of the image darker than the source.
 
-The shader includes built-in measured brightness data for this monitor, including approximately:
+The analysis runs only while the boost or the stats display is on.
 
-- **100% screen / full field:** 252 nits
-- **50% window:** 299 nits
-- **25% window:** 356 nits
-- **15% window:** 408 nits
-- **10% window:** 465 nits
+## Measured data
 
-It also includes built-in APL compensation points from **3% to 50% APL**.
+The compensation for each APL equals the 1060-nit peak divided by the peak that the panel reaches at that APL.
 
-## Recommended starting settings
+| APL | Measured peak (nits) | Compensation |
+|---:|---:|---:|
+| 3% | 1060 | 1.000 |
+| 5% | 800 | 1.325 |
+| 7% | 590 | 1.797 |
+| 10% | 490 | 2.163 |
+| 14% | 440 | 2.409 |
+| 18% | 420 | 2.524 |
+| 22% | 410 | 2.585 |
+| 25% | 370 | 2.865 |
+| 35% | 350 | 3.029 |
+| 50% | 320 | 3.313 |
 
-These are the default settings in this release and are a good place to start:
+Between these points, the shader interpolates in a straight line. Above 50% APL, it keeps the 50% value.
 
-- **APL Input Mode:** PQ Decoded Normalized
-- **APL_DECODE_SIZE:** 32
-- **APL Reference White (nits):** 1000
-- **APL Trigger:** 0.00
-- **Max APL Boost Strength:** 0.4
-- **Boost roll off end:** 1000
-- **BT.2390 roll off shape:** 1.25
-- **Shadow Protection Floor:** 1.0
-- **APL Smoothing Time (s):** 0.25
-- **Saturation Compensation:** 1.0
+## Settings
 
-## Shader controls guide
+| Setting | Default | What it does |
+|---|---|---|
+| Enable EOTF Boost | On | Turns the brightness compensation on or off. |
+| Input Signal | Auto | Picks how to read the game's HDR output: **Auto**, **PQ (HDR10)**, or **scRGB**. Auto follows the format that ReShade reports and falls back to PQ. |
+| APL Reference White (nits) | 1060 | Sets the brightness that counts as 100% APL. Keep it at the calibrated peak. A higher value makes scenes read darker, which lowers the boost. |
+| Compensation Freeze APL % | 50 | Holds the compensation at its value for this APL in all brighter scenes. Lower values limit the boost in bright scenes. 0 turns the hold off, but the measured table still ends at 50%. |
+| Panel Peak (nits) | 1060 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
+| Highlight Contrast | 0.40 | Sets how much contrast the scene's highlights keep while the boost fades out. Lower values brighten bright midtones more, and higher values keep more separation between highlights. |
+| APL Smoothing Time (s) | 0.25 | Sets how long the shader takes to follow a change in scene brightness. Raise it if the brightness looks jumpy. 0 turns smoothing off. |
+| scRGB Signal Reference (nits) | 80 | Sets the brightness of scRGB value 1.0. It only matters for scRGB games. |
+| Show APL Stats | Off | Shows live numbers in the top right corner. |
+| OSD Brightness | 0.5 | Sets the brightness of the stats display and the debug graph. It does not change the image. |
 
-### APL Input Mode
-Choose how the shader reads HDR brightness.
+The stats display has three rows:
 
-- **PQ Decoded Normalized** = correct for most HDR setups
-- **scRGB Normalized** = only use this if your HDR pipeline is scRGB
+| Row | Meaning |
+|---|---|
+| RAW APL | APL of the game's image before the boost. |
+| OUT APL | APL that the panel sees after the boost, as solved and smoothed by the shader. |
+| RAW NITS | Highest luma in the game's image, in nits. The shader tracks it only while the stats display is on. |
 
-For most users, leave this on **PQ Decoded Normalized**.
+## Preprocessor definitions
 
-### APL_DECODE_SIZE
-Controls how many points the shader checks to estimate overall screen brightness.
+These options are set in the ReShade overlay, in the shader's preprocessor definitions.
 
-- **Higher value** = more stable result
-- **Lower value** = a little lighter to run, but less stable
+| Definition | Default | What it does |
+|---|---|---|
+| `APL_FULLFRAME_ROLLING_PHASES` | 6 | Splits the histogram rows into this many groups and refreshes one group per frame. 0 refreshes every row each frame, which costs more GPU time. |
+| `PQHDRLUT_ENABLE` | 0 | 1 adds a 3D calibration LUT that runs after the boost. |
+| `PQHDRLUT_SIZE` | 65 | Sets the edge size of the calibration LUT. |
+| `ENABLE_APL_GRAPH` | 0 | 1 adds a debug graph of the boost curve. |
+| `ENABLE_UI_TOOLTIPS` | 0 | 1 adds a tooltip to each setting. |
 
-Default **32** is a good choice.
+### Calibration LUT
 
-### APL Reference White (nits)
-Controls how the shader judges overall scene brightness. 
+With `PQHDRLUT_ENABLE=1`, the shader loads `PQHDRLUT.cube` from ReShade's texture folders and adds an **Enable PQ HDR LUT** setting. The LUT takes and returns PQ-encoded Rec.2020 values. It runs on the boosted signal, or on the plain signal when the boost is off. For scRGB games, the shader converts the image to PQ Rec.2020 before the LUT and back after it.
 
-- **Higher value** = boost feels more conservative
-- **Lower value** = boost feels more aggressive
+### Debug graph
 
-Default **1000** is the intended starting point for this shader.
+With `ENABLE_APL_GRAPH=1`, the shader can draw a graph of input nits against output nits. It shows the identity line, the measured panel response, the boosted signal, the predicted panel output, and an optional BT.2390-style reference curve. The graph can use either a fixed APL or a measured window size of 100%, 50%, 25%, 15%, or 10%. It is a tuning aid and does not change the image.
 
-### APL Trigger
-Controls when the shader starts kicking in.
+The graph's 2D compensation table and window curves come from earlier measurements of the Samsung Odyssey OLED G8 (G85SB), not of the 27M2N6500. The live boost does not use them.
 
-- **Lower value** = boost starts earlier
-- **Higher value** = boost waits for brighter scenes
+## Adapting to another monitor
 
-Default is **0.00**, so the effect can work across the full range.
+The live boost depends on two arrays in the shader:
 
-### Max APL Boost Strength
-This is the main strength slider.
+- `APL_ANCHOR_POINTS` lists the APL values in percent, in ascending order.
+- `COMP_APL_1D` lists the compensation for each of those APL values.
 
-- **Higher value** = stronger brightness boost
-- **Lower value** = weaker effect
+To retune the shader for another monitor:
 
-If you only change one setting, this is usually the first one to try. I do not recommend values above 0.4 for 1000nit content, otherwise there is too much compression of HDR input vs real monitor brightness output, which causes overblown highlights.
+1. Measure the panel's peak brightness at each APL, starting with a window small enough to reach the full peak.
+2. Divide the full peak by each measurement to get the compensation values. The first value should be 1.0.
+3. Replace both arrays. They must have the same number of entries, which `APL_ANCHOR_COUNT` sets.
+4. Set **APL Reference White** and **Panel Peak** to the panel's peak, and use the same peak in the Windows HDR Calibration app.
 
-### Boost roll off end
-This sets the **target max nits for highlight roll-off**.
+## Credits
 
-For this preset, **1000 nits** is the intended starting point because it is designed for **Peak 1000 / High Brightness mode**.
+This shader builds on earlier work:
 
-- **Higher value** = brighter highlights
-- **Lower value** = safer highlight control
+- [DespairArdor/QD-OLED-APL-FIXER](https://github.com/DespairArdor/QD-OLED-APL-FIXER) is the original APL compensation shader.
+- [mspeedo/QD-OLED-APL-FIXER](https://github.com/mspeedo/QD-OLED-APL-FIXER) modeled it on measurements of the Samsung Odyssey OLED G8 (G85SB) in Peak 1000 mode and added the rolling full-frame histogram.
+- [shansolox/QD-OLED-APL-FIXER](https://github.com/shansolox/QD-OLED-APL-FIXER) added the color-preserving boost and versions for the Aorus FO32U/2/2P and other TB400 QD-OLED monitors. This shader starts from its v8.18.7.14F version.
 
-In simple terms: this should match the HDR peak target you want the shader to roll into.
+## License
 
-### BT.2390 roll off shape
-Controls how softly or strongly bright highlights are compressed near the top end.
-
-- **Lower value** = highlights stay brighter longer
-- **Higher value** = highlights are compressed earlier
-
-Default **1.25** is a good balanced setting.
-
-### Shadow Protection Floor
-Controls how much of the boost is allowed into darker parts of the image.
-
-- **Higher value** = more full-image boosting
-- **Lower value** = more protection for dark areas
-
-Lower it if dark scenes start looking too lifted.
-
-### APL Smoothing Time (s)
-Controls how quickly the shader reacts when scene brightness changes.
-
-- **Higher value** = slower, smoother changes
-- **Lower value** = faster reaction
-
-A higher value can help reduce visible brightness flicker caused by the shader when scenes change quickly.
-
-### Saturation Compensation
-Adjusts color intensity after brightness is boosted.
-
-- **1.0** = neutral
-- **Higher value** = stronger color
-- **Lower value** = less color intensity
-
-Leave it at **1.0** unless colors look too weak or too strong after boosting.
-
-### scRGB Signal Reference (nits)
-Only matters if you use **scRGB Normalized** mode.
-
-Most users can ignore this.
-
-### Show APL / Metric Stats
-Shows a small on-screen info display with live shader values.
-
-This is optional and not needed for normal use.
-
-### OSD Brightness
-Changes the brightness of the on-screen info display only.
-
-It does **not** change the shader effect itself.
-
-## Simple tuning tips
-
-- Want a stronger effect? Increase **Max APL Boost Strength**
-- Highlights look wrong? Check **BT.2390 roll off shape** first
-- Shadows look too lifted? Lower **Shadow Protection Floor**
-- Image brightness changes feel too twitchy or flickery? Increase **APL Smoothing Time**
-
-## Using measurements from another monitor
-
-This shader can be adapted to another **QD-OLED** if you have your own measured APL behavior.
-
-### What data you need
-
-For the **live boost logic**, the most important data is a **1D APL compensation LUT**:
-
-- a list of **APL points** in percent  
-  example: `3, 5, 7, 10, 14, 18, 22, 25, 35, 50`
-- a matching list of **compensation values** for those APL points  
-  example: `1.0, 1.35, 1.67, ...`
-
-In this shader, those are stored in:
-
-- `APL_POINTS`
-- `COMP_APL_1D`
-
-### What the compensation values mean
-
-The compensation values describe how much darker the monitor measured than the requested HDR target at a given APL.
-
-- **1.0** = no compensation needed
-- **Higher than 1.0** = the monitor dimmed more, so the shader boosts more
-
-### If you only have a larger 2D measurement table
-
-This shader’s live path does **not** use the full 2D table directly.
-
-Instead, it uses a **collapsed 1D LUT** made from one representative value per APL row.
-
-So if you measured another monitor with a 2D table, the easiest way to adapt this shader is:
-
-1. Keep your chosen APL points
-2. Pick one representative compensation value for each APL row
-3. Replace the values in `COMP_APL_1D`
-4. Keep the values in ascending APL order
-5. Make sure both arrays have the same number of entries
-
-### Minimum changes needed for another monitor
-
-For basic retuning, you only need to replace:
-
-- `APL_POINTS`
-- `COMP_APL_1D`
-- `COMP_MAX`
-
-That is enough to change the shader’s live APL-based boosting behavior.
-
-### Optional extra data
-
-The shader also contains built-in full-field / window measurement data for specific monitor:
-
-- **100% window**
-- **50% window**
-- **25% window**
-- **15% window**
-- **10% window**
-
-These are useful if you also want the built-in model or graph overlays to better match another monitor.
-
-But for simple live retuning, the main thing you need is the **1D APL LUT**.
-
-## Graphs
-
-This shader can also include an optional **APL EOTF debug graph**.
-
-The graph is only for analysis and tuning. It is not needed for normal use.
-
-It can show:
-
-- a normal **APL-based curve view** for a selected APL value
-- or a **window projection view** using the built-in **100%, 50%, 25%, 15%, or 10%** window measurements
-
-
-## Final note
-
-This shader is designed for **QD-OLED Peak 1000 / High Brightness mode**, and this specific preset is modeled around the specific monitor.
-
-It is not meant as a one-size-fits-all HDR preset, but it can be adapted for other displays if you have matching measured APL data.
-
-
+This project uses the MIT License. See [LICENSE](LICENSE).

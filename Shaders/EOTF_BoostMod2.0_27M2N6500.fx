@@ -1,7 +1,7 @@
 /*
     EOTF Boost v8.18.7.14F
     Calibrated for 27" 1440p 3rd-gen QD-OLED in HDR Peak 1000 mode,
-    with the Windows HDR Calibration Tool set to 1060 nits.
+    with a 1015 nit panel peak as reported by the monitor's EDID.
 
     Compensates the panel's APL-dependent dimming (ABL) from a measured 1D table.
 
@@ -167,7 +167,7 @@ uniform float APLReferenceWhiteNits <
     ui_min = 10.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "APL Reference White (nits)";
     UI_TOOLTIP("Sets the luminance represented by 100% APL.")
-> = 1060.0;
+> = 1015.0;
 
 uniform float CompensationFreezeAPLPercent <
     ui_type = "slider";
@@ -181,7 +181,7 @@ uniform float PanelPeakNits <
     ui_min = 0.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "Panel Peak (nits)";
     UI_TOOLTIP("Peak signal the boost eases into. Boosted content never exceeds it, and content above it passes through untouched. 0 disables highlight protection.")
-> = 1060.0;
+> = 1015.0;
 
 uniform float HighlightContrast <
     ui_type = "slider";
@@ -965,29 +965,26 @@ float SegmentLerp(float x, float x0, float y0, float x1, float y1)
     return lerp(y0, y1, Remap01(x, x0, x1));
 }
 
-// Measured APL anchors shared by the compensation table and the graph.
-static const int APL_ANCHOR_COUNT = 10;
+// Measured APL anchors of the compensation table.
+static const int APL_ANCHOR_COUNT = 7;
 
 static const float APL_ANCHOR_POINTS[APL_ANCHOR_COUNT] =
 {
-    3.000000, 5.000000, 7.000000, 10.000000, 14.000000, 18.000000, 22.000000, 25.000000, 35.000000, 50.000000
+    2.000000, 5.000000, 10.000000, 25.000000, 50.000000, 75.000000, 100.000000
 };
 
 
-// Measured 1D compensation for the 10 APL anchors above, taken as the ratio of
-// the 1060 nit peak reached at 3% APL to the window peak measured at each anchor.
+// 1D compensation: the 1060 nit peak at 2% APL divided by the peak at each anchor,
+// measured by TFTCentral on the Dell Alienware AW2725DF (same panel, HDR Peak 1000, FW M2B102).
 static const float COMP_APL_1D[APL_ANCHOR_COUNT] =
 {
-    1.000000, // 3%  (1060 nits)
-    1.325000, // 5%  (800 nits)
-    1.796610, // 7%  (590 nits)
-    2.163265, // 10% (490 nits)
-    2.409091, // 14% (440 nits)
-    2.523810, // 18% (420 nits)
-    2.585366, // 22% (410 nits)
-    2.864865, // 25% (370 nits)
-    3.028571, // 35% (350 nits)
-    3.312500  // 50% (320 nits)
+    1.000000, // 2%   (1060 nits)
+    1.362468, // 5%   (778 nits)
+    2.217573, // 10%  (478 nits)
+    2.796834, // 25%  (379 nits)
+    3.322884, // 50%  (319 nits)
+    3.680556, // 75%  (288 nits)
+    3.925926  // 100% (270 nits)
 };
 
 
@@ -1240,6 +1237,14 @@ float SolveUniformSceneDisplayAPL(float rawAPL)
     return SolveClosedLoopDisplayAPLFromResponseNodes(safeRawAPL, responseNodes, gMax);
 }
 
+// APL rows of the measured 2D compensation table.
+static const int GRAPH_APL_COUNT = 10;
+
+static const float GRAPH_APL_POINTS[GRAPH_APL_COUNT] =
+{
+    3.000000, 5.000000, 7.000000, 10.000000, 14.000000, 18.000000, 22.000000, 25.000000, 35.000000, 50.000000
+};
+
 // Input levels of the measured 2D compensation table.
 static const int NIT_COUNT = 24;
 
@@ -1248,7 +1253,7 @@ static const float NIT_POINTS[NIT_COUNT] =
     10.302358, 13.132379, 16.611621, 20.870708, 26.064850, 32.378420, 40.030390, 49.280814, 60.438551, 73.870492, 90.012580, 109.383004, 132.598006, 160.390856, 193.634650, 233.369755, 280.836899, 337.517130, 405.180165, 485.942985, 587.341000, 707.414628, 845.814884, 1040.932391
 };
 
-static const float GRAPH_COMP_TABLE_2D[APL_ANCHOR_COUNT * NIT_COUNT] =
+static const float GRAPH_COMP_TABLE_2D[GRAPH_APL_COUNT * NIT_COUNT] =
 {
     1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
     1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000, 1.000000,
@@ -1507,16 +1512,25 @@ float LookupGraphCompForAPLRow2D(int aplIdx, float inputNits)
     );
 }
 
+int FindGraphAPLIndex(float aplPct)
+{
+    int idx = 0;
+    [unroll]
+    for (int i = 0; i < GRAPH_APL_COUNT - 1; ++i)
+        idx += int(step(GRAPH_APL_POINTS[i + 1], aplPct));
+    return min(idx, GRAPH_APL_COUNT - 2);
+}
+
 float LookupMeasuredComp2DGraph(float aplPct, float inputNits)
 {
-    float clampedAPL = clamp(aplPct, APL_ANCHOR_POINTS[0], APL_ANCHOR_POINTS[APL_ANCHOR_COUNT - 1]);
-    int a0 = FindAPLAnchorIndex(clampedAPL);
-    int a1 = min(a0 + 1, APL_ANCHOR_COUNT - 1);
+    float clampedAPL = clamp(aplPct, GRAPH_APL_POINTS[0], GRAPH_APL_POINTS[GRAPH_APL_COUNT - 1]);
+    int a0 = FindGraphAPLIndex(clampedAPL);
+    int a1 = min(a0 + 1, GRAPH_APL_COUNT - 1);
 
     return SegmentLerp(
         clampedAPL,
-        APL_ANCHOR_POINTS[a0], LookupGraphCompForAPLRow2D(a0, inputNits),
-        APL_ANCHOR_POINTS[a1], LookupGraphCompForAPLRow2D(a1, inputNits)
+        GRAPH_APL_POINTS[a0], LookupGraphCompForAPLRow2D(a0, inputNits),
+        GRAPH_APL_POINTS[a1], LookupGraphCompForAPLRow2D(a1, inputNits)
     );
 }
 

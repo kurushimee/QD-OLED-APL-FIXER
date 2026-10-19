@@ -2,7 +2,7 @@
 
 This ReShade shader offsets the automatic brightness limiter (ABL) of the **Philips Evnia 27M2N6500**, a 27-inch 1440p third-generation QD-OLED monitor, in **HDR Peak 1000** mode.
 
-QD-OLED panels get dimmer when a large part of the screen is bright. On this monitor, a small highlight reaches about 1060 nits, but a full white screen reaches only about 270 nits. The shader measures how bright each frame is and raises the HDR signal by the amount the panel is expected to dim, so bright scenes keep their intended brightness. It works much like the "EOTF Boost" option on some MSI QD-OLED monitors.
+QD-OLED panels get dimmer when a large part of the screen is bright. On this panel, a small highlight reaches the full peak of about 1000 nits, but a full white screen reaches only about a quarter of it. The shader measures how bright each frame is and raises the HDR signal by the amount the panel is expected to dim, so bright scenes keep their intended brightness. It works much like the "EOTF Boost" option on some MSI QD-OLED monitors.
 
 The shader file is [`Shaders/EOTF_BoostMod2.0_27M2N6500.fx`](Shaders/EOTF_BoostMod2.0_27M2N6500.fx).
 
@@ -15,7 +15,7 @@ The built-in data matches this setup:
 | Monitor | Philips Evnia 27M2N6500 |
 | Monitor HDR mode | HDR Peak 1000 |
 | Windows HDR | On |
-| Windows HDR Calibration app | 1060 nits |
+| Peak luminance in the Windows HDR color profile | 1015 nits, as the monitor's EDID reports |
 
 Other monitors and other HDR modes dim in a different way, so on them the shader boosts too much or too little. To use it with another display, replace the measured data as described in [Adapting to another monitor](#adapting-to-another-monitor).
 
@@ -37,7 +37,7 @@ The default settings match the calibration target, so most setups need no change
 ## How it works
 
 1. **Measure the scene.** The shader builds a brightness histogram of the full frame. To save GPU time, it refreshes one of six groups of rows each frame and keeps the rest from earlier frames. From the histogram, it finds the average picture level (APL) and the scene's highlight peak. The highlight peak is the level that only the brightest 1/256 of the frame's light sits above.
-2. **Look up the compensation.** A measured table tells how much the panel dims at each APL. For example, at 25% APL the panel reaches 370 nits instead of 1060, so the scene needs about 2.86 times more signal.
+2. **Look up the compensation.** A measured table tells how much the panel dims at each APL. For example, at 25% APL the panel reaches only about 36% of its peak, so the scene needs about 2.80 times more signal.
 3. **Account for its own boost.** Boosting the image raises the APL, and a higher APL makes the panel dim even more. The shader solves for the APL that the panel will actually see after the boost and picks the gain from that.
 4. **Smooth the change.** The APL and the highlight peak change gradually over time, so the brightness does not jump between frames.
 5. **Apply the boost.** Shadows and midtones get the full gain. Near the top, the gain eases out in PQ space through two soft shoulders. The first shoulder leads up to the scene's highlight peak and keeps part of its contrast, set by **Highlight Contrast**. The second shoulder handles rarer, brighter content and any color channel that nears the panel peak, so they compress instead of clipping.
@@ -48,22 +48,22 @@ The analysis runs only while the boost or the stats display is on.
 
 ## Measured data
 
-The compensation for each APL equals the 1060-nit peak divided by the peak that the panel reaches at that APL.
+The table comes from [TFTCentral's review of the Dell Alienware AW2725DF](https://tftcentral.co.uk/reviews/dell-alienware-aw2725df), measured in its HDR Peak 1000 mode on firmware M2B102. That monitor uses the same third-generation 27-inch 1440p QD-OLED panel, and each window size equals the APL. TFTCentral's [MSI MPG 271QRX measurements](https://tftcentral.co.uk/articles/testing-hdr400-true-black-and-peak-1000-mode-brightness-on-new-oled-monitors) on this panel match it within 2 nits from 5% to 100%.
 
-| APL | Measured peak (nits) | Compensation |
-|---:|---:|---:|
-| 3% | 1060 | 1.000 |
-| 5% | 800 | 1.325 |
-| 7% | 590 | 1.797 |
-| 10% | 490 | 2.163 |
-| 14% | 440 | 2.409 |
-| 18% | 420 | 2.524 |
-| 22% | 410 | 2.585 |
-| 25% | 370 | 2.865 |
-| 35% | 350 | 3.029 |
-| 50% | 320 | 3.313 |
+The compensation for each APL equals the 1060-nit peak at 2% APL divided by the peak at that APL. The last column scales each measured peak to this monitor's 1015-nit peak.
 
-Between these points, the shader interpolates in a straight line. Above 50% APL, it keeps the 50% value.
+| APL | Measured peak (nits) | Compensation | Expected on this monitor (nits) |
+|---:|---:|---:|---:|
+| 1% | 1001 | – | – |
+| 2% | 1060 | 1.000 | 1015 |
+| 5% | 778 | 1.362 | 745 |
+| 10% | 478 | 2.218 | 458 |
+| 25% | 379 | 2.797 | 363 |
+| 50% | 319 | 3.323 | 305 |
+| 75% | 288 | 3.681 | 276 |
+| 100% | 270 | 3.926 | 259 |
+
+The 1% window reads lower than the 2% window. ABL only dims the panel more as the APL grows, so the shader treats this dip as a separate limit on very small windows and gives no boost below 2% APL. Between the points, the shader interpolates in a straight line. Above the **Compensation Freeze APL %**, it keeps the value at that APL.
 
 ## Settings
 
@@ -71,9 +71,9 @@ Between these points, the shader interpolates in a straight line. Above 50% APL,
 |---|---|---|
 | Enable EOTF Boost | On | Turns the brightness compensation on or off. |
 | Input Signal | Auto | Picks how to read the game's HDR output: **Auto**, **PQ (HDR10)**, or **scRGB**. Auto follows the format that ReShade reports and falls back to PQ. |
-| APL Reference White (nits) | 1060 | Sets the brightness that counts as 100% APL. Keep it at the calibrated peak. A higher value makes scenes read darker, which lowers the boost. |
-| Compensation Freeze APL % | 50 | Holds the compensation at its value for this APL in all brighter scenes. Lower values limit the boost in bright scenes. 0 turns the hold off, but the measured table still ends at 50%. |
-| Panel Peak (nits) | 1060 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
+| APL Reference White (nits) | 1015 | Sets the brightness that counts as 100% APL. Keep it at the calibrated peak. A higher value makes scenes read darker, which lowers the boost. |
+| Compensation Freeze APL % | 50 | Holds the compensation at its value for this APL in all brighter scenes. Lower values limit the boost in bright scenes. 0 turns the hold off, so the boost follows the measured table up to 100% APL. |
+| Panel Peak (nits) | 1015 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
 | Highlight Contrast | 0.40 | Sets how much contrast the scene's highlights keep while the boost fades out. Lower values brighten bright midtones more, and higher values keep more separation between highlights. |
 | APL Smoothing Time (s) | 0.25 | Sets how long the shader takes to follow a change in scene brightness. Raise it if the brightness looks jumpy. 0 turns smoothing off. |
 | scRGB Signal Reference (nits) | 80 | Sets the brightness of scRGB value 1.0. It only matters for scRGB games. |
@@ -122,7 +122,7 @@ To retune the shader for another monitor:
 1. Measure the panel's peak brightness at each APL, starting with a window small enough to reach the full peak.
 2. Divide the full peak by each measurement to get the compensation values. The first value should be 1.0.
 3. Replace both arrays. They must have the same number of entries, which `APL_ANCHOR_COUNT` sets.
-4. Set **APL Reference White** and **Panel Peak** to the panel's peak, and use the same peak in the Windows HDR Calibration app.
+4. Set **APL Reference White** and **Panel Peak** to the panel's peak, and use the same peak in the Windows HDR color profile.
 
 ## Credits
 

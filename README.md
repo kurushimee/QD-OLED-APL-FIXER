@@ -124,6 +124,37 @@ To retune the shader for another monitor:
 3. Replace both arrays. They must have the same number of entries, which `APL_ANCHOR_COUNT` sets.
 4. Set **APL Reference White** and **Panel Peak** to the panel's peak, and use the same peak in the Windows HDR color profile.
 
+## Desktop-wide (DWM) version
+
+The ReShade shader only reaches a game that has ReShade installed. [`DwmBoost/`](DwmBoost) runs the same compensation on the **whole Windows 11 desktop** by hooking the desktop compositor (`dwm.exe`) and boosting each composed frame, the way [DesktopLUT](https://github.com/sup3rflyer/DesktopLUT) and the `dwm_lut` family do for desktop color calibration. It is meant for non-game desktop use; games keep using the ReShade shader. Its output matches the shader at its current default values.
+
+While the effect is on it forces DWM composition, which **disables variable refresh rate (VRR)**, so it is turned off for gaming. It applies only to the Philips 27M2N6500 (the 2560×1440 HDR monitor); other monitors are left untouched.
+
+A tray app injects a hook into `dwm.exe` and keeps it resident. Toggling is instant and reversible:
+
+- **Ctrl+Alt+Shift+End** turns the boost on.
+- **Ctrl+Alt+Shift+Home** turns it off, which reverts the composition patches so VRR returns.
+- The tray menu has **Enable**, **Disable**, **Install autostart task** (an elevated logon task, no per-launch prompt), and **Quit**. Quit ejects the hook cleanly.
+
+On a static desktop DWM stops composing, so the app nudges the monitor once per refresh with a 1 px corner window while the brightness is still settling (about 1.25 s after the last change), then stops. This keeps the ABL-fade compensation converging without a game running.
+
+The target panel and its build are pinned: the tool injects only into Windows 11 25H2 (build 26200 or later) and refuses to inject if any `dwmcore.dll` byte pattern it relies on is missing or ambiguous, which also guards against a future Windows update changing the compositor.
+
+### Building
+
+The build needs CMake, Ninja or Visual Studio 2022, the MSVC toolchain, and the Windows 10 SDK (for `fxc`). From `DwmBoost/`:
+
+```bash
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+```
+
+This produces `DwmBoost.exe` and `DwmBoostHook.dll` in `build/bin`. Keep the two together. The build regenerates `hook/boost_bytecode.h` from [`hook/boost.hlsl`](DwmBoost/hook/boost.hlsl) with `fxc`. MinHook (BSD-2) is vendored under `DwmBoost/third_party/minhook/` with its license.
+
+### Verification
+
+[`DwmBoost/verify/parity_check.py`](DwmBoost/verify/parity_check.py) checks the ported boost math against the shader's values: it confirms the baked compensation table matches the measured panel peaks, the closed-loop solver reaches the fixed point `gain = compensation(solved APL)` at every level, the boost never darkens, and midtones get the full gain. For a flat full-field frame the GPU histogram collapses to one APL, so this CPU mirror reproduces exactly what the compute passes compute for that frame. Run `python parity_check.py`.
+
 ## Credits
 
 This shader builds on earlier work:
@@ -131,6 +162,8 @@ This shader builds on earlier work:
 - [DespairArdor/QD-OLED-APL-FIXER](https://github.com/DespairArdor/QD-OLED-APL-FIXER) is the original APL compensation shader.
 - [mspeedo/QD-OLED-APL-FIXER](https://github.com/mspeedo/QD-OLED-APL-FIXER) modeled it on measurements of the Samsung Odyssey OLED G8 (G85SB) in Peak 1000 mode and added the rolling full-frame histogram.
 - [shansolox/QD-OLED-APL-FIXER](https://github.com/shansolox/QD-OLED-APL-FIXER) added the color-preserving boost and versions for the Aorus FO32U/2/2P and other TB400 QD-OLED monitors. This shader starts from its v8.18.7.14F version.
+
+The DWM hook under `DwmBoost/` is written from scratch to keep the MIT license. [DesktopLUT](https://github.com/sup3rflyer/DesktopLUT) (GPL-3.0) was read for facts and design — the compositor functions involved, the vtable walk, the clean-copy and static-desktop settling approach — but none of its source is copied.
 
 ## License
 

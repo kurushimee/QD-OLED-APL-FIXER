@@ -1,7 +1,7 @@
 /*
     EOTF Boost v8.18.7.14F
     Calibrated for 27" 1440p 3rd-gen QD-OLED in HDR Peak 1000 mode,
-    with a 1015 nit panel peak as reported by the monitor's EDID.
+    with a 1060 nit panel peak, the peak measured at 2% APL.
 
     Compensates the panel's APL-dependent dimming (ABL) from a measured 1D table.
 
@@ -167,7 +167,7 @@ uniform float APLReferenceWhiteNits <
     ui_min = 10.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "APL Reference White (nits)";
     UI_TOOLTIP("Sets the luminance represented by 100% APL.")
-> = 1015.0;
+> = 1060.0;
 
 uniform float CompensationFreezeAPLPercent <
     ui_type = "slider";
@@ -181,7 +181,7 @@ uniform float PanelPeakNits <
     ui_min = 0.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "Panel Peak (nits)";
     UI_TOOLTIP("Peak signal the boost eases into. Boosted content never exceeds it, and content above it passes through untouched. 0 disables highlight protection.")
-> = 1015.0;
+> = 1060.0;
 
 uniform float HighlightContrast <
     ui_type = "slider";

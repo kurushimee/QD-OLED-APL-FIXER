@@ -15,7 +15,7 @@ The built-in data matches this setup:
 | Monitor | Philips Evnia 27M2N6500 |
 | Monitor HDR mode | HDR Peak 1000 |
 | Windows HDR | On |
-| Peak luminance in the Windows HDR color profile | 1015 nits, as the monitor's EDID reports |
+| Peak luminance in the Windows HDR color profile | 1060 nits, the measured peak at 2% APL |
 
 Other monitors and other HDR modes dim in a different way, so on them the shader boosts too much or too little. To use it with another display, replace the measured data as described in [Adapting to another monitor](#adapting-to-another-monitor).
 
@@ -50,18 +50,18 @@ The analysis runs only while the boost or the stats display is on.
 
 The table comes from [TFTCentral's review of the Dell Alienware AW2725DF](https://tftcentral.co.uk/reviews/dell-alienware-aw2725df), measured in its HDR Peak 1000 mode on firmware M2B102. That monitor uses the same third-generation 27-inch 1440p QD-OLED panel, and each window size equals the APL. TFTCentral's [MSI MPG 271QRX measurements](https://tftcentral.co.uk/articles/testing-hdr400-true-black-and-peak-1000-mode-brightness-on-new-oled-monitors) on this panel match it within 2 nits from 5% to 100%.
 
-The compensation for each APL equals the 1060-nit peak at 2% APL divided by the peak at that APL. The last column scales each measured peak to this monitor's 1015-nit peak.
+The compensation for each APL equals the 1060-nit peak at 2% APL divided by the peak at that APL.
 
-| APL | Measured peak (nits) | Compensation | Expected on this monitor (nits) |
-|---:|---:|---:|---:|
-| 1% | 1001 | – | – |
-| 2% | 1060 | 1.000 | 1015 |
-| 5% | 778 | 1.362 | 745 |
-| 10% | 478 | 2.218 | 458 |
-| 25% | 379 | 2.797 | 363 |
-| 50% | 319 | 3.323 | 305 |
-| 75% | 288 | 3.681 | 276 |
-| 100% | 270 | 3.926 | 259 |
+| APL | Measured peak (nits) | Compensation |
+|---:|---:|---:|
+| 1% | 1001 | – |
+| 2% | 1060 | 1.000 |
+| 5% | 778 | 1.362 |
+| 10% | 478 | 2.218 |
+| 25% | 379 | 2.797 |
+| 50% | 319 | 3.323 |
+| 75% | 288 | 3.681 |
+| 100% | 270 | 3.926 |
 
 The 1% window reads lower than the 2% window. ABL only dims the panel more as the APL grows, so the shader treats this dip as a separate limit on very small windows and gives no boost below 2% APL. Between the points, the shader interpolates in a straight line. Above the **Compensation Freeze APL %**, it keeps the value at that APL.
 
@@ -71,9 +71,9 @@ The 1% window reads lower than the 2% window. ABL only dims the panel more as th
 |---|---|---|
 | Enable EOTF Boost | On | Turns the brightness compensation on or off. |
 | Input Signal | Auto | Picks how to read the game's HDR output: **Auto**, **PQ (HDR10)**, or **scRGB**. Auto follows the format that ReShade reports and falls back to PQ. |
-| APL Reference White (nits) | 1015 | Sets the brightness that counts as 100% APL. Keep it at the calibrated peak. A higher value makes scenes read darker, which lowers the boost. |
+| APL Reference White (nits) | 1060 | Sets the brightness that counts as 100% APL. Keep it at the calibrated peak. A higher value makes scenes read darker, which lowers the boost. |
 | Compensation Freeze APL % | 50 | Holds the compensation at its value for this APL in all brighter scenes. Lower values limit the boost in bright scenes. 0 turns the hold off, so the boost follows the measured table up to 100% APL. |
-| Panel Peak (nits) | 1015 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
+| Panel Peak (nits) | 1060 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
 | Highlight Contrast | 0.40 | Sets how much contrast the scene's highlights keep while the boost fades out. Lower values brighten bright midtones more, and higher values keep more separation between highlights. |
 | APL Smoothing Time (s) | 0.25 | Sets how long the shader takes to follow a change in scene brightness. Raise it if the brightness looks jumpy. 0 turns smoothing off. |
 | scRGB Signal Reference (nits) | 80 | Sets the brightness of scRGB value 1.0. It only matters for scRGB games. |

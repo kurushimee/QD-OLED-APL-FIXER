@@ -16,11 +16,9 @@ namespace {
 const UINT TILE_SIZE = 32;
 const UINT BLOCK_W = 16, BLOCK_H = 16;
 const UINT ROW_COUNT_W = BLOCK_W + 1;   // 17 (aux column unused here)
-const UINT TILE_COUNT_X = (2560 + TILE_SIZE - 1) / TILE_SIZE;   // 80
-const UINT TILE_COUNT_Y = (1440 + TILE_SIZE - 1) / TILE_SIZE;   // 45
 const UINT ROLLING_PHASES = 6;
-const UINT ROLLING_ROW_SLOTS = (TILE_COUNT_Y + ROLLING_PHASES - 1) / ROLLING_PHASES;  // 8
-const UINT ROW_TEX_H = TILE_COUNT_Y * BLOCK_H;   // 720
+
+UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
 
 const double SETTLE_HOLD_MS = 1400.0;   // ~5 smoothing time constants + the 6-phase histogram refill
 const double PRIME_MIN_GAP_MS = 1000.0;
@@ -31,6 +29,7 @@ std::atomic<uint32_t> g_resetGeneration{0};
 std::atomic<int>      g_monLeft{0}, g_monTop{0};
 std::atomic<uint32_t> g_monWidth{0}, g_monHeight{0};
 std::atomic<bool>     g_monHdr{false};
+std::atomic<float>    g_monRefreshMs{0.0f};
 
 std::atomic<long>     g_inFlight{0};
 Present_t             g_orig = nullptr;
@@ -128,12 +127,15 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     if (!s.ctx) { s.Release(); return false; }
     s.owner = owner; s.width = w; s.height = h;
 
+    const UINT tileCountY = TileCount(h);
+    const UINT rowTexH = tileCountY * BLOCK_H;
+
     bool ok = true;
     ok &= CreateTex(s.dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, s.clean);
-    ok &= CreateTex(s.dev, ROW_COUNT_W, ROW_TEX_H, DXGI_FORMAT_R32_SINT, true, true, s.rowCount);
-    ok &= CreateTex(s.dev, BLOCK_W, ROW_TEX_H, DXGI_FORMAT_R32_SINT, true, true, s.rowOffset);
-    ok &= CreateTex(s.dev, BLOCK_W, ROW_TEX_H, DXGI_FORMAT_R32_SINT, true, true, s.rowMaxNits);
-    ok &= CreateTex(s.dev, 1, TILE_COUNT_Y, DXGI_FORMAT_R32_SINT, true, true, s.rowMeta);
+    ok &= CreateTex(s.dev, ROW_COUNT_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowCount);
+    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowOffset);
+    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowMaxNits);
+    ok &= CreateTex(s.dev, 1, tileCountY, DXGI_FORMAT_R32_SINT, true, true, s.rowMeta);
     ok &= CreateTex(s.dev, ROW_COUNT_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, s.globalCount);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalOffset);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalMaxNits);
@@ -150,7 +152,7 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     ok &= SUCCEEDED(s.dev->CreatePixelShader(g_PS_Boost, sizeof(g_PS_Boost), nullptr, &s.psBoost));
 
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = 16; cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.ByteWidth = 32; cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     ok &= SUCCEEDED(s.dev->CreateBuffer(&cbd, nullptr, &s.cb));
 
@@ -176,7 +178,11 @@ struct StateBlock
     ID3D11UnorderedAccessView* csUav[8] = {};
     ID3D11Buffer* csCb[1] = {};
     ID3D11VertexShader* vs = nullptr;
+    ID3D11GeometryShader* gs = nullptr;
     ID3D11PixelShader* ps = nullptr;
+    ID3D11RasterizerState* rs = nullptr;
+    ID3D11BlendState* blend = nullptr; FLOAT blendFactor[4] = {}; UINT sampleMask = 0;
+    ID3D11DepthStencilState* depthStencil = nullptr; UINT stencilRef = 0;
     ID3D11ShaderResourceView* psSrv[8] = {};
     ID3D11InputLayout* layout = nullptr;
     D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
@@ -194,8 +200,12 @@ void SaveState(ID3D11DeviceContext* c, StateBlock& b)
     c->CSGetUnorderedAccessViews(0, 8, b.csUav);
     c->CSGetConstantBuffers(0, 1, b.csCb);
     c->VSGetShader(&b.vs, nullptr, nullptr);
+    c->GSGetShader(&b.gs, nullptr, nullptr);
     c->PSGetShader(&b.ps, nullptr, nullptr);
     c->PSGetShaderResources(0, 8, b.psSrv);
+    c->RSGetState(&b.rs);
+    c->OMGetBlendState(&b.blend, b.blendFactor, &b.sampleMask);
+    c->OMGetDepthStencilState(&b.depthStencil, &b.stencilRef);
     c->IAGetInputLayout(&b.layout);
     c->IAGetPrimitiveTopology(&b.topo);
     c->IAGetVertexBuffers(0, 1, &b.vb, &b.vbStride, &b.vbOffset);
@@ -213,8 +223,12 @@ void RestoreState(ID3D11DeviceContext* c, StateBlock& b)
     c->CSSetConstantBuffers(0, 1, b.csCb);
     c->CSSetUnorderedAccessViews(0, 8, b.csUav, nullptr);
     c->VSSetShader(b.vs, nullptr, 0);
+    c->GSSetShader(b.gs, nullptr, 0);
     c->PSSetShader(b.ps, nullptr, 0);
     c->PSSetShaderResources(0, 8, b.psSrv);
+    c->RSSetState(b.rs);
+    c->OMSetBlendState(b.blend, b.blendFactor, b.sampleMask);
+    c->OMSetDepthStencilState(b.depthStencil, b.stencilRef);
     c->IASetInputLayout(b.layout);
     c->IASetPrimitiveTopology(b.topo);
     c->IASetVertexBuffers(0, 1, &b.vb, &b.vbStride, &b.vbOffset);
@@ -229,7 +243,11 @@ void RestoreState(ID3D11DeviceContext* c, StateBlock& b)
     for (auto p : b.csUav) if (p) p->Release();
     for (auto p : b.csCb) if (p) p->Release();
     if (b.vs) b.vs->Release();
+    if (b.gs) b.gs->Release();
     if (b.ps) b.ps->Release();
+    if (b.rs) b.rs->Release();
+    if (b.blend) b.blend->Release();
+    if (b.depthStencil) b.depthStencil->Release();
     for (auto p : b.psSrv) if (p) p->Release();
     if (b.layout) b.layout->Release();
     if (b.vb) b.vb->Release();
@@ -244,15 +262,16 @@ void ClearCS(ID3D11DeviceContext* c)
     c->CSSetUnorderedAccessViews(0, 8, nUav, nullptr);
 }
 
-void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float dtMs, bool resetThisRun)
+void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float frameMs, float gapMs, bool resetThisRun)
 {
     ID3D11DeviceContext* c = s.ctx;
 
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(c->Map(s.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)))
     {
-        struct CB { float frameTime; uint32_t reset; float pad0, pad1; } cb;
-        cb.frameTime = dtMs; cb.reset = resetThisRun ? 1u : 0u; cb.pad0 = cb.pad1 = 0.0f;
+        struct CB { float frameTime; float gapTime; uint32_t reset; float pad; uint32_t width, height, pad2[2]; } cb = {};
+        cb.frameTime = frameMs; cb.gapTime = gapMs; cb.reset = resetThisRun ? 1u : 0u;
+        cb.width = s.width; cb.height = s.height;
         memcpy(map.pData, &cb, sizeof(cb));
         c->Unmap(s.cb, 0);
     }
@@ -277,7 +296,7 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float dtMs, boo
         c->CSSetShaderResources(0, 2, srv);
         c->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
         c->CSSetShader(s.csBuild, nullptr, 0);
-        c->Dispatch(TILE_COUNT_X, ROLLING_ROW_SLOTS, 1);
+        c->Dispatch(TileCount(s.width), (TileCount(s.height) + ROLLING_PHASES - 1) / ROLLING_PHASES, 1);
     }
 
     // Pass 3: reduce to the global histogram.
@@ -310,7 +329,13 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float dtMs, boo
     c->IASetInputLayout(nullptr);
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     c->VSSetShader(s.vsBoost, nullptr, 0);
+    c->GSSetShader(nullptr, nullptr, 0);
     c->PSSetShader(s.psBoost, nullptr, 0);
+
+    // Default states: no scissor, no blend, no depth, so the whole frame is replaced whatever DWM left bound.
+    c->RSSetState(nullptr);
+    c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    c->OMSetDepthStencilState(nullptr, 0);
     {
         ID3D11ShaderResourceView* srv[3] = { s.clean.srv, s.aplSmoothed.srv, s.boostParams.srv };
         c->PSSetShaderResources(0, 3, srv);
@@ -453,16 +478,20 @@ __int64 __fastcall PresentDetour(void* self, void* overlaySwapChain, unsigned in
                             rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
                             if (SUCCEEDED(s.dev->CreateRenderTargetView(bb, &rd, &bbRTV)))
                             {
-                                float dtMs = (float)MsSince(s, s.lastRunQpc);
-                                if (dtMs < 0.0f) dtMs = 0.0f;
-                                if (dtMs > 100.0f) dtMs = 100.0f;
+                                // The previous frame stayed on screen for the whole interval; only one
+                                // refresh period of it belongs to this frame's smoothing step.
+                                double sinceRunMs = MsSince(s, s.lastRunQpc);
+                                if (sinceRunMs < 0.0) sinceRunMs = 0.0;
+                                const double refreshMs = g_monRefreshMs.load();
+                                const double frameMs = (refreshMs > 0.0 && sinceRunMs > refreshMs) ? refreshMs : sinceRunMs;
+                                const double gapMs = sinceRunMs - frameMs;
                                 s.lastRunQpc = now.QuadPart;
 
                                 StateBlock sb;
                                 __try
                                 {
                                     SaveState(s.ctx, sb);
-                                    RunPipeline(s, bbRTV, dtMs, resetThisRun);
+                                    RunPipeline(s, bbRTV, (float)frameMs, (float)gapMs, resetThisRun);
                                     RestoreState(s.ctx, sb);
                                 }
                                 __except (EXCEPTION_EXECUTE_HANDLER)
@@ -518,11 +547,13 @@ void PresentSetOrig(Present_t orig) { g_orig = orig; }
 Present_t PresentGetDetour() { return (Present_t)PresentDetour; }
 
 void PresentSetTarget(bool enabled, unsigned int resetGeneration,
-                      int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr)
+                      int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr,
+                      float monRefreshMs)
 {
     g_monLeft.store(monLeft); g_monTop.store(monTop);
     g_monWidth.store(monWidth); g_monHeight.store(monHeight);
     g_monHdr.store(monHdr);
+    g_monRefreshMs.store(monRefreshMs);
     g_resetGeneration.store(resetGeneration);
     g_enabled.store(enabled);
 }

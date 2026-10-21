@@ -16,11 +16,10 @@
 // The source's skipped-frame pause detection used ReShade's frame counter, which does not exist
 // here; the host raises ResetFlag instead (on enable, prime, and mode change) to drop stale rows
 // and smoothing history.
-
-// Target: Philips 27M2N6500, 2560x1440. The hook runs these passes only on a matching FP16 context,
-// so the histogram geometry is fixed at build time.
-#define BUFFER_WIDTH  2560
-#define BUFFER_HEIGHT 1440
+//
+// DWM also stops presenting while the screen is static, where a game keeps presenting the same frame.
+// The host passes that gap apart from the one-frame step, and the smoothing first converges toward
+// the previous run's targets over the gap, as the ReShade passes would on the repeated frames.
 
 // Baked defaults (ReShade uniform values).
 static const float APLReferenceWhiteNits        = 1060.0;
@@ -66,10 +65,17 @@ static const float SIGNAL_REFERENCE_NITS        = 80.0;   // scRGB 1.0
 
 cbuffer BoostCB : register(b0)
 {
-    float FrameTime;   // ms since the previous run
+    float FrameTime;   // ms, at most one refresh period: this frame's smoothing step
+    float GapTime;     // ms the previous frame stayed on screen beyond that step
     uint  ResetFlag;   // 1 = resume after a pause: drop stale rows and smoothing history
-    float2 _cbpad;
+    float _cbpad;
+    uint  BufferWidthPx;   // target back-buffer size; sets the histogram geometry
+    uint  BufferHeightPx;
+    uint2 _cbpad2;
 };
+
+#define BUFFER_WIDTH  int(BufferWidthPx)
+#define BUFFER_HEIGHT int(BufferHeightPx)
 
 
 // Fixed constants carried over from the source.
@@ -294,12 +300,12 @@ float LookupMeasuredComp1D(float aplPct)
     );
 }
 
-float ComputeTemporalBlendFactor(float smoothingSeconds)
+float ComputeTemporalBlendFactor(float smoothingSeconds, float elapsedMs)
 {
     if (smoothingSeconds <= 1e-6)
         return 1.0;
 
-    float dtSeconds = max(FrameTime, 0.0) * 0.001;
+    float dtSeconds = max(elapsedMs, 0.0) * 0.001;
     return saturate(1.0 - exp(-dtSeconds / max(smoothingSeconds, 1e-6)));
 }
 
@@ -608,7 +614,16 @@ void CS_Setup(uint3 threadID : SV_GroupThreadID)
         APL_SetupRollingPhase = APL_DecodeStoredRollingPhase(instantData.b);
         APL_SetupResumedAfterPause = resumedAfterPause ? 1 : 0;
 
-        float4 previousState = resumedAfterPause ? (float4)0.0 : Setup_APL.Load(int3(0, 0, 0));
+        float4 previousState = (float4)0.0;
+        if (!resumedAfterPause)
+        {
+            previousState = Setup_APL.Load(int3(0, 0, 0));
+
+            // APLInstant keeps the previous run's targets: g = display APL, a = highlight PQ.
+            float gapAlpha = ComputeTemporalBlendFactor(TransitionSpeed, GapTime);
+            previousState.r = lerp(previousState.r, instantData.g, gapAlpha);
+            previousState.g = lerp(previousState.g, instantData.a, gapAlpha);
+        }
 
         // Layout: smoothed APL, this run's rolling phase, history flag, smoothed highlight PQ.
         Setup_APLPrev[int2(0, 0)] = float4(previousState.r, float(APL_SetupRollingPhase), previousState.b, previousState.g);
@@ -914,7 +929,7 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
 
     float4 prevData = Solve_APLPrev.Load(int3(0, 0, 0));
     float hasPrev = (prevData.b > 0.0) ? 1.0 : 0.0;
-    float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
+    float alpha = ComputeTemporalBlendFactor(TransitionSpeed, FrameTime);
 
     float pixelCount = 0.0;
     float sceneNits = 0.0;
@@ -935,9 +950,10 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
     APL_EvalBinLight[localIndex] = sceneNits * pixelCount;
     GroupMemoryBarrierWithGroupSync();
 
+    float currentHighlightPQ = 0.0;
     if (localIndex == 0)
     {
-        float currentHighlightPQ = NitsToPQ(APL_FindHighlightPeakNits());
+        currentHighlightPQ = NitsToPQ(APL_FindHighlightPeakNits());
         APL_EvalHighlightPQ = lerp(
             currentHighlightPQ,
             lerp(saturate(prevData.a), currentHighlightPQ, alpha),
@@ -1001,7 +1017,7 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
 
         float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL);
 
-        Solve_APLInstant[int2(0, 0)] = float4(rawAPL, 0.0, float(nextRollingPhase), 0.0);
+        Solve_APLInstant[int2(0, 0)] = float4(rawAPL, currentDisplayAPL, float(nextRollingPhase), currentHighlightPQ);
         Solve_APL[int2(0, 0)] = float4(smoothedAPL, smoothedHighlightPQ, 1.0, sceneLogGain);
 
         BoostParams boostParams = ComputeBoostParamsFromSceneLogGain(sceneLogGain, smoothedHighlightPQ);

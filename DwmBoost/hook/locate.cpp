@@ -1,6 +1,7 @@
 #include "locate.h"
 #include <psapi.h>
 #include <cstdint>
+#include <cstdlib>
 
 namespace {
 

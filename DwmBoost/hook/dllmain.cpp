@@ -40,7 +40,8 @@ bool ProcessAlive(DWORD pid)
 void ApplyConfig(const DwmBoostConfig& c)
 {
     bool wantOn = (c.enabled != 0);
-    PresentSetTarget(wantOn, c.resetGeneration, c.monLeft, c.monTop, c.monWidth, c.monHeight, c.monHdr != 0);
+    PresentSetTarget(wantOn, c.resetGeneration, c.monLeft, c.monTop, c.monWidth, c.monHeight, c.monHdr != 0,
+                     c.monRefreshMs);
 
     if (wantOn && !g_flipOn.load())
     {

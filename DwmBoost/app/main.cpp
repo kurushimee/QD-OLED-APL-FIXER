@@ -1,6 +1,6 @@
 // DwmBoost tray host. Injects the hook DLL into dwm.exe, keeps it resident, and toggles the effect
 // through a shared-memory flag. Hotkeys: Ctrl+Alt+Shift+End = on, Home = off. The kicker thread keeps
-// DWM composing the Philips while the effect is still settling on a static desktop.
+// DWM composing the target monitor while the effect is still settling on a static desktop.
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
@@ -103,7 +103,7 @@ bool ElevateToSystem()
 
 // -------- monitor discovery (QueryDisplayConfig) --------
 
-Target FindPhilips()
+Target FindHdrMonitor()
 {
     Target t;
     UINT32 nPath = 0, nMode = 0;
@@ -119,7 +119,7 @@ Target FindPhilips()
         if (p.sourceInfo.modeInfoIdx >= modes.size()) continue;
         const DISPLAYCONFIG_SOURCE_MODE& sm = modes[p.sourceInfo.modeInfoIdx].sourceMode;
 
-        // HDR (advanced color enabled) for this target.
+        // The target is the monitor with HDR (advanced color) enabled.
         DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO aci = {};
         aci.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
         aci.header.size = sizeof(aci);
@@ -127,15 +127,14 @@ Target FindPhilips()
         aci.header.id = p.targetInfo.id;
         bool hdr = (DisplayConfigGetDeviceInfo(&aci.header) == ERROR_SUCCESS) && aci.advancedColorEnabled;
 
-        if (sm.width == 2560 && sm.height == 1440)
-        {
-            t.left = sm.position.x; t.top = sm.position.y;
-            t.width = sm.width; t.height = sm.height; t.hdr = hdr;
-            if (p.targetInfo.refreshRate.Denominator && p.targetInfo.refreshRate.Numerator)
-                t.refreshMs = 1000.0 * p.targetInfo.refreshRate.Denominator / p.targetInfo.refreshRate.Numerator;
-            t.found = true;
-            if (hdr) break;   // prefer the HDR 2560x1440 panel
-        }
+        if (!hdr) continue;
+
+        t.left = sm.position.x; t.top = sm.position.y;
+        t.width = sm.width; t.height = sm.height; t.hdr = true;
+        if (p.targetInfo.refreshRate.Denominator && p.targetInfo.refreshRate.Numerator)
+            t.refreshMs = 1000.0 * p.targetInfo.refreshRate.Denominator / p.targetInfo.refreshRate.Numerator;
+        t.found = true;
+        break;
     }
     return t;
 }
@@ -166,6 +165,7 @@ bool CreateConfig()
     init.monLeft = g_target.left; init.monTop = g_target.top;
     init.monWidth = g_target.width; init.monHeight = g_target.height;
     init.monHdr = g_target.hdr ? 1u : 0u;
+    init.monRefreshMs = (float)g_target.refreshMs;
     init.hostPid = GetCurrentProcessId();
     *g_config = init;
     return true;
@@ -182,6 +182,7 @@ void WriteEnabled(bool enabled)
     g_config->monLeft = g_target.left; g_config->monTop = g_target.top;
     g_config->monWidth = g_target.width; g_config->monHeight = g_target.height;
     g_config->monHdr = g_target.hdr ? 1u : 0u;
+    g_config->monRefreshMs = (float)g_target.refreshMs;
     g_config->hostPid = GetCurrentProcessId();
     MemoryBarrier();
     g_config->version = (v | 1u) + 1u;       // publish (even)
@@ -392,7 +393,7 @@ DWORD WINAPI KickThread(LPVOID)
             continue;
         }
 
-        // Active: pace at the Philips refresh period.
+        // Active: pace at the target refresh period.
         LARGE_INTEGER due; due.QuadPart = -(LONGLONG)(g_target.refreshMs * 10000.0);
         if (timer) { SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE); HANDLE w2[2] = { g_kickStop, timer }; WaitForMultipleObjects(2, w2, FALSE, 100); }
         else WaitForSingleObject(g_kickStop, (DWORD)(g_target.refreshMs + 0.5));
@@ -538,10 +539,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
 
     EnablePrivilege(SE_DEBUG_NAME);
 
-    g_target = FindPhilips();
+    g_target = FindHdrMonitor();
     if (!g_target.found)
     {
-        MessageBoxW(nullptr, L"No 2560x1440 monitor found. DwmBoost targets the Philips 27M2N6500.", L"DwmBoost", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, L"No monitor with HDR enabled found.", L"DwmBoost", MB_OK | MB_ICONERROR);
         return 1;
     }
 

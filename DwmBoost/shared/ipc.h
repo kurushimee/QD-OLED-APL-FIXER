@@ -44,9 +44,10 @@ struct DwmBoostConfig
     uint32_t resetGeneration;        // host bumps to force a history reset (enable, mode change)
     int32_t  monLeft;                // target monitor origin (desktop coords), for event names
     int32_t  monTop;
-    uint32_t monWidth;               // back-buffer size the hook matches (the Philips: 2560x1440)
+    uint32_t monWidth;               // back-buffer size the hook matches (the HDR monitor's desktop mode)
     uint32_t monHeight;
     uint32_t monHdr;                 // 1 = target monitor is in HDR
+    float    monRefreshMs;           // target monitor refresh period, the smoothing step of one frame
     uint32_t hostPid;                // tray host PID; the DLL self-reverts if it dies
 };
 #pragma pack(pop)

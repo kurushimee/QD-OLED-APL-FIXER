@@ -16,7 +16,8 @@ Present_t PresentGetDetour();
 // Mirror of the host config, pushed by the watcher thread (never read from shared memory in the
 // present path). resetGeneration bumps force one history-reset run.
 void PresentSetTarget(bool enabled, unsigned int resetGeneration,
-                      int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr);
+                      int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr,
+                      float monRefreshMs);
 
 // Release all GPU resources and close the settle/content/prime events. Called when the effect is
 // toggled off and at Shutdown. Safe to call repeatedly and when nothing was created.

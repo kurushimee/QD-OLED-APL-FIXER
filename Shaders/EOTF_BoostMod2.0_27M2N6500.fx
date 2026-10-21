@@ -11,10 +11,12 @@
     reacts to. Levels up to a knee get the full gain. When the whole boosted
     scene fits under the panel peak, the knee sits at the panel's limit and
     nothing is compressed. Otherwise a monotone PQ shoulder compresses the top:
-      - up to the scene highlight peak (measured from the histogram), it keeps
-        Highlight Contrast of the source PQ contrast;
-      - above it, the rarer content keeps a quarter of its PQ contrast and
-        reaches the panel peak at the scene maximum.
+      - up to the scene highlight peak (measured from the histogram), every
+        level keeps the same share of its PQ contrast: 1 minus the boosted
+        scene's PQ overshoot of the panel peak over Shoulder Span, so a small
+        overshoot is spread thinly and a large one costs more contrast;
+      - above it, the rarer content eases down to a quarter of its PQ contrast
+        and reaches the panel peak at the scene maximum.
     The knee is the highest level that leaves room for both. Luma drives the
     curve and the RGB ratios are kept. A looser curve on the brightest channel
     only keeps it under the panel peak. The boost never falls below the source.
@@ -185,12 +187,12 @@ uniform float PanelPeakNits <
     UI_TOOLTIP("Peak signal the boost eases into. Boosted content never exceeds it, and content above it passes through untouched. 0 disables highlight protection.")
 > = 1060.0;
 
-uniform float HighlightContrast <
+uniform float ShoulderSpanPQ <
     ui_type = "slider";
-    ui_min = 0.25; ui_max = 0.9; ui_step = 0.01;
-    ui_label = "Highlight Contrast";
-    UI_TOOLTIP("Share of PQ contrast kept across the scene's highlights when the boosted scene would pass the panel peak. Lower values keep more of the scene at full gain.")
-> = 0.4;
+    ui_min = 0.1; ui_max = 0.5; ui_step = 0.01;
+    ui_label = "Shoulder Span (PQ)";
+    UI_TOOLTIP("PQ range below the boosted scene's brightest level that absorbs whatever cannot fit under the panel peak. Wider keeps more highlight detail and dims more of the scene slightly; narrower keeps more of the scene exact and flattens highlights more.")
+> = 0.3;
 
 uniform float TransitionSpeed <
     ui_type = "slider";
@@ -761,36 +763,32 @@ float3 PQHDRLUT_Apply(float3 color)
 #endif
 
 
-// Average PQ contrast kept across the rare content between the scene highlight peak and the scene maximum.
+// PQ contrast the rare content above the scene highlight peak eases down to by the scene maximum.
 static const float OUTLIER_HIGHLIGHT_CONTRAST = 0.25;
 
 // Share of the frame's light allowed above the measured highlight peak.
 static const float HIGHLIGHT_PEAK_LIGHT_FRACTION = 1.0 / 256.0;
 
+// PQ width over which the slope eases from the full gain to the highlight contrast.
+static const float KNEE_TRANSITION_PQ = 0.04;
+
 // Halvings of the PQ range in the knee search.
 static const int KNEE_SEARCH_STEPS = 24;
 
 
-// Full gain up to the knee. Above it, a monotone shoulder runs through the scene highlight peak
-// and reaches the panel peak at the scene maximum. Levels are PQ codes; slopes are PQ per PQ.
+// Full gain up to the knee. Above it, every level keeps the same share of its PQ contrast up to the
+// scene highlight peak, then eases to the outlier contrast and reaches the panel peak at the scene
+// maximum. Levels named U are PQ codes after the full gain.
 struct BoostCurve
 {
     float gain;
     float peakPQ;
     float kneeNits;
-    float kneePQ;
-    float kneeOutPQ;
-    float kneeSlope;
-    float highlightPQ;
-    float highlightOutPQ;
-    float highlightSlope;
-    float maxPQ;
+    float kneeU;
+    float contrast;
+    float highlightU;
+    float maxU;
 };
-
-float GetHighlightContrast()
-{
-    return clamp(HighlightContrast, OUTLIER_HIGHLIGHT_CONTRAST, 0.95);
-}
 
 // PQ code of a source PQ code after the full gain.
 float GainMapPQ(float pq, float gain)
@@ -798,55 +796,42 @@ float GainMapPQ(float pq, float gain)
     return NitsToPQUnclamped(PQToLinearBT2100(pq) * 10000.0 * gain);
 }
 
-// Derivative of the PQ code with respect to log luminance.
-float PQLogSlope(float nits)
+// How far the shoulder sits below the full gain at u. One ramp from the knee eases the slope to the
+// curve's contrast; a second from the highlight peak eases it on to the outlier contrast.
+float ShoulderCompressionPQ(float u, float kneeU, float highlightU, float maxU, float contrast)
 {
-    float ym = pow(max(nits, 1e-6) / 10000.0, PQ_M1);
-    float num = PQ_C1 + PQ_C2 * ym;
-    float den = 1.0 + PQ_C3 * ym;
-    return PQ_M1 * PQ_M2 * (PQ_C2 - PQ_C1 * PQ_C3) * pow(num / den, PQ_M2) * ym / (num * den);
+    float t = max(u - kneeU, 0.0);
+    float bulk = (t < KNEE_TRANSITION_PQ)
+        ? t * t / (2.0 * KNEE_TRANSITION_PQ)
+        : t - 0.5 * KNEE_TRANSITION_PQ;
+
+    float outlierStart = max(highlightU, kneeU);
+    float outlierSpan = max(maxU - outlierStart, 1e-6);
+    float v = clamp(u - outlierStart, 0.0, outlierSpan);
+
+    return (1.0 - contrast) * bulk + (contrast - OUTLIER_HIGHLIGHT_CONTRAST) * v * v / (2.0 * outlierSpan);
 }
 
-// Delbourgo-Gregory rational cubic from (a, ya) with slope da to (b, yb) with slope db. It is monotone
-// for any non-negative slopes; r >= 1 and t(1 - t) <= 1/4 keep the denominator at 0.5 or more.
-float MonotoneRationalCubic(float x, float a, float ya, float da, float b, float yb, float db)
+// Highest contrast whose shoulder still ends on the panel peak with the knee at black.
+float MaxFittingContrast(float peakPQ, float highlightU, float maxU)
 {
-    float width = b - a;
-    float rise = yb - ya;
-
-    if (width <= 1e-7 || rise <= 1e-7)
-        return ya;
-
-    float r = 1.0 + (da + db) * width / rise;
-    float t = saturate((x - a) / width);
-    float u = 1.0 - t;
-    float numerator = ya * u * u * u + (r * ya + width * da) * t * u * u + (r * yb - width * db) * t * t * u + yb * t * t * t;
-    return numerator / (1.0 + (r - 3.0) * t * u);
+    float outlierSpan = maxU - highlightU;
+    return (peakPQ - 0.5 * KNEE_TRANSITION_PQ - 0.5 * OUTLIER_HIGHLIGHT_CONTRAST * outlierSpan) /
+        (0.5 * (maxU + highlightU) - 0.5 * KNEE_TRANSITION_PQ);
 }
 
-// Output a knee needs for the shoulder above it to keep its average contrasts and still end on the peak.
-float ShoulderBudgetPQ(float kneePQ, float gain, float highlightPQ, float maxPQ, float contrast)
+// Highest knee whose shoulder ends on the panel peak at the scene maximum.
+float SolveKneeU(float peakPQ, float highlightU, float maxU, float contrast)
 {
-    float tierPQ = max(kneePQ, highlightPQ);
-    return GainMapPQ(kneePQ, gain) + contrast * (tierPQ - kneePQ) + OUTLIER_HIGHLIGHT_CONTRAST * (maxPQ - tierPQ);
-}
-
-// Highest knee whose shoulder fits under the panel peak. When the whole scene fits,
-// the knee sits where the gain reaches the panel peak and nothing in the scene is compressed.
-float SolveKneePQ(float gain, float peakPQ, float highlightPQ, float maxPQ, float contrast)
-{
-    if (GainMapPQ(maxPQ, gain) <= peakPQ)
-        return NitsToPQ(PanelPeakNits / gain);
-
     float lo = 0.0;
-    float hi = maxPQ;
+    float hi = peakPQ;
 
     [loop]
     for (int i = 0; i < KNEE_SEARCH_STEPS; ++i)
     {
         float mid = 0.5 * (lo + hi);
 
-        if (ShoulderBudgetPQ(mid, gain, highlightPQ, maxPQ, contrast) <= peakPQ)
+        if (maxU - ShoulderCompressionPQ(maxU, mid, highlightU, maxU, contrast) <= peakPQ)
             lo = mid;
         else
             hi = mid;
@@ -861,48 +846,46 @@ BoostCurve MakeBoostCurve(float gain, float highlightPQ, float maxPQ, float cont
     curve.gain = max(gain, 1.0);
     curve.peakPQ = 1.0;
     curve.kneeNits = 10000.0;
-    curve.kneePQ = 1.0;
-    curve.kneeOutPQ = 1.0;
-    curve.kneeSlope = 1.0;
-    curve.highlightPQ = 1.0;
-    curve.highlightOutPQ = 1.0;
-    curve.highlightSlope = 1.0;
-    curve.maxPQ = 1.0;
+    curve.kneeU = 1.0;
+    curve.contrast = 1.0;
+    curve.highlightU = 1.0;
+    curve.maxU = 1.0;
 
     if (PanelPeakNits <= 0.0 || curve.gain <= 1.000001)
         return curve;
 
     curve.peakPQ = NitsToPQ(PanelPeakNits);
-    curve.maxPQ = clamp(maxPQ, 0.0, curve.peakPQ);
-    highlightPQ = clamp(highlightPQ, 0.0, curve.maxPQ);
+    maxPQ = clamp(maxPQ, 0.0, curve.peakPQ);
+    curve.maxU = GainMapPQ(maxPQ, curve.gain);
+    curve.highlightU = GainMapPQ(clamp(highlightPQ, 0.0, maxPQ), curve.gain);
 
-    curve.kneePQ = SolveKneePQ(curve.gain, curve.peakPQ, highlightPQ, curve.maxPQ, contrast);
-    curve.kneeNits = PQToLinearBT2100(curve.kneePQ) * 10000.0;
-    curve.kneeOutPQ = GainMapPQ(curve.kneePQ, curve.gain);
-    curve.kneeSlope = PQLogSlope(curve.kneeNits * curve.gain) / max(PQLogSlope(curve.kneeNits), 1e-9);
+    // When the whole boosted scene fits, the knee sits where the gain reaches the panel peak.
+    curve.kneeU = curve.peakPQ;
 
-    curve.highlightPQ = curve.kneePQ;
-    curve.highlightOutPQ = curve.kneeOutPQ;
-    curve.highlightSlope = curve.kneeSlope;
-
-    if (highlightPQ > curve.kneePQ)
+    if (curve.maxU > curve.peakPQ)
     {
-        curve.highlightPQ = highlightPQ;
-        curve.highlightOutPQ = curve.peakPQ - OUTLIER_HIGHLIGHT_CONTRAST * (curve.maxPQ - highlightPQ);
-
-        // Harmonic mean of the average slopes on either side of the highlight peak.
-        curve.highlightSlope = (curve.maxPQ > highlightPQ)
-            ? 2.0 * contrast * OUTLIER_HIGHLIGHT_CONTRAST / (contrast + OUTLIER_HIGHLIGHT_CONTRAST)
-            : contrast;
+        float fittingContrast = min(contrast, MaxFittingContrast(curve.peakPQ, curve.highlightU, curve.maxU));
+        curve.contrast = max(fittingContrast, OUTLIER_HIGHLIGHT_CONTRAST);
+        curve.kneeU = SolveKneeU(curve.peakPQ, curve.highlightU, curve.maxU, curve.contrast);
     }
 
+    curve.kneeNits = PQToLinearBT2100(curve.kneeU) * 10000.0 / curve.gain;
     return curve;
+}
+
+// Spreads the boosted scene's overshoot of the panel peak over the shoulder span, so a small overshoot
+// costs each highlight level a little contrast and a large one costs more.
+float GetHighlightContrast(float gain, float maxPQ)
+{
+    float peakPQ = NitsToPQ(PanelPeakNits);
+    float overshootPQ = GainMapPQ(min(maxPQ, peakPQ), gain) - peakPQ;
+    return 1.0 - overshootPQ / ShoulderSpanPQ;
 }
 
 // Scene levels in PQ: x = highlight peak, y = luma maximum, z = brightest channel maximum.
 BoostCurve MakeLumaBoostCurve(float gain, float3 scenePQ)
 {
-    return MakeBoostCurve(gain, scenePQ.x, scenePQ.y, GetHighlightContrast());
+    return MakeBoostCurve(gain, scenePQ.x, scenePQ.y, GetHighlightContrast(gain, scenePQ.y));
 }
 
 BoostCurve MakeChannelBoostCurve(float gain, float3 scenePQ)
@@ -918,12 +901,12 @@ float4 PackBoostCurveGlobals(BoostCurve curve)
 
 float4 PackBoostCurveKnee(BoostCurve curve)
 {
-    return float4(curve.kneeNits, curve.kneePQ, curve.kneeOutPQ, curve.kneeSlope);
+    return float4(curve.kneeNits, curve.kneeU, curve.contrast, 0.0);
 }
 
 float4 PackBoostCurveHighlight(BoostCurve curve)
 {
-    return float4(curve.highlightPQ, curve.highlightOutPQ, curve.highlightSlope, curve.maxPQ);
+    return float4(curve.highlightU, curve.maxU, 0.0, 0.0);
 }
 
 BoostCurve UnpackBoostCurve(float4 globals, float4 knee, float4 highlight)
@@ -932,13 +915,10 @@ BoostCurve UnpackBoostCurve(float4 globals, float4 knee, float4 highlight)
     curve.gain = globals.x;
     curve.peakPQ = globals.y;
     curve.kneeNits = knee.x;
-    curve.kneePQ = knee.y;
-    curve.kneeOutPQ = knee.z;
-    curve.kneeSlope = knee.w;
-    curve.highlightPQ = highlight.x;
-    curve.highlightOutPQ = highlight.y;
-    curve.highlightSlope = highlight.z;
-    curve.maxPQ = highlight.w;
+    curve.kneeU = knee.y;
+    curve.contrast = knee.z;
+    curve.highlightU = highlight.x;
+    curve.maxU = highlight.y;
     return curve;
 }
 
@@ -1134,17 +1114,14 @@ float ApplyBoostCurveToNits(float nits, BoostCurve curve)
     if (safeNits <= curve.kneeNits)
         return safeNits * curve.gain;
 
-    float x = NitsToPQ(safeNits);
-
-    if (x >= curve.peakPQ)
+    if (safeNits >= PanelPeakNits)
         return safeNits;
 
+    float u = NitsToPQUnclamped(safeNits * curve.gain);
     float y = curve.peakPQ;
 
-    if (x <= curve.highlightPQ)
-        y = MonotoneRationalCubic(x, curve.kneePQ, curve.kneeOutPQ, curve.kneeSlope, curve.highlightPQ, curve.highlightOutPQ, curve.highlightSlope);
-    else if (x < curve.maxPQ)
-        y = MonotoneRationalCubic(x, curve.highlightPQ, curve.highlightOutPQ, curve.highlightSlope, curve.maxPQ, curve.peakPQ, OUTLIER_HIGHLIGHT_CONTRAST);
+    if (u < curve.maxU)
+        y = min(u - ShoulderCompressionPQ(u, curve.kneeU, curve.highlightU, curve.maxU, curve.contrast), curve.peakPQ);
 
     return max(PQToLinearBT2100(y) * 10000.0, safeNits);
 }

@@ -36,13 +36,13 @@ The default settings match the calibration target, so most setups need no change
 
 ## How it works
 
-1. **Measure the scene.** The shader builds a brightness histogram of the full frame. To save GPU time, it refreshes one of six groups of rows each frame and keeps the rest from earlier frames. From the histogram, it finds the average picture level (APL) and the scene's highlight peak. The highlight peak is the level that only the brightest 1/256 of the frame's light sits above.
+1. **Measure the scene.** The shader builds a brightness histogram of the full frame. To save GPU time, it refreshes one of six groups of rows each frame and keeps the rest from earlier frames. From the histogram, it finds the average picture level (APL) and the scene's highlight peak. The highlight peak is the level that only the brightest 1/256 of the frame's light sits above. It also records the frame's brightest luma level and brightest color channel level.
 2. **Look up the compensation.** A measured table tells how much the panel dims at each APL. For example, at 25% APL the panel reaches only about 36% of its peak, so the scene needs about 2.80 times more signal.
 3. **Account for its own boost.** Boosting the image raises the APL, and a higher APL makes the panel dim even more. The shader solves for the APL that the panel will actually see after the boost and picks the gain from that.
-4. **Smooth the change.** The APL and the highlight peak change gradually over time, so the brightness does not jump between frames.
-5. **Apply the boost.** Shadows and midtones get the full gain. Near the top, the gain eases out in PQ space through two soft shoulders. The first shoulder leads up to the scene's highlight peak and keeps part of its contrast, set by **Highlight Contrast**. The second shoulder handles rarer, brighter content and any color channel that nears the panel peak, so they compress instead of clipping.
+4. **Smooth the change.** The APL, the highlight peak, and the brightest levels change gradually over time, so the brightness does not jump between frames.
+5. **Apply the boost.** Every level up to a knee gets the full gain. If the whole boosted scene fits under the panel peak, the knee sits where the gain reaches the peak, so nothing in the scene is compressed. If the brightest content would go past the peak, a smooth curve in PQ space compresses only the top of the range. Up to the scene's highlight peak, it keeps the share of contrast set by **Highlight Contrast**. Above that, the rarer and brighter content keeps a quarter of its contrast and reaches the panel peak at the scene's brightest level. The knee is the highest level that leaves room for both.
 
-Luma drives the boost, and all three color channels scale by the same amount, so colors keep their hue. The shader never makes any part of the image darker than the source.
+Luma drives the boost, and all three color channels scale by the same amount, so colors keep their hue. A looser curve on the brightest color channel only keeps that channel under the panel peak. The shader never makes any part of the image darker than the source.
 
 The analysis runs only while the boost or the stats display is on.
 
@@ -74,7 +74,7 @@ The 1% window reads lower than the 2% window. ABL only dims the panel more as th
 | APL Reference White (nits) | 1060 | Sets the brightness that counts as 100% APL. Keep it at the calibrated peak. A higher value makes scenes read darker, which lowers the boost. |
 | Compensation Freeze APL % | 50 | Holds the compensation at its value for this APL in all brighter scenes. Lower values limit the boost in bright scenes. 0 turns the hold off, so the boost follows the measured table up to 100% APL. |
 | Panel Peak (nits) | 1060 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
-| Highlight Contrast | 0.40 | Sets how much contrast the scene's highlights keep while the boost fades out. Lower values brighten bright midtones more, and higher values keep more separation between highlights. |
+| Highlight Contrast | 0.40 | Sets how much contrast the scene's highlights keep when the boosted scene would go past the panel peak. Lower values keep more of the scene at full gain, and higher values keep more separation between highlights. |
 | APL Smoothing Time (s) | 0.25 | Sets how long the shader takes to follow a change in scene brightness. Raise it if the brightness looks jumpy. 0 turns smoothing off. |
 | scRGB Signal Reference (nits) | 80 | Sets the brightness of scRGB value 1.0. It only matters for scRGB games. |
 | Show APL Stats | Off | Shows live numbers in the top right corner. |

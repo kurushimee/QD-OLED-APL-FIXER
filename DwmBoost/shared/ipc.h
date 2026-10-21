@@ -48,6 +48,7 @@ struct DwmBoostConfig
     uint32_t monHeight;
     uint32_t monHdr;                 // 1 = target monitor is in HDR
     float    monRefreshMs;           // target monitor refresh period, the smoothing step of one frame
+    float    monLitFraction;         // share of the native panel the desktop lights after aspect-ratio scaling
     uint32_t hostPid;                // tray host PID; the DLL self-reverts if it dies
 };
 #pragma pack(pop)

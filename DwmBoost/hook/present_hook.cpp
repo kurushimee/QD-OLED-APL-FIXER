@@ -15,7 +15,7 @@ namespace {
 // Histogram geometry — must match boost.hlsl.
 const UINT TILE_SIZE = 32;
 const UINT BLOCK_W = 16, BLOCK_H = 16;
-const UINT ROW_COUNT_W = BLOCK_W + 1;   // 17 (aux column unused here)
+const UINT ROW_COUNT_W = BLOCK_W + 1;   // aux column holds the exact scene maxima
 const UINT ROLLING_PHASES = 6;
 
 UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
@@ -30,6 +30,7 @@ std::atomic<int>      g_monLeft{0}, g_monTop{0};
 std::atomic<uint32_t> g_monWidth{0}, g_monHeight{0};
 std::atomic<bool>     g_monHdr{false};
 std::atomic<float>    g_monRefreshMs{0.0f};
+std::atomic<float>    g_monLitFraction{1.0f};
 
 std::atomic<long>     g_inFlight{0};
 Present_t             g_orig = nullptr;
@@ -139,10 +140,10 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     ok &= CreateTex(s.dev, ROW_COUNT_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, s.globalCount);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalOffset);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalMaxNits);
-    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplSmoothed);
-    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplInstant);
-    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplPrev);
-    ok &= CreateTex(s.dev, 1, 2, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.boostParams);
+    ok &= CreateTex(s.dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplSmoothed);
+    ok &= CreateTex(s.dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplInstant);
+    ok &= CreateTex(s.dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplPrev);
+    ok &= CreateTex(s.dev, 1, 5, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.boostParams);
 
     ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Setup, sizeof(g_CS_Setup), nullptr, &s.csSetup));
     ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Build, sizeof(g_CS_Build), nullptr, &s.csBuild));
@@ -269,9 +270,10 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float frameMs, 
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(c->Map(s.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)))
     {
-        struct CB { float frameTime; float gapTime; uint32_t reset; float pad; uint32_t width, height, pad2[2]; } cb = {};
+        struct CB { float frameTime; float gapTime; uint32_t reset; float pad; uint32_t width, height; float litFraction, pad2; } cb = {};
         cb.frameTime = frameMs; cb.gapTime = gapMs; cb.reset = resetThisRun ? 1u : 0u;
         cb.width = s.width; cb.height = s.height;
+        cb.litFraction = g_monLitFraction.load();
         memcpy(map.pData, &cb, sizeof(cb));
         c->Unmap(s.cb, 0);
     }
@@ -548,12 +550,13 @@ Present_t PresentGetDetour() { return (Present_t)PresentDetour; }
 
 void PresentSetTarget(bool enabled, unsigned int resetGeneration,
                       int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr,
-                      float monRefreshMs)
+                      float monRefreshMs, float monLitFraction)
 {
     g_monLeft.store(monLeft); g_monTop.store(monTop);
     g_monWidth.store(monWidth); g_monHeight.store(monHeight);
     g_monHdr.store(monHdr);
     g_monRefreshMs.store(monRefreshMs);
+    g_monLitFraction.store(monLitFraction);
     g_resetGeneration.store(resetGeneration);
     g_enabled.store(enabled);
 }

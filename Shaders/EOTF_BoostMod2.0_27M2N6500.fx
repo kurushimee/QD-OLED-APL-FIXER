@@ -22,7 +22,8 @@
     only keeps it under the panel peak. The boost never falls below the source.
 
     A rolling full-frame histogram estimates raw APL, the highlight peak, the
-    exact luma and channel maxima, and three boosted response points. A
+    luma and channel maxima (log averages of the 64 brightest pixels), and
+    three boosted response points. A
     bracketed solver finds display-side APL, then temporal smoothing produces
     the final gain.
 
@@ -71,9 +72,17 @@
 #define APL_FFH_MAX_BINS              256
 #define APL_FFH_BLOCK_W                16
 #define APL_FFH_BLOCK_H                16
-#define APL_FFH_AUX_X                  APL_FFH_BLOCK_W
 #define APL_FFH_REDUCE_THREADS         64
 #define APL_SETUP_THREADS             256
+
+// Fine bins for the scene maxima: 1/32 octave from 128 to 2048 nits, luma first, then brightest channel.
+// They sit in extra columns of the count textures, next to each row's histogram block.
+#define APL_TOP_MIN_EXPONENT            9
+#define APL_TOP_OCTAVES                 4
+#define APL_TOP_SUB_BITS                5
+#define APL_TOP_BINS                  (APL_TOP_OCTAVES << APL_TOP_SUB_BITS)
+#define APL_TOP_SLOTS                 (2 * APL_TOP_BINS)
+#define APL_TOP_COLUMNS               (APL_TOP_SLOTS / APL_FFH_BLOCK_H)
 
 
 // Packed value: pixel count in the upper bits and summed bin position in the lower bits.
@@ -88,7 +97,7 @@
 
 // Persistent 16x16 histogram block for each 32-pixel-high screen row.
 #define APL_FFH_ROW_HIST_TEX_W APL_FFH_BLOCK_W
-#define APL_FFH_ROW_COUNT_TEX_W (APL_FFH_BLOCK_W + 1)
+#define APL_FFH_ROW_COUNT_TEX_W (APL_FFH_BLOCK_W + APL_TOP_COLUMNS)
 #define APL_FFH_ROW_TEX_H (APL_FFH_TILE_COUNT_Y * APL_FFH_BLOCK_H)
 
 
@@ -127,6 +136,9 @@
 #endif
 #if (APL_FFH_BLOCK_W * APL_FFH_BLOCK_H != APL_FFH_MAX_BINS)
     #error "Full-frame APL histogram block dimensions do not match maximum bin count"
+#endif
+#if (APL_TOP_SLOTS != APL_FFH_MAX_BINS)
+    #error "Scene-maximum fine bins are cleared, built and reduced one per histogram bin"
 #endif
 #if (APL_FFH_COLOR_LUMA_BINS * APL_FFH_COLOR_RATIO_BINS != APL_FFH_MAX_BINS)
     #error "Color-preserving full-frame APL histogram dimensions are inconsistent"
@@ -199,7 +211,7 @@ uniform float TransitionSpeed <
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
     ui_label = "APL Smoothing Time (s)";
     UI_TOOLTIP("Smooths changes in APL, highlight peak, and scene maximum over time. 0 disables smoothing.")
-> = 0.05;
+> = 0.033;
 
 uniform float SIGNAL_REFERENCE_NITS <
     ui_type = "slider";
@@ -399,7 +411,7 @@ storage2D<float> StorageAPLFastPQNits
 };
 
 
-// Persistent row histograms. The count texture also stores the row maximum.
+// Persistent row histograms. The count texture also holds each row's fine bins for the scene maxima.
 texture TexAPLRowHistCount
 {
     Width = APL_FFH_ROW_COUNT_TEX_W;
@@ -478,7 +490,7 @@ storage2D<int> StorageAPLRowMeta
 
 texture TexAPLGlobalHistCount
 {
-    Width = APL_FFH_BLOCK_W + 1;
+    Width = APL_FFH_ROW_COUNT_TEX_W;
     Height = APL_FFH_BLOCK_H;
     Format = R32I;
 };
@@ -768,6 +780,10 @@ static const float OUTLIER_HIGHLIGHT_CONTRAST = 0.25;
 
 // Share of the frame's light allowed above the measured highlight peak.
 static const float HIGHLIGHT_PEAK_LIGHT_FRACTION = 1.0 / 256.0;
+
+// Brightest pixels the scene maxima average over in log luminance, so one pixel moves a maximum by at
+// most 1/SCENE_MAX_PIXELS of its distance from the rest instead of reshaping the whole curve.
+static const float SCENE_MAX_PIXELS = 64.0;
 
 // PQ width over which the slope eases from the full gain to the highlight contrast.
 static const float KNEE_TRANSITION_PQ = 0.04;
@@ -2072,24 +2088,37 @@ int2 APL_RowHistogramCoord(int rowIndex, int binIndex)
     return int2(binCoord.x, rowIndex * APL_FFH_BLOCK_H + binCoord.y);
 }
 
-int2 APL_RowExactMaxLumaCoord(int rowIndex)
+int2 APL_GlobalTopCoord(int topSlot)
 {
-    return int2(APL_FFH_AUX_X, rowIndex * APL_FFH_BLOCK_H);
+    return int2(APL_FFH_BLOCK_W + topSlot / APL_FFH_BLOCK_H, topSlot % APL_FFH_BLOCK_H);
 }
 
-int2 APL_RowExactMaxChannelCoord(int rowIndex)
+int2 APL_RowTopCoord(int rowIndex, int topSlot)
 {
-    return int2(APL_FFH_AUX_X, rowIndex * APL_FFH_BLOCK_H + 1);
+    return APL_GlobalTopCoord(topSlot) + int2(0, rowIndex * APL_FFH_BLOCK_H);
 }
 
-int2 APL_GlobalExactMaxLumaCoord()
+// Fine bin of a quantized level for the scene maxima, or -1 below the fine range.
+int APL_TopBin(int levelQ4)
 {
-    return int2(APL_FFH_AUX_X, 0);
+    if (levelQ4 < (1 << APL_TOP_MIN_EXPONENT))
+        return -1;
+
+    int exponent = firstbithigh(levelQ4);
+    if (exponent >= APL_TOP_MIN_EXPONENT + APL_TOP_OCTAVES)
+        return APL_TOP_BINS - 1;
+
+    int subBin = (levelQ4 >> (exponent - APL_TOP_SUB_BITS)) & ((1 << APL_TOP_SUB_BITS) - 1);
+    return ((exponent - APL_TOP_MIN_EXPONENT) << APL_TOP_SUB_BITS) + subBin;
 }
 
-int2 APL_GlobalExactMaxChannelCoord()
+void APL_TopBinBoundsQ4(int topBin, out int lowerQ4, out int upperQ4)
 {
-    return int2(APL_FFH_AUX_X, 1);
+    int exponent = APL_TOP_MIN_EXPONENT + (topBin >> APL_TOP_SUB_BITS);
+    int subBin = topBin & ((1 << APL_TOP_SUB_BITS) - 1);
+    int stepQ4 = 1 << (exponent - APL_TOP_SUB_BITS);
+    lowerQ4 = (1 << exponent) + subBin * stepQ4;
+    upperQ4 = lowerQ4 + stepQ4 - 1;
 }
 
 int APL_DecodeStoredRollingPhase(float storedPhase)
@@ -2176,15 +2205,15 @@ void APL_DecodePackedFullFrameSample(
     out int binIndex,
     out int packedContribution,
     out int maxNits2,
-    out int lumaQ4,
-    out int maxQ4,
+    out int lumaTopBin,
+    out int channelTopBin,
     out int valid)
 {
     binIndex = 0;
     packedContribution = 0;
     maxNits2 = 0;
-    lumaQ4 = 0;
-    maxQ4 = 0;
+    lumaTopBin = -1;
+    channelTopBin = -1;
     valid = 0;
 
     if (pixel.x < 0 || pixel.y < 0 || pixel.x >= BUFFER_WIDTH || pixel.y >= BUFFER_HEIGHT)
@@ -2206,14 +2235,16 @@ void APL_DecodePackedFullFrameSample(
         maxChannelNits = max(Max3(Rec709ToRec2020(color)), 0.0) * SIGNAL_REFERENCE_NITS;
     }
 
-    lumaQ4 = APL_QuantizeNitsQ4(sceneNits);
-    maxQ4 = APL_QuantizeNitsQ4(maxChannelNits);
+    int lumaQ4 = APL_QuantizeNitsQ4(sceneNits);
+    int maxQ4 = APL_QuantizeNitsQ4(maxChannelNits);
     int lumaBin = APL_HistogramLumaBin64(lumaQ4);
     binIndex = lumaBin * APL_FFH_COLOR_RATIO_BINS + APL_HistogramColorRatioBin(lumaQ4, maxQ4);
 
     int offset10 = APL_EncodeWithinBinOffset10(lumaQ4, lumaBin);
     packedContribution = APL_FFH_PACK_ONE_COUNT + offset10;
     maxNits2 = APL_QuantizeMaxNits2(maxChannelNits);
+    lumaTopBin = APL_TopBin(lumaQ4);
+    channelTopBin = APL_TopBin(maxQ4);
     valid = 1;
 }
 
@@ -2227,8 +2258,7 @@ groupshared int APL_SetupRollingPhase;
 groupshared int APL_SetupResumedAfterPause;
 groupshared int APL_TilePackedCountLuma[APL_FFH_MAX_BINS];
 groupshared int APL_TileMaxNits[APL_FFH_MAX_BINS];
-groupshared int APL_TileExactMaxLumaQ4;
-groupshared int APL_TileExactMaxChannelQ4;
+groupshared int APL_TileTopCount[APL_TOP_SLOTS];
 groupshared int APL_BuildRollingPhase;
 
 void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int maxNits2, int valid)
@@ -2238,6 +2268,15 @@ void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int max
 
     atomicAdd(APL_TilePackedCountLuma[binIndex], packedContribution);
     atomicAdd(APL_TileMaxNits[binIndex], maxNits2);
+}
+
+void APL_AtomicAddTopSample(int lumaTopBin, int channelTopBin)
+{
+    if (lumaTopBin >= 0)
+        atomicAdd(APL_TileTopCount[lumaTopBin], 1);
+
+    if (channelTopBin >= 0)
+        atomicAdd(APL_TileTopCount[APL_TOP_BINS + channelTopBin], 1);
 }
 
 
@@ -2299,14 +2338,11 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
             tex2Dstore(StorageAPLRowHistCount, coord, 0);
             tex2Dstore(StorageAPLRowHistOffset10, coord, 0);
             tex2Dstore(StorageAPLRowHistMaxNits, coord, 0);
-            if (binIndex == 0)
-            {
-                tex2Dstore(StorageAPLRowHistCount, APL_RowExactMaxLumaCoord(rowIndex), 0);
-                tex2Dstore(StorageAPLRowHistCount, APL_RowExactMaxChannelCoord(rowIndex), 0);
+            tex2Dstore(StorageAPLRowHistCount, APL_RowTopCoord(rowIndex, binIndex), 0);
 #if APL_FULLFRAME_ROLLING_PHASES > 0
+            if (binIndex == 0)
                 tex2Dstore(StorageAPLRowMeta, int2(0, rowIndex), signature << APL_FFH_ROW_META_COUNT_BITS);
 #endif
-            }
         }
     }
 }
@@ -2324,14 +2360,13 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
     {
         float storedPhase = tex2Dfetch(SamplerAPLPrev, int2(0, 0)).g;
         APL_BuildRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
-        APL_TileExactMaxLumaQ4 = 0;
-        APL_TileExactMaxChannelQ4 = 0;
     }
 
     if (localIndex < APL_FFH_MAX_BINS)
     {
         APL_TilePackedCountLuma[localIndex] = 0;
         APL_TileMaxNits[localIndex] = 0;
+        APL_TileTopCount[localIndex] = 0;
     }
     barrier();
 
@@ -2351,8 +2386,10 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
         APL_DecodePackedFullFrameSample(pixelBase + int2(0, 1), b2, p2, m2, l2, c2, v2);
         APL_DecodePackedFullFrameSample(pixelBase + int2(1, 1), b3, p3, m3, l3, c3, v3);
 
-        atomicMax(APL_TileExactMaxLumaQ4, max(max(l0, l1), max(l2, l3)));
-        atomicMax(APL_TileExactMaxChannelQ4, max(max(c0, c1), max(c2, c3)));
+        APL_AtomicAddTopSample(l0, c0);
+        APL_AtomicAddTopSample(l1, c1);
+        APL_AtomicAddTopSample(l2, c2);
+        APL_AtomicAddTopSample(l3, c3);
 
         if (v1 != 0 && v0 != 0 && b1 == b0) { p0 += p1; m0 += m1; v1 = 0; }
         if (v2 != 0 && v0 != 0 && b2 == b0) { p0 += p2; m0 += m2; v2 = 0; }
@@ -2368,12 +2405,6 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
     }
     barrier();
 
-    if (validPhysicalRow && localIndex == 0)
-    {
-        atomicMax(StorageAPLRowHistCount, APL_RowExactMaxLumaCoord(physicalRow), APL_TileExactMaxLumaQ4);
-        atomicMax(StorageAPLRowHistCount, APL_RowExactMaxChannelCoord(physicalRow), APL_TileExactMaxChannelQ4);
-    }
-
     if (validPhysicalRow && localIndex < APL_FFH_MAX_BINS)
     {
         int packedValue = APL_TilePackedCountLuma[localIndex];
@@ -2386,6 +2417,10 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
             atomicAdd(StorageAPLRowHistOffset10, rowCoord, offsetSum10);
             atomicAdd(StorageAPLRowHistMaxNits, rowCoord, APL_TileMaxNits[localIndex]);
         }
+
+        int topCount = APL_TileTopCount[localIndex];
+        if (topCount > 0)
+            atomicAdd(StorageAPLRowHistCount, APL_RowTopCoord(physicalRow, int(localIndex)), topCount);
     }
 
 #if APL_FULLFRAME_ROLLING_PHASES > 0
@@ -2401,12 +2436,14 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
 groupshared int APL_ReduceCount[APL_FFH_REDUCE_THREADS];
 groupshared float APL_ReduceOffset10[APL_FFH_REDUCE_THREADS];
 groupshared float APL_ReduceMaxNits[APL_FFH_REDUCE_THREADS];
+groupshared int APL_ReduceTopCount[APL_FFH_REDUCE_THREADS];
 
 #define APL_REDUCE_ROW_STAGE(S) \
     if (localIndex < S) { \
         APL_ReduceCount[localIndex] += APL_ReduceCount[localIndex + S]; \
         APL_ReduceOffset10[localIndex] += APL_ReduceOffset10[localIndex + S]; \
         APL_ReduceMaxNits[localIndex] += APL_ReduceMaxNits[localIndex + S]; \
+        APL_ReduceTopCount[localIndex] += APL_ReduceTopCount[localIndex + S]; \
     } \
     barrier();
 
@@ -2425,6 +2462,7 @@ void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadI
     int countSum = 0;
     float offsetSum10 = 0.0;
     float maxSumNits = 0.0;
+    int topCountSum = 0;
 
     [loop]
     for (int rowIndex = localIndex; rowIndex < APL_FFH_TILE_COUNT_Y; rowIndex += APL_FFH_REDUCE_THREADS)
@@ -2435,12 +2473,14 @@ void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadI
             countSum += tex2Dfetch(SamplerAPLRowHistCount, sourceCoord);
             offsetSum10 += float(tex2Dfetch(SamplerAPLRowHistOffset10, sourceCoord));
             maxSumNits += float(tex2Dfetch(SamplerAPLRowHistMaxNits, sourceCoord));
+            topCountSum += tex2Dfetch(SamplerAPLRowHistCount, APL_RowTopCoord(rowIndex, binIndex));
         }
     }
 
     APL_ReduceCount[localIndex] = countSum;
     APL_ReduceOffset10[localIndex] = offsetSum10;
     APL_ReduceMaxNits[localIndex] = maxSumNits;
+    APL_ReduceTopCount[localIndex] = topCountSum;
     barrier();
 
     APL_REDUCE_ROW_STAGE(32)
@@ -2455,25 +2495,7 @@ void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadI
         tex2Dstore(StorageAPLGlobalHistCount, localBinCoord, APL_ReduceCount[0]);
         tex2Dstore(StorageAPLGlobalHistOffset10, localBinCoord, APL_ReduceOffset10[0]);
         tex2Dstore(StorageAPLGlobalHistMaxNits, localBinCoord, APL_ReduceMaxNits[0]);
-
-        if (binIndex == 0)
-        {
-            int exactMaxLumaQ4 = 0;
-            int exactMaxChannelQ4 = 0;
-
-            [loop]
-            for (int rowIndex = 0; rowIndex < APL_FFH_TILE_COUNT_Y; ++rowIndex)
-            {
-                if (APL_IsRowValid(rowIndex, expectedSignature))
-                {
-                    exactMaxLumaQ4 = max(exactMaxLumaQ4, tex2Dfetch(SamplerAPLRowHistCount, APL_RowExactMaxLumaCoord(rowIndex)));
-                    exactMaxChannelQ4 = max(exactMaxChannelQ4, tex2Dfetch(SamplerAPLRowHistCount, APL_RowExactMaxChannelCoord(rowIndex)));
-                }
-            }
-
-            tex2Dstore(StorageAPLGlobalHistCount, APL_GlobalExactMaxLumaCoord(), exactMaxLumaQ4);
-            tex2Dstore(StorageAPLGlobalHistCount, APL_GlobalExactMaxChannelCoord(), exactMaxChannelQ4);
-        }
+        tex2Dstore(StorageAPLGlobalHistCount, APL_GlobalTopCoord(binIndex), APL_ReduceTopCount[0]);
     }
 }
 
@@ -2536,9 +2558,37 @@ float APL_FindHighlightPeakNits()
     return 0.0;
 }
 
-float APL_LoadExactMaxNits(int2 coord)
+// Log-average level of the SCENE_MAX_PIXELS brightest pixels of one measure (0 = luma, 1 = brightest
+// channel), walked down its fine bins.
+float APL_FindSceneMaxNits(int measure)
 {
-    return float(tex2Dfetch(SamplerAPLGlobalHistCount, coord)) * 0.25;
+    float pixelsLeft = SCENE_MAX_PIXELS;
+    float logSumQ4 = 0.0;
+
+    [loop]
+    for (int topBin = APL_TOP_BINS - 1; topBin >= 0; --topBin)
+    {
+        float count = float(tex2Dfetch(SamplerAPLGlobalHistCount, APL_GlobalTopCoord(measure * APL_TOP_BINS + topBin)));
+
+        if (count > 0.0 && pixelsLeft > 0.0)
+        {
+            int lowerQ4 = 0;
+            int upperQ4 = 0;
+            APL_TopBinBoundsQ4(topBin, lowerQ4, upperQ4);
+
+            // The pixels taken are the top of the bin, spread evenly in log luminance.
+            float taken = min(count, pixelsLeft);
+            float logLower = log2(float(lowerQ4));
+            float logUpper = log2(float(upperQ4 + 1));
+            logSumQ4 += taken * (logUpper - 0.5 * (taken / count) * (logUpper - logLower));
+            pixelsLeft -= taken;
+        }
+    }
+
+    // Pixels below the fine range count at its floor, so a few bright pixels pull the maximum only
+    // part of the way up.
+    logSumQ4 += pixelsLeft * float(APL_TOP_MIN_EXPONENT);
+    return exp2(logSumQ4 / SCENE_MAX_PIXELS) * 0.25;
 }
 
 [shader("compute")]
@@ -2574,12 +2624,15 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
     APL_EvalBinLight[localIndex] = sceneNits * pixelCount;
     barrier();
 
+    float2 sceneMaxNits = 0.0.xx;
+
     if (localIndex == 0)
     {
+        sceneMaxNits = float2(APL_FindSceneMaxNits(0), APL_FindSceneMaxNits(1));
         float3 currentScenePQ = float3(
             NitsToPQ(APL_FindHighlightPeakNits()),
-            NitsToPQ(APL_LoadExactMaxNits(APL_GlobalExactMaxLumaCoord())),
-            NitsToPQ(APL_LoadExactMaxNits(APL_GlobalExactMaxChannelCoord())));
+            NitsToPQ(sceneMaxNits.x),
+            NitsToPQ(sceneMaxNits.y));
         float3 previousScenePQ = saturate(float3(prevData.a, prevMaxima.xy));
 
         // Smoothed in PQ so level shifts fade evenly in perceived brightness.
@@ -2670,7 +2723,7 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
         tex2Dstore(
             StorageAPLInstant,
             int2(0, 0),
-            float4(rawAPL, APL_LoadExactMaxNits(APL_GlobalExactMaxLumaCoord()), float(nextRollingPhase), float(APL_GetFrameStamp()))
+            float4(rawAPL, sceneMaxNits.x, float(nextRollingPhase), float(APL_GetFrameStamp()))
         );
         tex2Dstore(StorageAPL, int2(0, 0), float4(smoothedAPL, scenePQ.x, 1.0, sceneLogGain));
         tex2Dstore(StorageAPL, int2(1, 0), float4(scenePQ.yz, 0.0, 0.0));

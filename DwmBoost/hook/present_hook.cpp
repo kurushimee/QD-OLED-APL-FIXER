@@ -15,12 +15,12 @@ namespace {
 // Histogram geometry — must match boost.hlsl.
 const UINT TILE_SIZE = 32;
 const UINT BLOCK_W = 16, BLOCK_H = 16;
-const UINT ROW_COUNT_W = BLOCK_W + 1;   // aux column holds the exact scene maxima
+const UINT COUNT_W = BLOCK_W * 2;   // the count textures add one fine scene-maximum bin per histogram bin
 const UINT ROLLING_PHASES = 6;
 
 UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
 
-const double SETTLE_HOLD_MS = 1400.0;   // ~5 smoothing time constants + the 6-phase histogram refill
+const double SETTLE_HOLD_MS = 1400.0;   // keeps DWM composing while smoothing settles and the 6-phase histogram refills
 const double PRIME_MIN_GAP_MS = 1000.0;
 
 // Host config mirror (written by the watcher thread, read in the present path).
@@ -133,11 +133,11 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
 
     bool ok = true;
     ok &= CreateTex(s.dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, s.clean);
-    ok &= CreateTex(s.dev, ROW_COUNT_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowCount);
+    ok &= CreateTex(s.dev, COUNT_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowCount);
     ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowOffset);
     ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowMaxNits);
     ok &= CreateTex(s.dev, 1, tileCountY, DXGI_FORMAT_R32_SINT, true, true, s.rowMeta);
-    ok &= CreateTex(s.dev, ROW_COUNT_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, s.globalCount);
+    ok &= CreateTex(s.dev, COUNT_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, s.globalCount);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalOffset);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalMaxNits);
     ok &= CreateTex(s.dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplSmoothed);

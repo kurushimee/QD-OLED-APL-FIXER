@@ -36,7 +36,7 @@ The default settings match the calibration target, so most setups need no change
 
 ## How it works
 
-1. **Measure the scene.** The shader builds a brightness histogram of the full frame. To save GPU time, it refreshes one of six groups of rows each frame and keeps the rest from earlier frames. From the histogram, it finds the average picture level (APL) and the scene's highlight peak. The highlight peak is the level that only the brightest 1/256 of the frame's light sits above. It also records the frame's brightest luma level and brightest color channel level.
+1. **Measure the scene.** The shader builds a brightness histogram of the full frame. To save GPU time, it refreshes one of six groups of rows each frame and keeps the rest from earlier frames. From the histogram, it finds the average picture level (APL) and the scene's highlight peak. The highlight peak is the level that only the brightest 1/256 of the frame's light sits above. It also finds the frame's brightest luma level and brightest color channel level, each as the log average of the 64 brightest pixels, so one stray bright pixel barely moves the curve.
 2. **Look up the compensation.** A measured table tells how much the panel dims at each APL. For example, at 25% APL the panel reaches only about 36% of its peak, so the scene needs about 2.80 times more signal.
 3. **Account for its own boost.** Boosting the image raises the APL, and a higher APL makes the panel dim even more. The shader solves for the APL that the panel will actually see after the boost and picks the gain from that.
 4. **Smooth the change.** The APL, the highlight peak, and the brightest levels change gradually over time, so the brightness does not jump between frames.
@@ -75,7 +75,7 @@ The 1% window reads lower than the 2% window. ABL only dims the panel more as th
 | Compensation Freeze APL % | 50 | Holds the compensation at its value for this APL in all brighter scenes. Lower values limit the boost in bright scenes. 0 turns the hold off, so the boost follows the measured table up to 100% APL. |
 | Panel Peak (nits) | 1060 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
 | Shoulder Span (PQ) | 0.30 | Sets the PQ range below the boosted scene's brightest level that absorbs whatever cannot fit under the panel peak. Wider keeps more highlight detail and dims more of the scene slightly, and narrower keeps more of the scene exact and flattens highlights more. |
-| APL Smoothing Time (s) | 0.05 | Sets how long the shader takes to follow a change in scene brightness. Raise it if the brightness looks jumpy. 0 turns smoothing off. |
+| APL Smoothing Time (s) | 0.033 | Sets how long the shader takes to follow a change in scene brightness. Raise it if the brightness looks jumpy. 0 turns smoothing off. |
 | scRGB Signal Reference (nits) | 80 | Sets the brightness of scRGB value 1.0. It only matters for scRGB games. |
 | Show APL Stats | Off | Shows live numbers in the top right corner. |
 | OSD Brightness | 0.5 | Sets the brightness of the stats display and the debug graph. It does not change the image. |

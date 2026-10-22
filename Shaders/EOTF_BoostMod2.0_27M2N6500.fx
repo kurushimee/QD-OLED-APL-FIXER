@@ -210,8 +210,8 @@ uniform float TransitionSpeed <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
     ui_label = "APL Smoothing Time (s)";
-    UI_TOOLTIP("Smooths changes in APL, highlight peak, and scene maximum over time. 0 disables smoothing.")
-> = 0.033;
+    UI_TOOLTIP("Smooths changes in APL, highlight peak, and scene maximum over time. Sudden large brightness changes shorten it so they land almost at once. 0 disables smoothing.")
+> = 0.25;
 
 uniform float SIGNAL_REFERENCE_NITS <
     ui_type = "slider";
@@ -301,7 +301,7 @@ uniform bool GraphUsePQSpace <
 #endif
 
 
-// Texel 0 holds the smoothed APL state; texel 1 holds the smoothed scene maxima in PQ.
+// Texel 0 holds the smoothed APL state, texel 1 the smoothed scene maxima in PQ and the smoothing time.
 texture TexAPL
 {
     Width = 2;
@@ -785,6 +785,10 @@ static const float HIGHLIGHT_PEAK_LIGHT_FRACTION = 1.0 / 256.0;
 // most 1/SCENE_MAX_PIXELS of its distance from the rest instead of reshaping the whole curve.
 static const float SCENE_MAX_PIXELS = 64.0;
 
+// Gap between the gain and its target, in log2 gain, that halves the smoothing time. Sudden changes a few
+// times this size land almost at once, smaller ones keep the full smoothing.
+static const float SMOOTHING_HALVING_GAIN_GAP = 0.08;
+
 // PQ width over which the slope eases from the full gain to the highlight contrast.
 static const float KNEE_TRANSITION_PQ = 0.04;
 
@@ -1094,6 +1098,16 @@ float ComputeSceneLogGainFromAPL(float currentAPL)
 {
     float aplPct = saturate(currentAPL) * 100.0;
     return log2(max(LookupMeasuredComp1D(aplPct), 1.0));
+}
+
+// Shrinks while the gain trails its target by a large step, and grows back toward TransitionSpeed at the
+// same pace afterwards, so the end of a big change does not slow down again.
+float ComputeSmoothingTime(float previousSmoothingTime, float targetAPL, float smoothedAPL)
+{
+    float relaxedTime = lerp(previousSmoothingTime, TransitionSpeed, ComputeTemporalBlendFactor(TransitionSpeed));
+    float gainGap = abs(ComputeSceneLogGainFromAPL(targetAPL) - ComputeSceneLogGainFromAPL(smoothedAPL));
+    float gapRatio = gainGap / SMOOTHING_HALVING_GAIN_GAP;
+    return min(relaxedTime, TransitionSpeed * exp2(-gapRatio * gapRatio));
 }
 
 
@@ -2603,7 +2617,9 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
     float4 prevData = tex2Dfetch(SamplerAPLPrev, int2(0, 0));
     float4 prevMaxima = tex2Dfetch(SamplerAPLPrev, int2(1, 0));
     float hasPrev = (prevData.b > 0.0) ? 1.0 : 0.0;
-    float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
+
+    // The scene levels feed the curves the solve tests, so they take the smoothing time the previous frame set.
+    float sceneAlpha = ComputeTemporalBlendFactor(prevMaxima.z);
 
     float pixelCount = 0.0;
     float sceneNits = 0.0;
@@ -2638,7 +2654,7 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
         // Smoothed in PQ so level shifts fade evenly in perceived brightness.
         APL_EvalScenePQ = lerp(
             currentScenePQ,
-            lerp(previousScenePQ, currentScenePQ, alpha),
+            lerp(previousScenePQ, currentScenePQ, sceneAlpha),
             hasPrev
         );
     }
@@ -2712,9 +2728,12 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
         int nextRollingPhase = APL_GetNextRollingPhase(currentRollingPhase);
 
         float currentDisplayAPL = SolveClosedLoopDisplayAPLFromResponseNodes(rawAPL, responseNodes, gMax);
+        float smoothingTime = (hasPrev > 0.0)
+            ? ComputeSmoothingTime(prevMaxima.z, currentDisplayAPL, saturate(prevData.r))
+            : TransitionSpeed;
         float smoothedAPL = lerp(
             currentDisplayAPL,
-            lerp(saturate(prevData.r), currentDisplayAPL, alpha),
+            lerp(saturate(prevData.r), currentDisplayAPL, ComputeTemporalBlendFactor(smoothingTime)),
             hasPrev
         );
 
@@ -2726,7 +2745,7 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
             float4(rawAPL, sceneMaxNits.x, float(nextRollingPhase), float(APL_GetFrameStamp()))
         );
         tex2Dstore(StorageAPL, int2(0, 0), float4(smoothedAPL, scenePQ.x, 1.0, sceneLogGain));
-        tex2Dstore(StorageAPL, int2(1, 0), float4(scenePQ.yz, 0.0, 0.0));
+        tex2Dstore(StorageAPL, int2(1, 0), float4(scenePQ.yz, smoothingTime, 0.0));
 
         float sceneGain = SceneGainFromLogGain(sceneLogGain);
         BoostCurve lumaCurve = MakeLumaBoostCurve(sceneGain, scenePQ);

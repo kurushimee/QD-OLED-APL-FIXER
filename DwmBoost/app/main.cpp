@@ -1,5 +1,5 @@
 // DwmBoost tray host. Injects the hook DLL into dwm.exe, keeps it resident, and toggles the effect
-// through a shared-memory flag. Hotkeys: Ctrl+Alt+Shift+End = on, Home = off. The kicker thread keeps
+// through a shared-memory flag; the effect starts on. Hotkeys: Ctrl+Alt+Shift+End = on, Home = off. The kicker thread keeps
 // DWM composing the target monitor while the effect is still settling on a static desktop.
 #include <windows.h>
 #include <shellapi.h>
@@ -262,7 +262,8 @@ DWORD RemoteCall(HANDLE proc, void* fn, void* arg)
 {
     HANDLE th = CreateRemoteThread(proc, nullptr, 0, (LPTHREAD_START_ROUTINE)fn, arg, 0, nullptr);
     if (!th) return 0xFFFFFFFF;
-    WaitForSingleObject(th, 15000);
+    // No timeout: a timed-out wait reads STILL_ACTIVE (259) as the result while the call keeps running.
+    WaitForSingleObject(th, INFINITE);
     DWORD code = 0xFFFFFFFF;
     GetExitCodeThread(th, &code);
     CloseHandle(th);
@@ -365,6 +366,14 @@ void PaintLayered(HWND w, int x, int y, int cw, int ch, BYTE alpha, HDC screen, 
     UpdateLayeredWindow(w, screen, &pos, &sz, mem, &src, 0, &bf, ULW_ALPHA);
 }
 
+// The kick and prime windows are top-level: their thread must answer messages, or Windows marks
+// DwmBoost as hung and holds shutdown on it.
+void PumpMessages()
+{
+    MSG m;
+    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
+}
+
 DWORD WINAPI KickThread(LPVOID)
 {
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -400,13 +409,15 @@ DWORD WINAPI KickThread(LPVOID)
 
     for (;;)
     {
+        PumpMessages();
+
         ULONGLONG now = GetTickCount64();
         bool kicking = lastSettleMs && (now - lastSettleMs < QUIET_MS);
 
         if (!kicking && primeUntilMs == 0)
         {
             HANDLE waits[3] = { g_kickStop, g_settleEvt, g_primeEvt };
-            DWORD w = WaitForMultipleObjects(3, waits, FALSE, 1000);
+            DWORD w = MsgWaitForMultipleObjects(3, waits, FALSE, 1000, QS_ALLINPUT);
             if (w == WAIT_OBJECT_0) break;
             if (w == WAIT_OBJECT_0 + 1) lastSettleMs = GetTickCount64();
             else if (w == WAIT_OBJECT_0 + 2) primeUntilMs = GetTickCount64() + 100;
@@ -586,6 +597,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
             MessageBoxW(nullptr, L"Could not elevate to SYSTEM (needed to inject into dwm.exe).", L"DwmBoost", MB_OK | MB_ICONERROR);
             return 1;
         }
+        // A hook left resident by a host that exited without ejecting locks the staged DLL.
+        ShutdownAndEject(g_dwmPid);
         st = InjectAndInit(g_dwmPid, err);
         RevertToSelf();
     }
@@ -604,6 +617,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
     RegisterHotKey(g_hwnd, HOTKEY_OFF, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_HOME);
     SetTray(g_hwnd, true);
     SetTimer(g_hwnd, 1, 2000, nullptr);   // heartbeat watch
+    Toggle(true);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0))

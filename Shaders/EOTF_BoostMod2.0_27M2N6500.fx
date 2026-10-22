@@ -199,7 +199,7 @@ uniform float TransitionSpeed <
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
     ui_label = "APL Smoothing Time (s)";
     UI_TOOLTIP("Smooths changes in APL, highlight peak, and scene maximum over time. 0 disables smoothing.")
-> = 0.0;
+> = 0.05;
 
 uniform float SIGNAL_REFERENCE_NITS <
     ui_type = "slider";

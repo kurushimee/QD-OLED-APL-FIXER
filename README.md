@@ -75,7 +75,7 @@ The 1% window reads lower than the 2% window. ABL only dims the panel more as th
 | Compensation Freeze APL % | 50 | Holds the compensation at its value for this APL in all brighter scenes. Lower values limit the boost in bright scenes. 0 turns the hold off, so the boost follows the measured table up to 100% APL. |
 | Panel Peak (nits) | 1060 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
 | Shoulder Span (PQ) | 0.30 | Sets the PQ range below the boosted scene's brightest level that absorbs whatever cannot fit under the panel peak. Wider keeps more highlight detail and dims more of the scene slightly, and narrower keeps more of the scene exact and flattens highlights more. |
-| APL Smoothing Time (s) | 0 | Sets how long the shader takes to follow a change in scene brightness. 0 follows every change instantly. Raise it if the brightness looks jumpy. |
+| APL Smoothing Time (s) | 0.05 | Sets how long the shader takes to follow a change in scene brightness. Raise it if the brightness looks jumpy. 0 turns smoothing off. |
 | scRGB Signal Reference (nits) | 80 | Sets the brightness of scRGB value 1.0. It only matters for scRGB games. |
 | Show APL Stats | Off | Shows live numbers in the top right corner. |
 | OSD Brightness | 0.5 | Sets the brightness of the stats display and the debug graph. It does not change the image. |

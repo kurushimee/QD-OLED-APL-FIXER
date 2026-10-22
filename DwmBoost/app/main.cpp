@@ -24,6 +24,7 @@ const wchar_t* kMutexName = L"Local\\DwmBoost_SingleInstance";
 const wchar_t* kTaskName = L"DwmBoost";
 
 const UINT WM_TRAY = WM_APP + 1;
+const UINT WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
 const UINT HOTKEY_ON = 1;
 const UINT HOTKEY_OFF = 2;
 enum { CMD_ENABLE = 100, CMD_DISABLE, CMD_AUTOSTART, CMD_QUIT };
@@ -39,6 +40,7 @@ DWORD g_dwmPid = 0;
 bool g_enabled = false;
 Target g_target;
 NOTIFYICONDATAW g_nid = {};
+bool g_trayAdded = false;
 
 // -------- logging --------
 void Logf(const wchar_t* fmt, ...)
@@ -503,7 +505,10 @@ void SetTray(HWND hwnd, bool create)
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = LoadIconW(nullptr, g_enabled ? IDI_WINLOGO : IDI_APPLICATION);
     wcscpy_s(g_nid.szTip, g_enabled ? L"DwmBoost: on" : L"DwmBoost: off");
-    Shell_NotifyIconW(create ? NIM_ADD : NIM_MODIFY, &g_nid);
+
+    // NIM_MODIFY succeeds when an earlier add that timed out went through after all.
+    if (create) g_trayAdded = Shell_NotifyIconW(NIM_ADD, &g_nid) || Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    else Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
 void Toggle(bool on)
@@ -530,6 +535,13 @@ void ShowMenu(HWND hwnd)
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    // Broadcast when a tray host starts (the taskbar at logon or after an Explorer restart); icons must be re-added.
+    if (msg == WM_TASKBARCREATED)
+    {
+        SetTray(hwnd, true);
+        return 0;
+    }
+
     switch (msg)
     {
     case WM_HOTKEY:
@@ -552,6 +564,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         // Heartbeat watch: if the hook vanished (DWM restart / fault), mark off and do not reinject.
         if (!HeartbeatAlive() && g_enabled) { g_enabled = false; StopKicker(); if (g_config) g_config->enabled = 0; SetTray(hwnd, false); }
+        if (!g_trayAdded) SetTray(hwnd, true);   // the shell can refuse icons early in logon
         return 0;
     case WM_DESTROY:
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -566,7 +579,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
 {
     HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        MessageBoxW(nullptr, L"DwmBoost is already running.", L"DwmBoost", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
 
     EnablePrivilege(SE_DEBUG_NAME);
 
@@ -611,7 +628,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
 
     WNDCLASSW wc = {}; wc.lpfnWndProc = WndProc; wc.hInstance = inst; wc.lpszClassName = kWndClass;
     RegisterClassW(&wc);
-    g_hwnd = CreateWindowExW(0, kWndClass, L"DwmBoost", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
+    // Hidden top-level, not message-only, so it receives the TaskbarCreated broadcast; the filter lets
+    // that broadcast and the tray callbacks through from the non-elevated shell.
+    g_hwnd = CreateWindowExW(0, kWndClass, L"DwmBoost", 0, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
+    ChangeWindowMessageFilterEx(g_hwnd, WM_TASKBARCREATED, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(g_hwnd, WM_TRAY, MSGFLT_ALLOW, nullptr);
 
     RegisterHotKey(g_hwnd, HOTKEY_ON, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_END);
     RegisterHotKey(g_hwnd, HOTKEY_OFF, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_HOME);

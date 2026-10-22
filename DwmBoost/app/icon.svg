@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bezel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d8dce6"/>
+      <stop offset="1" stop-color="#8b92a6"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2238"/>
+      <stop offset="1" stop-color="#05060a"/>
+    </linearGradient>
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#ffb000" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ffb000" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe866"/>
+      <stop offset="0.5" stop-color="#ffc21a"/>
+      <stop offset="1" stop-color="#ff9500"/>
+    </linearGradient>
+  </defs>
+  <path d="M108 192H148L156 228H100Z" fill="#7d8398"/>
+  <rect x="60" y="226" width="136" height="30" rx="15" fill="url(#bezel)"/>
+  <rect width="256" height="192" rx="28" fill="url(#bezel)"/>
+  <rect x="16" y="16" width="224" height="160" rx="12" fill="url(#screen)"/>
+  <ellipse cx="128" cy="96" rx="88" ry="68" fill="url(#glow)"/>
+  <path d="M119 30H161L140 79H167L102 162L117 102H89Z" fill="url(#bolt)"/>
+</svg>

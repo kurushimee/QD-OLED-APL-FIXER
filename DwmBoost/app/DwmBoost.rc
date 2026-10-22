@@ -1,0 +1,5 @@
+#include "resource.h"
+
+// The lowest ID is the one Explorer shows for the executable.
+IDI_BOOST_ON  ICON "icon.ico"
+IDI_BOOST_OFF ICON "icon_off.ico"

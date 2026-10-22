@@ -49,6 +49,7 @@ set_target_properties(DwmBoostHook PROPERTIES OUTPUT_NAME "DwmBoostHook")
 # --- Tray host ---
 add_executable(DwmBoost WIN32
     app/main.cpp
+    app/DwmBoost.rc
     app/app.manifest)
 target_link_libraries(DwmBoost PRIVATE user32 shell32 dwmapi advapi32 gdi32)
 # The app.manifest carries the UAC trustInfo; stop the linker synthesizing a conflicting one.

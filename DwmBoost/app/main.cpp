@@ -11,6 +11,7 @@
 #include <atomic>
 
 #include "../shared/ipc.h"
+#include "resource.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -41,6 +42,7 @@ bool g_enabled = false;
 Target g_target;
 NOTIFYICONDATAW g_nid = {};
 bool g_trayAdded = false;
+HICON g_iconOn = nullptr, g_iconOff = nullptr;
 
 // -------- logging --------
 void Logf(const wchar_t* fmt, ...)
@@ -498,12 +500,18 @@ void InstallAutostart()
 
 // -------- tray --------
 
+HICON LoadTrayIcon(int id)
+{
+    return static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(id), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+}
+
 void SetTray(HWND hwnd, bool create)
 {
     g_nid.cbSize = sizeof(g_nid); g_nid.hWnd = hwnd; g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon = LoadIconW(nullptr, g_enabled ? IDI_WINLOGO : IDI_APPLICATION);
+    g_nid.hIcon = g_enabled ? g_iconOn : g_iconOff;
     wcscpy_s(g_nid.szTip, g_enabled ? L"DwmBoost: on" : L"DwmBoost: off");
 
     // NIM_MODIFY succeeds when an earlier add that timed out went through after all.
@@ -636,6 +644,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
 
     RegisterHotKey(g_hwnd, HOTKEY_ON, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_END);
     RegisterHotKey(g_hwnd, HOTKEY_OFF, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_HOME);
+    g_iconOn = LoadTrayIcon(IDI_BOOST_ON);
+    g_iconOff = LoadTrayIcon(IDI_BOOST_OFF);
     SetTray(g_hwnd, true);
     SetTimer(g_hwnd, 1, 2000, nullptr);   // heartbeat watch
     Toggle(true);

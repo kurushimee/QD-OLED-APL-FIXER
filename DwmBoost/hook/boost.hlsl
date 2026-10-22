@@ -26,7 +26,7 @@ static const float APLReferenceWhiteNits        = 1060.0;
 static const float PanelPeakNits                = 1060.0;
 static const float CompensationFreezeAPLPercent = 50.0;
 static const float ShoulderSpanPQ               = 0.30;
-static const float TransitionSpeed              = 0.25;   // APL smoothing time, seconds
+static const float TransitionSpeed              = 0.0;    // APL smoothing time, seconds
 static const float SIGNAL_REFERENCE_NITS        = 80.0;   // scRGB 1.0
 
 // Full-frame histogram layout. Each 16x16 group processes one 32x32 pixel tile.

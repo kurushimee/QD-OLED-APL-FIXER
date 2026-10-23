@@ -22,12 +22,11 @@
 // the previous run's targets over the gap, as the ReShade passes would on the repeated frames.
 
 // Baked defaults (ReShade uniform values).
-static const float APLReferenceWhiteNits        = 1060.0;
-static const float PanelPeakNits                = 1060.0;
-static const float CompensationFreezeAPLPercent = 50.0;
-static const float ShoulderSpanPQ               = 0.30;
-static const float TransitionSpeed              = 0.25;   // APL smoothing time, seconds
-static const float SIGNAL_REFERENCE_NITS        = 80.0;   // scRGB 1.0
+static const float APLReferenceWhiteNits = 1060.0;
+static const float PanelPeakNits         = 1060.0;
+static const float ShoulderSpanPQ        = 0.30;
+static const float TransitionSpeed       = 0.25;   // APL smoothing time, seconds
+static const float SIGNAL_REFERENCE_NITS = 80.0;   // scRGB 1.0
 
 // Full-frame histogram layout. Each 16x16 group processes one 32x32 pixel tile.
 #define APL_FFH_TILE_SIZE        32
@@ -306,24 +305,42 @@ float SegmentLerp(float x, float x0, float y0, float x1, float y1)
 }
 
 // Measured APL anchors of the compensation table.
-static const int APL_ANCHOR_COUNT = 7;
+static const int APL_ANCHOR_COUNT = 24;
 
 static const float APL_ANCHOR_POINTS[APL_ANCHOR_COUNT] =
 {
-    2.000000, 5.000000, 10.000000, 25.000000, 50.000000, 75.000000, 100.000000
+      3.0,   4.0,   5.0,   6.0,   7.0,   8.0,   9.0,  10.0,
+     11.0,  12.0,  13.0,  14.0,  15.0,  17.0,  20.0,  22.0,
+     25.0,  27.0,  30.0,  35.0,  40.0,  50.0,  75.0, 100.0
 };
 
-// 1D compensation: the 1060 nit peak at 2% APL divided by the peak at each anchor,
-// measured by TFTCentral on the Dell Alienware AW2725DF (same panel, HDR Peak 1000, FW M2B102).
+// 1D compensation, the 1060 nit peak at 3% APL divided by the measured peak at each anchor.
 static const float COMP_APL_1D[APL_ANCHOR_COUNT] =
 {
-    1.000000, // 2%   (1060 nits)
-    1.362468, // 5%   (778 nits)
-    2.217573, // 10%  (478 nits)
-    2.796834, // 25%  (379 nits)
-    3.322884, // 50%  (319 nits)
-    3.680556, // 75%  (288 nits)
-    3.925926  // 100% (270 nits)
+    1.000000, // 3%   (1060.0 nits)
+    1.147683, // 4%   (923.6 nits)
+    1.302371, // 5%   (813.9 nits)
+    1.467331, // 6%   (722.4 nits)
+    1.638837, // 7%   (646.8 nits)
+    1.804870, // 8%   (587.3 nits)
+    1.970627, // 9%   (537.9 nits)
+    2.134085, // 10%  (496.7 nits)
+    2.193709, // 11%  (483.2 nits)
+    2.237231, // 12%  (473.8 nits)
+    2.285468, // 13%  (463.8 nits)
+    2.324561, // 14%  (456.0 nits)
+    2.376149, // 15%  (446.1 nits)
+    2.437902, // 17%  (434.8 nits)
+    2.545629, // 20%  (416.4 nits)
+    2.594859, // 22%  (408.5 nits)
+    2.693774, // 25%  (393.5 nits)
+    2.746826, // 27%  (385.9 nits)
+    2.807947, // 30%  (377.5 nits)
+    2.895384, // 35%  (366.1 nits)
+    3.001982, // 40%  (353.1 nits)
+    3.178411, // 50%  (333.5 nits)
+    3.476550, // 75%  (304.9 nits)
+    3.686957  // 100% (287.5 nits)
 };
 
 int FindAPLAnchorIndex(float aplPct)
@@ -335,25 +352,17 @@ int FindAPLAnchorIndex(float aplPct)
     return min(idx, APL_ANCHOR_COUNT - 2);
 }
 
-float ApplyCompensationFreezeAPL(float aplPct)
+// Log compensation, and so log nits, is linear in log APL between anchors.
+float LookupMeasuredLogComp1D(float aplPct)
 {
-    float freezeAPL = CompensationFreezeAPLPercent;
-    if (freezeAPL > 0.0)
-        aplPct = min(aplPct, freezeAPL);
-    return aplPct;
-}
-
-float LookupMeasuredComp1D(float aplPct)
-{
-    float lookupAPL = ApplyCompensationFreezeAPL(aplPct);
-    float clampedAPL = clamp(lookupAPL, APL_ANCHOR_POINTS[0], APL_ANCHOR_POINTS[APL_ANCHOR_COUNT - 1]);
+    float clampedAPL = clamp(aplPct, APL_ANCHOR_POINTS[0], APL_ANCHOR_POINTS[APL_ANCHOR_COUNT - 1]);
     int a0 = FindAPLAnchorIndex(clampedAPL);
     int a1 = min(a0 + 1, APL_ANCHOR_COUNT - 1);
 
     return SegmentLerp(
-        clampedAPL,
-        APL_ANCHOR_POINTS[a0], COMP_APL_1D[a0],
-        APL_ANCHOR_POINTS[a1], COMP_APL_1D[a1]
+        log2(clampedAPL),
+        log2(APL_ANCHOR_POINTS[a0]), log2(COMP_APL_1D[a0]),
+        log2(APL_ANCHOR_POINTS[a1]), log2(COMP_APL_1D[a1])
     );
 }
 
@@ -369,7 +378,7 @@ float ComputeTemporalBlendFactor(float smoothingSeconds, float elapsedMs)
 float ComputeSceneLogGainFromAPL(float currentAPL)
 {
     float aplPct = saturate(currentAPL) * 100.0;
-    return log2(max(LookupMeasuredComp1D(aplPct), 1.0));
+    return max(LookupMeasuredLogComp1D(aplPct), 0.0);
 }
 
 // Shrinks while the gain trails its target by a large step, and grows back toward TransitionSpeed at the

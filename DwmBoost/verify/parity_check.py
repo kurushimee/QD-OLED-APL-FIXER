@@ -11,15 +11,17 @@ import math
 # Baked defaults (must match boost.hlsl).
 APL_REF_WHITE = 1060.0
 PANEL_PEAK = 1060.0
-FREEZE_APL = 50.0
 HI_CONTRAST = 0.40
 SIG_REF = 80.0
 OUTLIER = 0.25
 BLEND_POW = 6.0
 CLEARANCE = 3.0
 
-ANCHORS = [2.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0]
-COMP = [1.0, 1.362468, 2.217573, 2.796834, 3.322884, 3.680556, 3.925926]
+ANCHORS = [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 17.0, 20.0, 22.0, 25.0, 27.0, 30.0,
+           35.0, 40.0, 50.0, 75.0, 100.0]
+COMP = [1.000000, 1.147683, 1.302371, 1.467331, 1.638837, 1.804870, 1.970627, 2.134085, 2.193709, 2.237231, 2.285468,
+        2.324561, 2.376149, 2.437902, 2.545629, 2.594859, 2.693774, 2.746826, 2.807947, 2.895384, 3.001982, 3.178411,
+        3.476550, 3.686957]
 
 PQ_M1, PQ_M2 = 0.1593017578125, 78.84375
 PQ_C1, PQ_C2, PQ_C3 = 0.8359375, 18.8515625, 18.6875
@@ -55,17 +57,18 @@ def seg_lerp(x, x0, y0, x1, y1):
     return y0 + (y1 - y0) * t
 
 
-def lookup_comp_1d(apl_pct):
-    a = min(apl_pct, FREEZE_APL) if FREEZE_APL > 0 else apl_pct
-    a = min(max(a, ANCHORS[0]), ANCHORS[-1])
+def lookup_log_comp_1d(apl_pct):
+    a = min(max(apl_pct, ANCHORS[0]), ANCHORS[-1])
     i = 0
     while i < len(ANCHORS) - 2 and ANCHORS[i + 1] <= a:
         i += 1
-    return seg_lerp(a, ANCHORS[i], COMP[i], ANCHORS[i + 1], COMP[i + 1])
+    return seg_lerp(math.log2(a),
+                    math.log2(ANCHORS[i]), math.log2(COMP[i]),
+                    math.log2(ANCHORS[i + 1]), math.log2(COMP[i + 1]))
 
 
 def scene_log_gain(apl01):
-    return math.log2(max(lookup_comp_1d(min(max(apl01, 0.0), 1.0) * 100.0), 1.0))
+    return max(lookup_log_comp_1d(min(max(apl01, 0.0), 1.0) * 100.0), 0.0)
 
 
 def cand_max_log_gain():
@@ -181,9 +184,10 @@ def main():
     fails = 0
 
     # 1. Baked table matches the published measurements (compensation = 1060-nit peak / peak at APL).
-    peaks = {2: 1060.0, 5: 778.0, 10: 478.0, 25: 379.0, 50: 319.0, 75: 288.0, 100: 270.0}
-    for apl, comp in zip(ANCHORS, COMP):
-        expect = 1060.0 / peaks[int(apl)]
+    peaks = [1060.0, 923.6, 813.9, 722.4, 646.8, 587.3, 537.9, 496.7, 483.2, 473.8, 463.8, 456.0, 446.1, 434.8, 416.4,
+             408.5, 393.5, 385.9, 377.5, 366.1, 353.1, 333.5, 304.9, 287.5]
+    for apl, comp, peak in zip(ANCHORS, COMP, peaks):
+        expect = 1060.0 / peak
         if abs(expect - comp) > 5e-4:
             print(f"FAIL table {apl}%: baked {comp:.6f} vs peak-derived {expect:.6f}")
             fails += 1
@@ -193,7 +197,7 @@ def main():
     print("\n  level(nits)  rawAPL%  solvedAPL%   gain   comp(solvedAPL)")
     for level in (20, 60, 150, 300, 530, 795, 1060):
         raw, disp, gain = solve_flat_field(level)
-        comp_at = lookup_comp_1d(disp * 100.0)
+        comp_at = 2.0 ** lookup_log_comp_1d(disp * 100.0)
         print(f"  {level:9.0f}  {raw*100:7.2f}  {disp*100:9.2f}  {gain:6.3f}  {comp_at:7.3f}")
         if abs(gain - comp_at) > 1e-2:
             print(f"FAIL fixed point at {level} nits: gain {gain:.4f} != comp {comp_at:.4f}")

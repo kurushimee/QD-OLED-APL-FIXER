@@ -187,7 +187,6 @@ bool CreateConfig()
     init.monLeft = g_target.left; init.monTop = g_target.top;
     init.monWidth = g_target.width; init.monHeight = g_target.height;
     init.monHdr = g_target.hdr ? 1u : 0u;
-    init.monRefreshMs = (float)g_target.refreshMs;
     init.monLitFraction = (float)g_target.litFraction;
     init.hostPid = GetCurrentProcessId();
     *g_config = init;
@@ -205,7 +204,6 @@ void WriteEnabled(bool enabled)
     g_config->monLeft = g_target.left; g_config->monTop = g_target.top;
     g_config->monWidth = g_target.width; g_config->monHeight = g_target.height;
     g_config->monHdr = g_target.hdr ? 1u : 0u;
-    g_config->monRefreshMs = (float)g_target.refreshMs;
     g_config->monLitFraction = (float)g_target.litFraction;
     g_config->hostPid = GetCurrentProcessId();
     MemoryBarrier();

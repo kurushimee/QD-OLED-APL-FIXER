@@ -36,13 +36,13 @@ The default settings match the calibration target, so most setups need no change
 
 ## How it works
 
-1. **Measure the scene.** The shader builds a brightness histogram of the full frame. To save GPU time, it refreshes one of six groups of rows each frame and keeps the rest from earlier frames. From the histogram, it finds the average picture level (APL) and the scene's highlight peak. The highlight peak is the level that only the brightest 1/256 of the frame's light sits above. It also finds the frame's brightest luma level and brightest color channel level, each as the log average of the 64 brightest pixels, so one stray bright pixel barely moves the curve.
+1. **Measure the scene.** The shader builds a brightness histogram of the full frame, every frame, and finds the average picture level (APL) from it. Each pixel counts toward the APL the way it loads the panel, from the panel's own red, green, and blue: partly by its brightest subpixel and partly by the mean of all three, so a pure primary loads the panel 0.75 as much as white at the same channel level and gray loads it at its luma.
 2. **Look up the compensation.** A measured table tells how much the panel dims at each APL. For example, at 25% APL the panel reaches only about 37% of its peak, so the scene needs about 2.69 times more signal.
-3. **Account for its own boost.** Boosting the image raises the APL, and a higher APL makes the panel dim even more. The shader solves for the APL that the panel will actually see after the boost and picks the gain from that.
-4. **Smooth the change.** The gain, the highlight peak, and the brightest levels change gradually over time, so the brightness does not jump between frames. The gain is smoothed in log space, so equal steps in brightness take equal time whether the scene gets brighter or darker. The further the gain falls behind its target, the shorter the smoothing gets, so a sudden large change such as an explosion or a scene cut lands almost at once while small fluctuations stay smooth.
-5. **Apply the boost.** Every level up to a knee gets the full gain. If the whole boosted scene fits under the panel peak, the knee sits where the gain reaches the peak, so nothing in the scene is compressed. If the brightest content would go past the peak, a smooth curve in PQ space compresses only the top of the range. Up to the scene's highlight peak, every level keeps the same share of its contrast, so fine texture stays visible in bright areas. That share depends on how far the boosted scene would go past the peak: the overshoot is spread over a fixed range below the scene's brightest level, set by **Shoulder Span**. A small overshoot costs each level a little contrast, and a large one costs more. Above the highlight peak, the rarer and brighter content eases down to a quarter of its contrast and reaches the panel peak at the scene's brightest level. The knee is the highest level that leaves room for both, so it drops only as far as the scene needs.
+3. **Account for its own boost.** Boosting the image raises the APL, and a higher APL makes the panel dim even more. The shader measures each frame's APL with the boost applied, which is the APL the panel actually sees.
+4. **Cancel the dimming the panel applies.** The panel dims each frame for the APL of the frame before it, the last one it has fully received. The gain for each frame is the compensation for that APL, so every frame is compensated for exactly the dimming it gets, including the first frame after a cut. When the boost changes the APL, the gain settles over the next few frames while each of those frames still gets the right brightness.
+5. **Apply the boost.** Every level up to a knee gets the full gain. The panel cannot show more than its peak divided by the gain, so above the knee a smooth curve in PQ space eases the slope down to a quarter of the PQ contrast and lands the panel peak signal on the panel peak. The knee depends only on the gain, from 692 nits at a gain of 1.2 down to 155 nits at the highest gain of 3.69. Nothing else in the scene moves it, so a level keeps its brightness when a bright sky or lamp comes into view. Levels between the knee and the panel's limit lose a little brightness even with nothing brighter in the frame, and levels above the limit keep a quarter of their PQ contrast.
 
-Luma drives the boost, and all three color channels scale by the same amount, so colors keep their hue. A looser curve on the brightest color channel only keeps that channel under the panel peak. The shader never makes any part of the image darker than the source.
+Luma drives the boost, and all three color channels scale by the same amount, so colors keep their hue. The brightest color channel follows the same curve, which keeps it under the panel peak. The shader never makes any part of the image darker than the source.
 
 The analysis runs only while the boost or the stats display is on.
 
@@ -87,8 +87,6 @@ The shader gives no boost below 3% APL. Between the points, it interpolates the 
 | Input Signal | Auto | Picks how to read the game's HDR output: **Auto**, **PQ (HDR10)**, or **scRGB**. Auto follows the format that ReShade reports and falls back to PQ. |
 | APL Reference White (nits) | 1060 | Sets the brightness that counts as 100% APL. Keep it at the calibrated peak. A higher value makes scenes read darker, which lowers the boost. |
 | Panel Peak (nits) | 1060 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
-| Shoulder Span (PQ) | 0.30 | Sets the PQ range below the boosted scene's brightest level that absorbs whatever cannot fit under the panel peak. Wider keeps more highlight detail and dims more of the scene slightly, and narrower keeps more of the scene exact and flattens highlights more. |
-| APL Smoothing Time (s) | 0.25 | Sets how long the shader takes to follow a small change in scene brightness. Sudden large changes go much faster. Raise it if the brightness looks jumpy. 0 turns smoothing off. |
 | scRGB Signal Reference (nits) | 80 | Sets the brightness of scRGB value 1.0. It only matters for scRGB games. |
 | Show APL Stats | Off | Shows live numbers in the top right corner. |
 | OSD Brightness | 0.5 | Sets the brightness of the stats display and the debug graph. It does not change the image. |
@@ -98,8 +96,8 @@ The stats display has three rows:
 | Row | Meaning |
 |---|---|
 | RAW APL | APL of the game's image before the boost. |
-| OUT APL | APL that the panel sees after the boost at the current smoothed gain. |
-| RAW NITS | Highest luma in the game's image, in nits. The shader tracks it only while the stats display is on. |
+| OUT APL | APL that the panel sees after the boost. |
+| KNEE NIT | Output level where the highlight shoulder starts, in nits. It turns orange whenever the boost raises the signal, and shows the panel peak at 3% APL and below, where there is no boost. |
 
 ## Preprocessor definitions
 
@@ -107,7 +105,6 @@ These options are set in the ReShade overlay, in the shader's preprocessor defin
 
 | Definition | Default | What it does |
 |---|---|---|
-| `APL_FULLFRAME_ROLLING_PHASES` | 6 | Splits the histogram rows into this many groups and refreshes one group per frame. 0 refreshes every row each frame, which costs more GPU time. |
 | `PQHDRLUT_ENABLE` | 0 | 1 adds a 3D calibration LUT that runs after the boost. |
 | `PQHDRLUT_SIZE` | 65 | Sets the edge size of the calibration LUT. |
 | `ENABLE_APL_GRAPH` | 0 | 1 adds a debug graph of the boost curve. |
@@ -122,6 +119,29 @@ With `PQHDRLUT_ENABLE=1`, the shader loads `PQHDRLUT.cube` from ReShade's textur
 With `ENABLE_APL_GRAPH=1`, the shader can draw a graph of input nits against output nits. It shows the identity line, the measured panel response, the boosted signal, the predicted panel output, and an optional BT.2390-style reference curve. The graph can use either a fixed APL or a measured window size of 100%, 50%, 25%, 15%, or 10%. It is a tuning aid and does not change the image.
 
 The graph's 2D compensation table and window curves come from earlier measurements of the Samsung Odyssey OLED G8 (G85SB), not of the 27M2N6500. The live boost does not use them.
+
+## Null test
+
+[`Shaders/ABL_NullTest.fx`](Shaders/ABL_NullTest.fx) checks the compensation by eye, with no measuring gear. Copy it next to the boost, turn on **ABL_NullTest**, and move it above **EOTF_Boost_1D_APL_LUT** in the effect list so the boost analyzes the pattern. It writes the format ReShade reports, so keep the boost's **Input Signal** on **Auto**.
+
+The pattern is a 60-nit gray reference patch inside a wide black gap. The rest of the screen switches every 720 frames, 3 seconds at 240 fps, between state A, the first content in the test's name, and state B, the second. A small dim mark under the patch shows while state B is on. Watch only the patch, through a paper tube or cupped hands so the rest of the screen is out of view. The eye judges a patch against its surroundings, so with the changing load in view the patch seems to change even when it does not. Keep the frame rate at or under the refresh rate, as G-Sync with a frame cap does, so each frame is one refresh.
+
+| Test | Boost | What it checks |
+|---|---|---|
+| Gray vs white window | Off | Whether a small bright window loads the panel the same as a dim fill with the same total light. |
+| Gray vs red, green, or blue | Off | Whether the panel's own red, green, or blue primary, taken from its EDID, loads it as the boost's load model counts it. |
+| Gray vs pastel red | Off | Whether a color halfway between the panel's red and white loads it as the load model counts it, which covers how mixed colors fall between a primary and white. |
+| Panel latency | Off | How many frames the panel's dimming lags behind a load change. |
+| Out APL 3% vs 6% through 50% vs 80% | On | Whether the compensation table holds between the two loads. |
+| Bright window, 150 nit patch | On | Whether a bright highlight coming into view leaves lower levels alone. |
+
+In the model checks with the boost off, both states carry a 5% APL load as the boost counts it, and the RAW APL row of the stats display reads the same in both. The KNEE NIT row there shows what the boost would do if it were on, so it can be ignored. In the curve checks, the OUT APL row lands on the named loads, and the patch sits below the knee at every gain, so it always gets the full gain.
+
+The bright window check uses a 150-nit patch, and both states carry the same 8% raw APL. In state B half of that light gathers into a 900-nit window left of the gap, as when a bright sky or lamp comes into view. The shoulder holds the window down, so state B shows about 14% out APL against about 21% in state A, and the 10% vs 25% curve check has to hold before this one means anything.
+
+A steady patch means the model holds for that test. A patch that is brighter or darker in B means the model is off between the two states. In a model check the panel treats one content as a heavier load than the boost counts, and in a curve check the table's compensation at one load is off relative to the other. A blink at each switch points to timing instead, with the boost's gain and the panel's dimming changing on different frames.
+
+The panel latency check replaces the single patch with a row of five in a black band across the middle, while the rest of the screen switches between 3% and 10% APL. Each patch is brightened by the measured compensation for the load of a frame further back, from the left the current frame, then 1, 2, 3, and 4 frames earlier. The panel dims all of them alike, so the patch whose delay matches the frames the panel's dimming lags behind holds still through both switches, while every other patch blinks for as many frames as its delay is off. The boost assumes the second patch, one frame. Compare the patches with each other instead of watching one through a tube.
 
 ## Adapting to another monitor
 
@@ -146,7 +166,7 @@ A tray app injects a hook into `dwm.exe` and keeps it resident. Toggling is inst
 - **Ctrl+Alt+Shift+Home** turns it off, which reverts the composition patches so VRR returns.
 - The tray menu has **Enable**, **Disable**, **Install autostart task** (an elevated logon task, no per-launch prompt), and **Quit**. Quit ejects the hook cleanly.
 
-On a static desktop DWM stops composing, so the app nudges the monitor once per refresh with a 1 px corner window while the brightness is still settling (about 1.25 s after the last change), then stops. This keeps the ABL-fade compensation converging without a game running.
+On a static desktop DWM stops composing, so the app nudges the monitor once per refresh with a 1 px corner window for about 21 frames after the last change, then stops. Each frame's gain follows the load of the frame before it, so this lets the gain settle on the new content without a game running.
 
 The target panel and its build are pinned: the tool injects only into Windows 11 25H2 (build 26200 or later) and refuses to inject if any `dwmcore.dll` byte pattern it relies on is missing or ambiguous, which also guards against a future Windows update changing the compositor.
 
@@ -163,7 +183,7 @@ This produces `DwmBoost.exe` and `DwmBoostHook.dll` in `build/bin`. Keep the two
 
 ### Verification
 
-[`DwmBoost/verify/parity_check.py`](DwmBoost/verify/parity_check.py) checks the ported boost math against the shader's values: it confirms the baked compensation table matches the measured panel peaks, the closed-loop solver reaches the fixed point `gain = compensation(solved APL)` at every level, the boost never darkens, and midtones get the full gain. For a flat full-field frame the GPU histogram collapses to one APL, so this CPU mirror reproduces exactly what the compute passes compute for that frame. Run `python parity_check.py`.
+[`DwmBoost/verify/parity_check.py`](DwmBoost/verify/parity_check.py) checks the ported boost math against the shader's values: it confirms the baked compensation table matches the measured panel peaks, the boost never darkens, and midtones get the full gain. It also plays cuts and short flashes frame by frame and confirms every frame gets exactly the dimming the panel applies to it, and that the gain settles on the fixed point `gain = compensation(APL after boost)` within the app's 21 settle frames, the count the table's steepest step calls for. Per gain, it confirms the shoulder keeps the full gain up to the knee and puts the panel peak signal on the panel peak. For a flat full-field frame the GPU histogram collapses to one APL, so this CPU mirror reproduces exactly what the compute passes compute for that frame. Run `python parity_check.py`.
 
 ## Credits
 

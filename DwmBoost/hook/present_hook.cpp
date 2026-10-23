@@ -15,12 +15,13 @@ namespace {
 // Histogram geometry — must match boost.hlsl.
 const UINT TILE_SIZE = 32;
 const UINT BLOCK_W = 16, BLOCK_H = 16;
-const UINT COUNT_W = BLOCK_W * 2;   // the count textures add one fine scene-maximum bin per histogram bin
-const UINT ROLLING_PHASES = 6;
 
 UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
 
-const double SETTLE_HOLD_MS = 1400.0;   // keeps DWM composing while smoothing settles and the 6-phase histogram refills
+// Runs after a content change that keep DWM composing while the gain settles. Each solve leaves at most 0.756
+// of the gain error, the steepest slope of the compensation table, so 21 take the largest possible jump under
+// half a 10-bit PQ code.
+const int SETTLE_RUNS = 21;
 const double PRIME_MIN_GAP_MS = 1000.0;
 
 // Host config mirror (written by the watcher thread, read in the present path).
@@ -29,7 +30,6 @@ std::atomic<uint32_t> g_resetGeneration{0};
 std::atomic<int>      g_monLeft{0}, g_monTop{0};
 std::atomic<uint32_t> g_monWidth{0}, g_monHeight{0};
 std::atomic<bool>     g_monHdr{false};
-std::atomic<float>    g_monRefreshMs{0.0f};
 std::atomic<float>    g_monLitFraction{1.0f};
 
 std::atomic<long>     g_inFlight{0};
@@ -68,10 +68,10 @@ struct MonitorState
     UINT width = 0, height = 0;
 
     Tex clean;               // RGBA16F clean copy (SRV)
-    Tex rowCount, rowOffset, rowMaxNits, rowMeta;        // R32_SINT (SRV+UAV)
+    Tex rowCount, rowOffset, rowMaxNits, rowLoad;        // R32_SINT (SRV+UAV)
     Tex globalCount;                                     // R32_SINT (SRV+UAV)
-    Tex globalOffset, globalMaxNits;                     // R32_FLOAT (SRV+UAV)
-    Tex aplSmoothed, aplInstant, aplPrev, boostParams;   // RGBA32F (SRV+UAV)
+    Tex globalOffset, globalMaxNits, globalLoad;         // R32_FLOAT (SRV+UAV)
+    Tex aplInstant, aplPrev, boostParams;                // RGBA32F (SRV+UAV)
 
     ID3D11ComputeShader* csSetup = nullptr;
     ID3D11ComputeShader* csBuild = nullptr;
@@ -88,18 +88,17 @@ struct MonitorState
     unsigned evtOpenTick = 0;
 
     LARGE_INTEGER freq = {};
-    LONGLONG lastRunQpc = 0;
-    LONGLONG lastContentQpc = 0;
     LONGLONG lastPrimeQpc = 0;
+    int runsSinceContent = 0;
     uint32_t lastResetGeneration = 0;
     bool initialized = false;
 
     void Release()
     {
         clean.Release();
-        rowCount.Release(); rowOffset.Release(); rowMaxNits.Release(); rowMeta.Release();
-        globalCount.Release(); globalOffset.Release(); globalMaxNits.Release();
-        aplSmoothed.Release(); aplInstant.Release(); aplPrev.Release(); boostParams.Release();
+        rowCount.Release(); rowOffset.Release(); rowMaxNits.Release(); rowLoad.Release();
+        globalCount.Release(); globalOffset.Release(); globalMaxNits.Release(); globalLoad.Release();
+        aplInstant.Release(); aplPrev.Release(); boostParams.Release();
         if (csSetup) { csSetup->Release(); csSetup = nullptr; }
         if (csBuild) { csBuild->Release(); csBuild = nullptr; }
         if (csReduce) { csReduce->Release(); csReduce = nullptr; }
@@ -133,17 +132,17 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
 
     bool ok = true;
     ok &= CreateTex(s.dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, s.clean);
-    ok &= CreateTex(s.dev, COUNT_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowCount);
+    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowCount);
     ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowOffset);
     ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowMaxNits);
-    ok &= CreateTex(s.dev, 1, tileCountY, DXGI_FORMAT_R32_SINT, true, true, s.rowMeta);
-    ok &= CreateTex(s.dev, COUNT_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, s.globalCount);
+    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowLoad);
+    ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, s.globalCount);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalOffset);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalMaxNits);
-    ok &= CreateTex(s.dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplSmoothed);
-    ok &= CreateTex(s.dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplInstant);
-    ok &= CreateTex(s.dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplPrev);
-    ok &= CreateTex(s.dev, 1, 5, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.boostParams);
+    ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalLoad);
+    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplInstant);
+    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplPrev);
+    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.boostParams);
 
     ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Setup, sizeof(g_CS_Setup), nullptr, &s.csSetup));
     ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Build, sizeof(g_CS_Build), nullptr, &s.csBuild));
@@ -153,7 +152,7 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     ok &= SUCCEEDED(s.dev->CreatePixelShader(g_PS_Boost, sizeof(g_PS_Boost), nullptr, &s.psBoost));
 
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = 32; cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.ByteWidth = 16; cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     ok &= SUCCEEDED(s.dev->CreateBuffer(&cbd, nullptr, &s.cb));
 
@@ -162,7 +161,8 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     s.cover.Init(w, h, TILE_SIZE);
     s.primed = false;
     QueryPerformanceFrequency(&s.freq);
-    s.lastRunQpc = 0; s.lastContentQpc = 0; s.lastPrimeQpc = 0;
+    s.lastPrimeQpc = 0;
+    s.runsSinceContent = 0;
     s.lastResetGeneration = g_resetGeneration.load();
     s.initialized = true;
     return true;
@@ -263,28 +263,28 @@ void ClearCS(ID3D11DeviceContext* c)
     c->CSSetUnorderedAccessViews(0, 8, nUav, nullptr);
 }
 
-void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float frameMs, float gapMs, bool resetThisRun)
+void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, bool resetThisRun)
 {
     ID3D11DeviceContext* c = s.ctx;
 
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(c->Map(s.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)))
     {
-        struct CB { float frameTime; float gapTime; uint32_t reset; float pad; uint32_t width, height; float litFraction, pad2; } cb = {};
-        cb.frameTime = frameMs; cb.gapTime = gapMs; cb.reset = resetThisRun ? 1u : 0u;
+        struct CB { uint32_t reset; uint32_t width, height; float litFraction; } cb = {};
+        cb.reset = resetThisRun ? 1u : 0u;
         cb.width = s.width; cb.height = s.height;
         cb.litFraction = g_monLitFraction.load();
         memcpy(map.pData, &cb, sizeof(cb));
         c->Unmap(s.cb, 0);
     }
 
-    // Pass 1: setup / rolling-row clear.
+    // Pass 1: setup / row clear.
     ClearCS(c);
     c->CSSetConstantBuffers(0, 1, &s.cb);
     {
-        ID3D11ShaderResourceView* srv[2] = { s.aplInstant.srv, s.aplSmoothed.srv };
-        ID3D11UnorderedAccessView* uav[5] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowMeta.uav, s.aplPrev.uav };
-        c->CSSetShaderResources(0, 2, srv);
+        ID3D11ShaderResourceView* srv[1] = { s.aplInstant.srv };
+        ID3D11UnorderedAccessView* uav[5] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowLoad.uav, s.aplPrev.uav };
+        c->CSSetShaderResources(0, 1, srv);
         c->CSSetUnorderedAccessViews(0, 5, uav, nullptr);
         c->CSSetShader(s.csSetup, nullptr, 0);
         c->Dispatch(1, 1, 1);
@@ -293,32 +293,32 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float frameMs, 
     // Pass 2: row histogram build from the clean copy.
     ClearCS(c);
     {
-        ID3D11ShaderResourceView* srv[2] = { s.clean.srv, s.aplPrev.srv };
-        ID3D11UnorderedAccessView* uav[4] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowMeta.uav };
-        c->CSSetShaderResources(0, 2, srv);
+        ID3D11ShaderResourceView* srv[1] = { s.clean.srv };
+        ID3D11UnorderedAccessView* uav[4] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowLoad.uav };
+        c->CSSetShaderResources(0, 1, srv);
         c->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
         c->CSSetShader(s.csBuild, nullptr, 0);
-        c->Dispatch(TileCount(s.width), (TileCount(s.height) + ROLLING_PHASES - 1) / ROLLING_PHASES, 1);
+        c->Dispatch(TileCount(s.width), TileCount(s.height), 1);
     }
 
     // Pass 3: reduce to the global histogram.
     ClearCS(c);
     {
-        ID3D11ShaderResourceView* srv[4] = { s.rowCount.srv, s.rowOffset.srv, s.rowMaxNits.srv, s.rowMeta.srv };
-        ID3D11UnorderedAccessView* uav[3] = { s.globalCount.uav, s.globalOffset.uav, s.globalMaxNits.uav };
+        ID3D11ShaderResourceView* srv[4] = { s.rowCount.srv, s.rowOffset.srv, s.rowMaxNits.srv, s.rowLoad.srv };
+        ID3D11UnorderedAccessView* uav[4] = { s.globalCount.uav, s.globalOffset.uav, s.globalMaxNits.uav, s.globalLoad.uav };
         c->CSSetShaderResources(0, 4, srv);
-        c->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
+        c->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
         c->CSSetShader(s.csReduce, nullptr, 0);
         c->Dispatch(BLOCK_W, BLOCK_H, 1);
     }
 
-    // Pass 4: solve, smooth, boost parameters.
+    // Pass 4: solve, boost parameters.
     ClearCS(c);
     {
-        ID3D11ShaderResourceView* srv[4] = { s.globalCount.srv, s.globalOffset.srv, s.globalMaxNits.srv, s.aplPrev.srv };
-        ID3D11UnorderedAccessView* uav[3] = { s.aplSmoothed.uav, s.aplInstant.uav, s.boostParams.uav };
-        c->CSSetShaderResources(0, 4, srv);
-        c->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
+        ID3D11ShaderResourceView* srv[5] = { s.globalCount.srv, s.globalOffset.srv, s.globalMaxNits.srv, s.globalLoad.srv, s.aplPrev.srv };
+        ID3D11UnorderedAccessView* uav[2] = { s.aplInstant.uav, s.boostParams.uav };
+        c->CSSetShaderResources(0, 5, srv);
+        c->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
         c->CSSetShader(s.csSolve, nullptr, 0);
         c->Dispatch(1, 1, 1);
     }
@@ -339,8 +339,8 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float frameMs, 
     c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     c->OMSetDepthStencilState(nullptr, 0);
     {
-        ID3D11ShaderResourceView* srv[3] = { s.clean.srv, s.aplSmoothed.srv, s.boostParams.srv };
-        c->PSSetShaderResources(0, 3, srv);
+        ID3D11ShaderResourceView* srv[2] = { s.clean.srv, s.boostParams.srv };
+        c->PSSetShaderResources(0, 2, srv);
     }
     c->Draw(3, 0);
 }
@@ -470,7 +470,6 @@ __int64 __fastcall PresentDetour(void* self, void* overlaySwapChain, unsigned in
                         if (!wasPrimed && s.primed) resetThisRun = true;   // history restarts on a fresh clean copy
 
                         LARGE_INTEGER now; QueryPerformanceCounter(&now);
-                        if (newContent) s.lastContentQpc = now.QuadPart;
 
                         if (s.primed)
                         {
@@ -480,20 +479,13 @@ __int64 __fastcall PresentDetour(void* self, void* overlaySwapChain, unsigned in
                             rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
                             if (SUCCEEDED(s.dev->CreateRenderTargetView(bb, &rd, &bbRTV)))
                             {
-                                // The previous frame stayed on screen for the whole interval; only one
-                                // refresh period of it belongs to this frame's smoothing step.
-                                double sinceRunMs = MsSince(s, s.lastRunQpc);
-                                if (sinceRunMs < 0.0) sinceRunMs = 0.0;
-                                const double refreshMs = g_monRefreshMs.load();
-                                const double frameMs = (refreshMs > 0.0 && sinceRunMs > refreshMs) ? refreshMs : sinceRunMs;
-                                const double gapMs = sinceRunMs - frameMs;
-                                s.lastRunQpc = now.QuadPart;
+                                if (s.runsSinceContent < SETTLE_RUNS) ++s.runsSinceContent;
 
                                 StateBlock sb;
                                 __try
                                 {
                                     SaveState(s.ctx, sb);
-                                    RunPipeline(s, bbRTV, (float)frameMs, (float)gapMs, resetThisRun);
+                                    RunPipeline(s, bbRTV, resetThisRun);
                                     RestoreState(s.ctx, sb);
                                 }
                                 __except (EXCEPTION_EXECUTE_HANDLER)
@@ -523,8 +515,9 @@ __int64 __fastcall PresentDetour(void* self, void* overlaySwapChain, unsigned in
                         }
 
                         // Settle/content signalling: keep DWM composing this monitor while the clean copy is
-                        // not primed or content changed within the settle window.
-                        bool settlePending = (!s.primed) || (MsSince(s, s.lastContentQpc) < SETTLE_HOLD_MS);
+                        // not primed or the gain is still settling on the latest content.
+                        if (newContent) s.runsSinceContent = 0;
+                        bool settlePending = (!s.primed) || (s.runsSinceContent < SETTLE_RUNS);
                         if (settlePending || newContent)
                         {
                             OpenEventsLazily(s);
@@ -550,12 +543,11 @@ Present_t PresentGetDetour() { return (Present_t)PresentDetour; }
 
 void PresentSetTarget(bool enabled, unsigned int resetGeneration,
                       int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr,
-                      float monRefreshMs, float monLitFraction)
+                      float monLitFraction)
 {
     g_monLeft.store(monLeft); g_monTop.store(monTop);
     g_monWidth.store(monWidth); g_monHeight.store(monHeight);
     g_monHdr.store(monHdr);
-    g_monRefreshMs.store(monRefreshMs);
     g_monLitFraction.store(monLitFraction);
     g_resetGeneration.store(resetGeneration);
     g_enabled.store(enabled);

@@ -3,18 +3,24 @@
 #
 # For a flat full-field scRGB frame the GPU histogram collapses to a single APL, so this CPU mirror
 # of the solve-and-boost path follows what the compute passes compute for that frame. It checks that
-# the baked table matches the measured peaks, that the solved APL is the APL the boost produces at the
-# solved gain, and that the boost never darkens and rises with the level. Run: python parity_check.py
+# the baked table matches the measured peaks, that from an unboosted frame the gain reaches the
+# closed-loop solve within the host's settle runs, that the boost never darkens and rises with the
+# level, that through cuts and flashes every frame is compensated for the dimming the panel applies to
+# it, that the shoulder keeps the full gain up to the knee and puts the panel peak signal on the panel
+# peak, and that the settle runs in present_hook.cpp cover the slowest gain convergence the table
+# allows. Run: python parity_check.py
 
 import math
+import re
+from pathlib import Path
 
 # Baked defaults (must match boost.hlsl).
 APL_REF_WHITE = 1060.0
 PANEL_PEAK = 1060.0
-SHOULDER_SPAN = 0.30
-OUTLIER = 0.25
+HIGHLIGHT_CONTRAST = 0.25
 KNEE_TRANSITION = 0.04
-KNEE_SEARCH_STEPS = 24
+
+HOOK_SOURCE = Path(__file__).resolve().parent.parent / "hook" / "present_hook.cpp"
 
 # (log2 APL percent, log2 compensation) per anchor.
 APL_ANCHORS = [(1.584963, 0.000000), (2.000000, 0.198724), (2.321928, 0.381141), (2.584963, 0.553194),
@@ -75,65 +81,31 @@ def cand_max_log_gain():
     return APL_ANCHORS[-1][1]
 
 
-# Boost curve (scalar). On a flat field the max channel equals luma, so the channel curve never binds and
-# the luma curve alone sets the boost.
+# Boost curve (scalar). On a flat gray field the brightest channel equals luma, so the one curve sets the boost.
 def gain_map_pq(pq, gain):
     return nits_to_pq_unclamped(pq_to_lin(pq) * 10000.0 * gain)
 
 
-def shoulder_compression(u, knee_u, contrast, outlier_start_u, outlier_scale):
+def shoulder_compression(u, knee_u):
     t = max(u - knee_u, 0.0)
-    bulk = t * t / (2.0 * KNEE_TRANSITION) if t < KNEE_TRANSITION else t - 0.5 * KNEE_TRANSITION
-    v = max(u - outlier_start_u, 0.0)
-    return (1.0 - contrast) * bulk + outlier_scale * v * v
+    eased = t * t / (2.0 * KNEE_TRANSITION) if t < KNEE_TRANSITION else t - 0.5 * KNEE_TRANSITION
+    return (1.0 - HIGHLIGHT_CONTRAST) * eased
 
 
-def outlier_ramp_scale(contrast, outlier_start_u, max_u):
-    return (contrast - OUTLIER) / (2.0 * max(max_u - outlier_start_u, 1e-6))
-
-
-def max_fitting_contrast(peak_pq, highlight_u, max_u):
-    span = max_u - highlight_u
-    return (peak_pq - 0.5 * KNEE_TRANSITION - 0.5 * OUTLIER * span) / (0.5 * (max_u + highlight_u) - 0.5 * KNEE_TRANSITION)
-
-
-def solve_knee_u(peak_pq, highlight_u, max_u, contrast):
-    lo, hi = 0.0, peak_pq
-    for _ in range(KNEE_SEARCH_STEPS):
-        mid = 0.5 * (lo + hi)
-        start = max(highlight_u, mid)
-        compression = shoulder_compression(max_u, mid, contrast, start, outlier_ramp_scale(contrast, start, max_u))
-        if max_u - compression <= peak_pq:
-            lo = mid
-        else:
-            hi = mid
-    return lo
-
-
-def make_curve(gain, highlight_pq, max_pq, contrast):
-    c = {"gain": max(gain, 1.0), "peakPQ": 1.0, "kneeNits": 10000.0, "kneeU": 1.0, "contrast": 1.0,
-         "outlierStartU": 1.0, "outlierScale": 0.0, "maxU": 1.0}
+def make_curve(gain):
+    c = {"gain": max(gain, 1.0), "peakPQ": 1.0, "kneeNits": 10000.0, "kneeU": 1.0}
     if PANEL_PEAK <= 0 or c["gain"] <= 1.000001:
         return c
     c["peakPQ"] = nits_to_pq(PANEL_PEAK)
-    max_pq = min(max(max_pq, 0.0), c["peakPQ"])
-    c["maxU"] = gain_map_pq(max_pq, c["gain"])
-    highlight_u = gain_map_pq(min(max(highlight_pq, 0.0), max_pq), c["gain"])
-    c["kneeU"] = c["peakPQ"]
-    if c["maxU"] > c["peakPQ"]:
-        fitting = min(contrast, max_fitting_contrast(c["peakPQ"], highlight_u, c["maxU"]))
-        c["contrast"] = max(fitting, OUTLIER)
-        c["kneeU"] = solve_knee_u(c["peakPQ"], highlight_u, c["maxU"], c["contrast"])
-    c["outlierStartU"] = max(highlight_u, c["kneeU"])
-    c["outlierScale"] = outlier_ramp_scale(c["contrast"], c["outlierStartU"], c["maxU"])
+    max_u = gain_map_pq(c["peakPQ"], c["gain"])
+    eased = (max_u - c["peakPQ"]) / (1.0 - HIGHLIGHT_CONTRAST)
+    if eased < 0.5 * KNEE_TRANSITION:
+        span = math.sqrt(2.0 * KNEE_TRANSITION * eased)
+    else:
+        span = eased + 0.5 * KNEE_TRANSITION
+    c["kneeU"] = max_u - span
     c["kneeNits"] = pq_to_lin(c["kneeU"]) * 10000.0 / c["gain"]
     return c
-
-
-def make_luma_curve(gain, level_pq):
-    peak_pq = nits_to_pq(PANEL_PEAK)
-    contrast = 1.0 - (gain_map_pq(min(level_pq, peak_pq), gain) - peak_pq) / SHOULDER_SPAN
-    return make_curve(gain, level_pq, level_pq, contrast)
 
 
 def boost_curve_nits(nits, c):
@@ -143,9 +115,7 @@ def boost_curve_nits(nits, c):
     if n >= PANEL_PEAK:
         return n
     u = nits_to_pq_unclamped(n * c["gain"])
-    y = c["peakPQ"]
-    if u < c["maxU"]:
-        y = min(u - shoulder_compression(u, c["kneeU"], c["contrast"], c["outlierStartU"], c["outlierScale"]), y)
+    y = min(u - shoulder_compression(u, c["kneeU"]), c["peakPQ"])
     return max(pq_to_lin(y) * 10000.0, n)
 
 
@@ -155,51 +125,57 @@ def post_boost_metric(luma_nits, c):
     return min(max(boost_curve_nits(luma_nits, c) / max(APL_REF_WHITE, 1.0), 0.0), 1.0)
 
 
-def eval_nodes(logA, log_gain, scale):
-    t = min(max(log_gain * scale, 0.0), 3.0)
-    if t <= 1.0:
-        e = logA[0] + (logA[1] - logA[0]) * t
-    elif t <= 2.0:
-        e = logA[1] + (logA[2] - logA[1]) * (t - 1.0)
-    else:
-        e = logA[2] + (logA[3] - logA[2]) * (t - 2.0)
-    return min(max(2.0 ** e, 0.0), 1.0)
-
-
-def solve_display_apl(raw_apl, nodes, gmax):
-    r = min(max(raw_apl, 0.0), 1.0)
-    if r <= 1e-6:
-        return 0.0
-    if gmax <= 1e-6:
-        return r
-    logA = [math.log2(max(v, 1e-6)) for v in [r] + list(nodes)]
-    scale = 3.0 / gmax
-    lo, hi = 0.0, gmax
-    f_lo = min(max(scene_log_gain(r), 0.0), gmax)
-    if f_lo <= 1e-6:
-        return r
-    apl_hi = min(max(nodes[2], 0.0), 1.0)
-    if min(max(scene_log_gain(apl_hi), 0.0), gmax) - gmax >= -1e-6:
-        return apl_hi
-    for _ in range(10):
-        mid = 0.5 * (lo + hi)
-        apl_mid = eval_nodes(logA, mid, scale)
-        if min(max(scene_log_gain(apl_mid), 0.0), gmax) - mid > 0.0:
-            lo = mid
-        else:
-            hi = mid
-    return eval_nodes(logA, 0.5 * (lo + hi), scale)
+def raw_apl(level_nits):
+    return min(max(level_nits / max(APL_REF_WHITE, 1.0), 0.0), 1.0)
 
 
 def solve_flat_field(level_nits):
-    """Mirror CS_Solve for a flat full-field frame at level_nits."""
-    raw_apl = min(max(level_nits / max(APL_REF_WHITE, 1.0), 0.0), 1.0)
-    gmax = cand_max_log_gain()
-    level_pq = nits_to_pq(level_nits)
-    nodes = [post_boost_metric(level_nits, make_luma_curve(2.0 ** (gmax * k / 3.0), level_pq)) for k in (1, 2, 3)]
-    disp_apl = solve_display_apl(raw_apl, nodes, gmax)
-    gain = 2.0 ** scene_log_gain(disp_apl)
-    return raw_apl, disp_apl, gain
+    """Settled state for a flat full-field frame at level_nits, where the gain is the compensation for the APL it
+    shows. The compensation rises slower than the log gain, so bisection finds the one settled gain."""
+    lo, hi = 0.0, cand_max_log_gain()
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if scene_log_gain(post_boost_metric(level_nits, make_curve(2.0 ** mid))) > mid:
+            lo = mid
+        else:
+            hi = mid
+    gain = 2.0 ** (0.5 * (lo + hi))
+    return raw_apl(level_nits), post_boost_metric(level_nits, make_curve(gain)), gain
+
+
+def run_frames(levels, last_disp=None):
+    """Mirror CS_Solve over consecutive flat-field frames, starting settled on the first level unless the last
+    frame's display APL is given. Each frame's gain is the compensation for the display APL of the frame before
+    it, and its own display APL is measured at that gain."""
+    if last_disp is None:
+        last_disp = solve_flat_field(levels[0])[1]
+    gains = []
+    for level in levels:
+        gain = 2.0 ** scene_log_gain(last_disp)
+        gains.append(gain)
+        last_disp = post_boost_metric(level, make_curve(gain))
+    return gains
+
+
+def smallest_10bit_step():
+    """Smallest relative luminance step between 10-bit PQ codes up to the panel peak."""
+    peak_code = int(nits_to_pq(PANEL_PEAK) * 1023)
+    return min(pq_to_lin((code + 1) / 1023) / pq_to_lin(code / 1023) - 1.0 for code in range(1, peak_code))
+
+
+def host_settle_runs():
+    return int(re.search(r"SETTLE_RUNS = (\d+);", HOOK_SOURCE.read_text()).group(1))
+
+
+def shown_brightness_errors(levels, gains):
+    """Each frame's shown level over its source level, minus 1, on a panel that dims a frame for the load the
+    boost really produced on the frame before it."""
+    errors = []
+    for n in range(1, len(levels)):
+        prev_load = post_boost_metric(levels[n - 1], make_curve(gains[n - 1]))
+        shown = boost_curve_nits(levels[n], make_curve(gains[n]))
+        errors.append(shown * 2.0 ** -scene_log_gain(prev_load) / levels[n] - 1.0)
+    return errors
 
 
 def main():
@@ -215,21 +191,25 @@ def main():
             fails += 1
     print("table check: baked APL_ANCHORS matches the measured peaks")
 
-    # 2. Closed-loop fixed point: the solved APL must be the APL the boost actually produces at the solved gain.
-    print("\n  level(nits)  rawAPL%  solvedAPL%   gain   boostedAPL%")
-    for level in (20, 60, 150, 300, 530, 795, 1060):
+    # 2. From an unboosted frame, the frame loop reaches the closed-loop solve within the host's settle runs, to
+    # under half the smallest 10-bit PQ step.
+    settle_runs = host_settle_runs()
+    tolerance = math.log2(1.0 + 0.5 * smallest_10bit_step())
+    print(f"\n  level(nits)  rawAPL%  solvedAPL%   gain   gain error after {settle_runs} runs")
+    for level in (20, 60, 150, 230, 300, 530, 795, 1060):
         raw, disp, gain = solve_flat_field(level)
-        boosted = post_boost_metric(level, make_luma_curve(gain, nits_to_pq(level)))
-        print(f"  {level:9.0f}  {raw*100:7.2f}  {disp*100:9.2f}  {gain:6.3f}  {boosted*100:10.2f}")
-        if abs(disp - boosted) > 0.01 * boosted:
-            print(f"FAIL fixed point at {level} nits: solved APL {disp:.4f} != boosted APL {boosted:.4f}")
+        settled = run_frames([level] * (settle_runs + 1), last_disp=raw)[-1]
+        error = abs(math.log2(settled / gain))
+        print(f"  {level:9.0f}  {raw*100:7.2f}  {disp*100:9.2f}  {gain:6.3f}  {(2.0 ** error - 1.0) * 100:10.3f}%")
+        if error > tolerance:
+            print(f"FAIL settling at {level} nits: gain {settled:.4f} after {settle_runs} runs vs solve {gain:.4f}")
             fails += 1
 
     # 3. Boost never darkens and is monotonic in level.
     prev = -1.0
     for level in range(1, 1061, 10):
         raw, disp, gain = solve_flat_field(float(level))
-        out = boost_curve_nits(float(level), make_luma_curve(gain, nits_to_pq(float(level))))
+        out = boost_curve_nits(float(level), make_curve(gain))
         if out < float(level) - 1e-3:
             print(f"FAIL darkening at {level} nits: out {out:.2f}")
             fails += 1
@@ -241,12 +221,69 @@ def main():
 
     # 4. Shadow/midtone gain is the full table gain below the shoulder (mid-gray is fully restored).
     raw, disp, gain = solve_flat_field(80.0)   # scRGB 1.0 flat field
-    p = make_luma_curve(gain, nits_to_pq(80.0))
+    p = make_curve(gain)
     mid_out = boost_curve_nits(20.0, p)
     if abs(mid_out - 20.0 * gain) > 0.5:
         print(f"FAIL midtone: 20-nit sample out {mid_out:.3f} vs full-gain {20.0*gain:.3f}")
         fails += 1
     print(f"midtone check: 20-nit sample boosted by full gain {gain:.3f} -> {mid_out:.2f} nits")
+
+    # 5. Through cuts and a two-frame flash, every frame shows its source level on a panel one frame behind, and
+    # the gain settles on the closed-loop solve.
+    print("\n  sequence                worst frame error   settled gain vs solve")
+    sequences = {
+        "6% -> 10% out APL": [43.34] * 5 + [49.67] * 40,
+        "10% -> 6% out APL": [49.67] * 5 + [43.34] * 40,
+        "3% -> 25% out APL": [31.8] * 5 + [98.4] * 40,
+        "2-frame flash in 5%": [53.0] * 5 + [74.2] * 2 + [53.0] * 40,
+    }
+    for name, levels in sequences.items():
+        gains = run_frames(levels)
+        worst = max(abs(e) for e in shown_brightness_errors(levels, gains))
+        settled = solve_flat_field(levels[-1])[2]
+        drift = gains[-1] / settled - 1.0
+        print(f"  {name:22s}  {worst * 100:8.3f}%           {drift * 100:+.3f}%")
+        if worst > 0.01 or abs(drift) > 0.005:
+            print(f"FAIL {name}: worst frame error {worst:.4f}, settled gain off by {drift:.4f}")
+            fails += 1
+
+    # 6. The shoulder depends on the gain alone. Every level up to the knee keeps the full gain, the curve rises
+    # without passing the panel peak, and the panel peak signal lands on the panel peak.
+    print("\n  gain   knee(nits)  ceiling(nits)")
+    for gain in (1.1, 1.2, 1.5, 2.0, 2.5, 3.0, 2.0 ** cand_max_log_gain()):
+        c = make_curve(gain)
+        print(f"  {gain:5.3f}  {c['kneeNits']:10.1f}  {PANEL_PEAK / gain:13.1f}")
+
+        for level in (0.25 * c["kneeNits"], 0.5 * c["kneeNits"], c["kneeNits"]):
+            if abs(boost_curve_nits(level, c) - level * gain) > 1e-6 * level * gain:
+                print(f"FAIL gain {gain:.3f}: {level:.1f} nits below the knee misses the full gain")
+                fails += 1
+
+        top = boost_curve_nits(PANEL_PEAK * (1.0 - 1e-9), c)
+        if abs(top - PANEL_PEAK) > 0.01:
+            print(f"FAIL gain {gain:.3f}: panel peak signal shows at {top:.2f} nits")
+            fails += 1
+
+        prev = 0.0
+        for level in range(1, int(PANEL_PEAK)):
+            out = boost_curve_nits(float(level), c)
+            if out < prev - 1e-3 or out > PANEL_PEAK + 1e-3:
+                print(f"FAIL gain {gain:.3f}: {level} nits shows at {out:.2f} after {prev:.2f}")
+                fails += 1
+                break
+            prev = out
+
+    # 7. The host keeps DWM composing for SETTLE_RUNS solves after a content change. Each solve leaves at most the
+    # steepest table slope of the gain error, so those solves must take the largest jump, across the whole table,
+    # under half the smallest 10-bit PQ step up to the panel peak.
+    steepest = max((y1 - y0) / (x1 - x0) for (x0, y0), (x1, y1) in zip(APL_ANCHORS, APL_ANCHORS[1:]))
+    span = APL_ANCHORS[-1][1] - APL_ANCHORS[0][1]
+    needed = math.ceil(math.log(tolerance / span) / math.log(steepest))
+    print(f"\nsettle check: steepest slope {steepest:.4f}, smallest step {smallest_10bit_step() * 100:.2f}%, "
+          f"{needed} solves needed, host keeps {settle_runs}")
+    if settle_runs != needed:
+        print(f"FAIL settle runs: present_hook.cpp keeps {settle_runs}, the table needs {needed}")
+        fails += 1
 
     print("\nALL CHECKS PASSED" if fails == 0 else f"\n{fails} CHECK(S) FAILED")
     return 1 if fails else 0

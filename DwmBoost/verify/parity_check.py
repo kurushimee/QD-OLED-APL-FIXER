@@ -2,26 +2,27 @@
 # Numeric parity check for the scalar core of boost.hlsl against the ReShade shader's values.
 #
 # For a flat full-field scRGB frame the GPU histogram collapses to a single APL, so this CPU mirror
-# of the solve-and-boost path reproduces exactly what the compute passes compute for that frame. It
-# checks the closed-loop fixed point (gain == compensation(solved APL)) and that the baked table and
-# constants match Shaders/EOTF_BoostMod2.0_27M2N6500.fx. Run: python parity_check.py
+# of the solve-and-boost path follows what the compute passes compute for that frame. It checks that
+# the baked table matches the measured peaks, that the solved APL is the APL the boost produces at the
+# solved gain, and that the boost never darkens and rises with the level. Run: python parity_check.py
 
 import math
 
 # Baked defaults (must match boost.hlsl).
 APL_REF_WHITE = 1060.0
 PANEL_PEAK = 1060.0
-HI_CONTRAST = 0.40
-SIG_REF = 80.0
+SHOULDER_SPAN = 0.30
 OUTLIER = 0.25
-BLEND_POW = 6.0
-CLEARANCE = 3.0
+KNEE_TRANSITION = 0.04
+KNEE_SEARCH_STEPS = 24
 
-ANCHORS = [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 17.0, 20.0, 22.0, 25.0, 27.0, 30.0,
-           35.0, 40.0, 50.0, 75.0, 100.0]
-COMP = [1.000000, 1.147683, 1.302371, 1.467331, 1.638837, 1.804870, 1.970627, 2.134085, 2.193709, 2.237231, 2.285468,
-        2.324561, 2.376149, 2.437902, 2.545629, 2.594859, 2.693774, 2.746826, 2.807947, 2.895384, 3.001982, 3.178411,
-        3.476550, 3.686957]
+# (log2 APL percent, log2 compensation) per anchor.
+APL_ANCHORS = [(1.584963, 0.000000), (2.000000, 0.198724), (2.321928, 0.381141), (2.584963, 0.553194),
+               (2.807355, 0.712673), (3.000000, 0.851895), (3.169925, 0.978654), (3.321928, 1.093618),
+               (3.459432, 1.133372), (3.584963, 1.161714), (3.700440, 1.192490), (3.807355, 1.216959),
+               (3.906891, 1.248625), (4.087463, 1.285640), (4.321928, 1.348022), (4.459432, 1.375656),
+               (4.643856, 1.429629), (4.754888, 1.457765), (4.906891, 1.489516), (5.129283, 1.533755),
+               (5.321928, 1.585916), (5.643856, 1.668306), (6.228819, 1.797656), (6.643856, 1.882430)]
 
 PQ_M1, PQ_M2 = 0.1593017578125, 78.84375
 PQ_C1, PQ_C2, PQ_C3 = 0.8359375, 18.8515625, 18.6875
@@ -58,13 +59,12 @@ def seg_lerp(x, x0, y0, x1, y1):
 
 
 def lookup_log_comp_1d(apl_pct):
-    a = min(max(apl_pct, ANCHORS[0]), ANCHORS[-1])
+    x = min(max(math.log2(max(apl_pct, 1e-6)), APL_ANCHORS[0][0]), APL_ANCHORS[-1][0])
     i = 0
-    while i < len(ANCHORS) - 2 and ANCHORS[i + 1] <= a:
+    while i < len(APL_ANCHORS) - 2 and APL_ANCHORS[i + 1][0] <= x:
         i += 1
-    return seg_lerp(math.log2(a),
-                    math.log2(ANCHORS[i]), math.log2(COMP[i]),
-                    math.log2(ANCHORS[i + 1]), math.log2(COMP[i + 1]))
+    (x0, y0), (x1, y1) = APL_ANCHORS[i], APL_ANCHORS[i + 1]
+    return seg_lerp(x, x0, y0, x1, y1)
 
 
 def scene_log_gain(apl01):
@@ -72,62 +72,87 @@ def scene_log_gain(apl01):
 
 
 def cand_max_log_gain():
-    return scene_log_gain(ANCHORS[-1] * 0.01)
+    return APL_ANCHORS[-1][1]
 
 
-# BoostParams + curve (scalar, flat field: luma == max channel).
-def make_params(gain, highlight_pq):
-    gain = max(gain, 1.0)
-    p = {"gain": gain, "peakPQ": 0.0, "hiPQ": 0.0, "hiTopPQ": 0.0, "fullGainNits": 10000.0}
-    if PANEL_PEAK <= 0 or gain <= 1.000001:
-        return p
-    p["peakPQ"] = nits_to_pq(PANEL_PEAK)
-    p["hiPQ"] = min(max(highlight_pq, 0.0), p["peakPQ"])
-    p["hiTopPQ"] = p["peakPQ"] - OUTLIER * (p["peakPQ"] - p["hiPQ"])
-    max_off = max(nits_to_pq_unclamped(PANEL_PEAK * gain) - p["peakPQ"], 0.0)
-    clr = CLEARANCE * max_off
-    hc = max(min(HI_CONTRAST, 0.95), OUTLIER)
-    hlim = (p["hiTopPQ"] - hc * p["hiPQ"] - clr) / (1.0 - hc)
-    plim = p["peakPQ"] - clr / (1.0 - OUTLIER)
-    lim = min(hlim, plim)
-    p["fullGainNits"] = pq_to_lin(lim) * 10000.0 if lim > 0 else 0.0
-    return p
+# Boost curve (scalar). On a flat field the max channel equals luma, so the channel curve never binds and
+# the luma curve alone sets the boost.
+def gain_map_pq(pq, gain):
+    return nits_to_pq_unclamped(pq_to_lin(pq) * 10000.0 * gain)
 
 
-def smooth_min(vals):
-    s = min(vals)
-    if s <= 0:
-        return 0.0
-    w = sum((s / max(v, 1e-9)) ** BLEND_POW for v in vals)
-    return s * w ** (-1.0 / BLEND_POW)
+def shoulder_compression(u, knee_u, contrast, outlier_start_u, outlier_scale):
+    t = max(u - knee_u, 0.0)
+    bulk = t * t / (2.0 * KNEE_TRANSITION) if t < KNEE_TRANSITION else t - 0.5 * KNEE_TRANSITION
+    v = max(u - outlier_start_u, 0.0)
+    return (1.0 - contrast) * bulk + outlier_scale * v * v
 
 
-def hi_shoulder(x, p):
-    hc = max(min(HI_CONTRAST, 0.95), OUTLIER)
-    return p["hiTopPQ"] + hc * (x - p["hiPQ"]) - x
+def outlier_ramp_scale(contrast, outlier_start_u, max_u):
+    return (contrast - OUTLIER) / (2.0 * max(max_u - outlier_start_u, 1e-6))
 
 
-def peak_shoulder(x, p):
-    return (1.0 - OUTLIER) * (p["peakPQ"] - x)
+def max_fitting_contrast(peak_pq, highlight_u, max_u):
+    span = max_u - highlight_u
+    return (peak_pq - 0.5 * KNEE_TRANSITION - 0.5 * OUTLIER * span) / (0.5 * (max_u + highlight_u) - 0.5 * KNEE_TRANSITION)
 
 
-def boost_curve_nits(nits, p):
+def solve_knee_u(peak_pq, highlight_u, max_u, contrast):
+    lo, hi = 0.0, peak_pq
+    for _ in range(KNEE_SEARCH_STEPS):
+        mid = 0.5 * (lo + hi)
+        start = max(highlight_u, mid)
+        compression = shoulder_compression(max_u, mid, contrast, start, outlier_ramp_scale(contrast, start, max_u))
+        if max_u - compression <= peak_pq:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def make_curve(gain, highlight_pq, max_pq, contrast):
+    c = {"gain": max(gain, 1.0), "peakPQ": 1.0, "kneeNits": 10000.0, "kneeU": 1.0, "contrast": 1.0,
+         "outlierStartU": 1.0, "outlierScale": 0.0, "maxU": 1.0}
+    if PANEL_PEAK <= 0 or c["gain"] <= 1.000001:
+        return c
+    c["peakPQ"] = nits_to_pq(PANEL_PEAK)
+    max_pq = min(max(max_pq, 0.0), c["peakPQ"])
+    c["maxU"] = gain_map_pq(max_pq, c["gain"])
+    highlight_u = gain_map_pq(min(max(highlight_pq, 0.0), max_pq), c["gain"])
+    c["kneeU"] = c["peakPQ"]
+    if c["maxU"] > c["peakPQ"]:
+        fitting = min(contrast, max_fitting_contrast(c["peakPQ"], highlight_u, c["maxU"]))
+        c["contrast"] = max(fitting, OUTLIER)
+        c["kneeU"] = solve_knee_u(c["peakPQ"], highlight_u, c["maxU"], c["contrast"])
+    c["outlierStartU"] = max(highlight_u, c["kneeU"])
+    c["outlierScale"] = outlier_ramp_scale(c["contrast"], c["outlierStartU"], c["maxU"])
+    c["kneeNits"] = pq_to_lin(c["kneeU"]) * 10000.0 / c["gain"]
+    return c
+
+
+def make_luma_curve(gain, level_pq):
+    peak_pq = nits_to_pq(PANEL_PEAK)
+    contrast = 1.0 - (gain_map_pq(min(level_pq, peak_pq), gain) - peak_pq) / SHOULDER_SPAN
+    return make_curve(gain, level_pq, level_pq, contrast)
+
+
+def boost_curve_nits(nits, c):
     n = max(nits, 0.0)
-    if p["peakPQ"] <= 0 or n <= p["fullGainNits"]:
-        return n * p["gain"]
-    x = nits_to_pq(n)
-    if x >= p["peakPQ"]:
+    if n <= c["kneeNits"]:
+        return n * c["gain"]
+    if n >= PANEL_PEAK:
         return n
-    gain_off = nits_to_pq_unclamped(n * p["gain"]) - x
-    off = smooth_min([gain_off, hi_shoulder(x, p), peak_shoulder(x, p)])
-    return pq_to_lin(x + off) * 10000.0
+    u = nits_to_pq_unclamped(n * c["gain"])
+    y = c["peakPQ"]
+    if u < c["maxU"]:
+        y = min(u - shoulder_compression(u, c["kneeU"], c["contrast"], c["outlierStartU"], c["outlierScale"]), y)
+    return max(pq_to_lin(y) * 10000.0, n)
 
 
-def post_boost_metric(luma_nits, p):
+def post_boost_metric(luma_nits, c):
     if luma_nits <= 1e-6:
         return 0.0
-    scale = boost_curve_nits(luma_nits, p) / max(luma_nits, 1e-6)  # flat field: max channel == luma
-    return min(max(luma_nits * scale / max(APL_REF_WHITE, 1.0), 0.0), 1.0)
+    return min(max(boost_curve_nits(luma_nits, c) / max(APL_REF_WHITE, 1.0), 0.0), 1.0)
 
 
 def eval_nodes(logA, log_gain, scale):
@@ -170,11 +195,8 @@ def solve_flat_field(level_nits):
     """Mirror CS_Solve for a flat full-field frame at level_nits."""
     raw_apl = min(max(level_nits / max(APL_REF_WHITE, 1.0), 0.0), 1.0)
     gmax = cand_max_log_gain()
-    highlight_pq = nits_to_pq(level_nits)
-    nodes = []
-    for k in (1, 2, 3):
-        p = make_params(2.0 ** (gmax * k / 3.0), highlight_pq)
-        nodes.append(post_boost_metric(level_nits, p))
+    level_pq = nits_to_pq(level_nits)
+    nodes = [post_boost_metric(level_nits, make_luma_curve(2.0 ** (gmax * k / 3.0), level_pq)) for k in (1, 2, 3)]
     disp_apl = solve_display_apl(raw_apl, nodes, gmax)
     gain = 2.0 ** scene_log_gain(disp_apl)
     return raw_apl, disp_apl, gain
@@ -183,40 +205,43 @@ def solve_flat_field(level_nits):
 def main():
     fails = 0
 
-    # 1. Baked table matches the published measurements (compensation = 1060-nit peak / peak at APL).
+    # 1. Baked table matches the measurements (compensation = 1060-nit peak / peak at APL).
+    apls = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 20, 22, 25, 27, 30, 35, 40, 50, 75, 100]
     peaks = [1060.0, 923.6, 813.9, 722.4, 646.8, 587.3, 537.9, 496.7, 483.2, 473.8, 463.8, 456.0, 446.1, 434.8, 416.4,
              408.5, 393.5, 385.9, 377.5, 366.1, 353.1, 333.5, 304.9, 287.5]
-    for apl, comp, peak in zip(ANCHORS, COMP, peaks):
-        expect = 1060.0 / peak
-        if abs(expect - comp) > 5e-4:
-            print(f"FAIL table {apl}%: baked {comp:.6f} vs peak-derived {expect:.6f}")
+    for (log_apl, log_comp), apl, peak in zip(APL_ANCHORS, apls, peaks):
+        if abs(log_apl - math.log2(apl)) > 1e-6 or abs(log_comp - math.log2(1060.0 / peak)) > 1e-6:
+            print(f"FAIL table {apl}%: baked ({log_apl:.6f}, {log_comp:.6f}) vs measured")
             fails += 1
-    print("table check: baked COMP_APL_1D matches the measured peaks")
+    print("table check: baked APL_ANCHORS matches the measured peaks")
 
-    # 2. Closed-loop fixed point: the solved gain must equal compensation(solved APL).
-    print("\n  level(nits)  rawAPL%  solvedAPL%   gain   comp(solvedAPL)")
+    # 2. Closed-loop fixed point: the solved APL must be the APL the boost actually produces at the solved gain.
+    print("\n  level(nits)  rawAPL%  solvedAPL%   gain   boostedAPL%")
     for level in (20, 60, 150, 300, 530, 795, 1060):
         raw, disp, gain = solve_flat_field(level)
-        comp_at = 2.0 ** lookup_log_comp_1d(disp * 100.0)
-        print(f"  {level:9.0f}  {raw*100:7.2f}  {disp*100:9.2f}  {gain:6.3f}  {comp_at:7.3f}")
-        if abs(gain - comp_at) > 1e-2:
-            print(f"FAIL fixed point at {level} nits: gain {gain:.4f} != comp {comp_at:.4f}")
+        boosted = post_boost_metric(level, make_luma_curve(gain, nits_to_pq(level)))
+        print(f"  {level:9.0f}  {raw*100:7.2f}  {disp*100:9.2f}  {gain:6.3f}  {boosted*100:10.2f}")
+        if abs(disp - boosted) > 0.01 * boosted:
+            print(f"FAIL fixed point at {level} nits: solved APL {disp:.4f} != boosted APL {boosted:.4f}")
             fails += 1
 
     # 3. Boost never darkens and is monotonic in level.
     prev = -1.0
     for level in range(1, 1061, 10):
         raw, disp, gain = solve_flat_field(float(level))
-        out = boost_curve_nits(float(level), make_params(gain, nits_to_pq(float(level))))
+        out = boost_curve_nits(float(level), make_luma_curve(gain, nits_to_pq(float(level))))
         if out < float(level) - 1e-3:
             print(f"FAIL darkening at {level} nits: out {out:.2f}")
+            fails += 1
+        if out < prev - 1e-3:
+            print(f"FAIL not monotonic at {level} nits: out {out:.2f} after {prev:.2f}")
             fails += 1
         prev = out
     print("\nmonotonic / no-darkening check: passed" if fails == 0 else "")
 
     # 4. Shadow/midtone gain is the full table gain below the shoulder (mid-gray is fully restored).
     raw, disp, gain = solve_flat_field(80.0)   # scRGB 1.0 flat field
-    p = make_params(gain, nits_to_pq(80.0))
+    p = make_luma_curve(gain, nits_to_pq(80.0))
     mid_out = boost_curve_nits(20.0, p)
     if abs(mid_out - 20.0 * gain) > 0.5:
         print(f"FAIL midtone: 20-nit sample out {mid_out:.3f} vs full-gain {20.0*gain:.3f}")

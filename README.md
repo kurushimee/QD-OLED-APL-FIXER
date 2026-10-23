@@ -39,7 +39,7 @@ The default settings match the calibration target, so most setups need no change
 1. **Measure the scene.** The shader builds a brightness histogram of the full frame. To save GPU time, it refreshes one of six groups of rows each frame and keeps the rest from earlier frames. From the histogram, it finds the average picture level (APL) and the scene's highlight peak. The highlight peak is the level that only the brightest 1/256 of the frame's light sits above. It also finds the frame's brightest luma level and brightest color channel level, each as the log average of the 64 brightest pixels, so one stray bright pixel barely moves the curve.
 2. **Look up the compensation.** A measured table tells how much the panel dims at each APL. For example, at 25% APL the panel reaches only about 37% of its peak, so the scene needs about 2.69 times more signal.
 3. **Account for its own boost.** Boosting the image raises the APL, and a higher APL makes the panel dim even more. The shader solves for the APL that the panel will actually see after the boost and picks the gain from that.
-4. **Smooth the change.** The APL, the highlight peak, and the brightest levels change gradually over time, so the brightness does not jump between frames. The further the gain falls behind its target, the shorter the smoothing gets, so a sudden large change such as an explosion or a scene cut lands almost at once while small fluctuations stay smooth.
+4. **Smooth the change.** The gain, the highlight peak, and the brightest levels change gradually over time, so the brightness does not jump between frames. The gain is smoothed in log space, so equal steps in brightness take equal time whether the scene gets brighter or darker. The further the gain falls behind its target, the shorter the smoothing gets, so a sudden large change such as an explosion or a scene cut lands almost at once while small fluctuations stay smooth.
 5. **Apply the boost.** Every level up to a knee gets the full gain. If the whole boosted scene fits under the panel peak, the knee sits where the gain reaches the peak, so nothing in the scene is compressed. If the brightest content would go past the peak, a smooth curve in PQ space compresses only the top of the range. Up to the scene's highlight peak, every level keeps the same share of its contrast, so fine texture stays visible in bright areas. That share depends on how far the boosted scene would go past the peak: the overshoot is spread over a fixed range below the scene's brightest level, set by **Shoulder Span**. A small overshoot costs each level a little contrast, and a large one costs more. Above the highlight peak, the rarer and brighter content eases down to a quarter of its contrast and reaches the panel peak at the scene's brightest level. The knee is the highest level that leaves room for both, so it drops only as far as the scene needs.
 
 Luma drives the boost, and all three color channels scale by the same amount, so colors keep their hue. A looser curve on the brightest color channel only keeps that channel under the panel peak. The shader never makes any part of the image darker than the source.
@@ -98,7 +98,7 @@ The stats display has three rows:
 | Row | Meaning |
 |---|---|
 | RAW APL | APL of the game's image before the boost. |
-| OUT APL | APL that the panel sees after the boost, as solved and smoothed by the shader. |
+| OUT APL | APL that the panel sees after the boost at the current smoothed gain. |
 | RAW NITS | Highest luma in the game's image, in nits. The shader tracks it only while the stats display is on. |
 
 ## Preprocessor definitions
@@ -125,16 +125,13 @@ The graph's 2D compensation table and window curves come from earlier measuremen
 
 ## Adapting to another monitor
 
-The live boost depends on two arrays in the shader:
-
-- `APL_ANCHOR_POINTS` lists the APL values in percent, in ascending order.
-- `COMP_APL_1D` lists the compensation for each of those APL values.
+The live boost depends on the `APL_ANCHORS` table in the shader. In ascending APL order, each entry holds the base-2 logarithm of an APL in percent and the base-2 logarithm of the compensation at that APL.
 
 To retune the shader for another monitor:
 
 1. Measure the panel's peak brightness at each APL, starting with a window small enough to reach the full peak.
 2. Divide the full peak by each measurement to get the compensation values. The first value should be 1.0.
-3. Replace both arrays. They must have the same number of entries, which `APL_ANCHOR_COUNT` sets.
+3. Fill the table with log2 of each APL and log2 of its compensation, and set `APL_ANCHOR_COUNT` to the number of entries. `DwmBoost/hook/boost.hlsl` and `DwmBoost/verify/parity_check.py` hold copies of the same table.
 4. Set **APL Reference White** and **Panel Peak** to the panel's peak, and use the same peak in the Windows HDR color profile.
 
 ## Desktop-wide (DWM) version

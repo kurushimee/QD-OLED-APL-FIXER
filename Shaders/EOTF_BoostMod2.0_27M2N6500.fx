@@ -203,7 +203,7 @@ uniform float TransitionSpeed <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 2.0; ui_step = 0.01;
     ui_label = "APL Smoothing Time (s)";
-    UI_TOOLTIP("Smooths changes in APL, highlight peak, and scene maximum over time. Sudden large brightness changes shorten it so they land almost at once. 0 disables smoothing.")
+    UI_TOOLTIP("Smooths changes in boost gain, highlight peak, and scene maximum over time. Sudden large brightness changes shorten it so they land almost at once. 0 disables smoothing.")
 > = 0.25;
 
 uniform float SIGNAL_REFERENCE_NITS <
@@ -294,7 +294,8 @@ uniform bool GraphUsePQSpace <
 #endif
 
 
-// Texel 0 holds the smoothed APL state, texel 1 the smoothed scene maxima in PQ and the smoothing time.
+// Texel 0 holds the output APL, the smoothed highlight PQ, the history flag and the smoothed log2 gain. Texel 1 holds
+// the smoothed scene maxima in PQ and the smoothing time.
 texture TexAPL
 {
     Width = 2;
@@ -382,10 +383,13 @@ storage2D<float4> StorageAPLPrev
 };
 
 
-// Exact 129-node PQ decode table used with linear filtering.
+// PQ decode table with one node per 10-bit code. HDR10 input lands on node centers and reads exact values,
+// finer input interpolates between neighboring codes.
+#define APL_FAST_PQ_NODES 1024
+
 texture TexAPLFastPQNits
 {
-    Width = 129;
+    Width = APL_FAST_PQ_NODES;
     Height = 1;
     Format = R32F;
 };
@@ -799,7 +803,8 @@ struct BoostCurve
     float kneeNits;
     float kneeU;
     float contrast;
-    float highlightU;
+    float outlierStartU;
+    float outlierScale;
     float maxU;
 };
 
@@ -809,20 +814,23 @@ float GainMapPQ(float pq, float gain)
     return NitsToPQUnclamped(PQToLinearBT2100(pq) * 10000.0 * gain);
 }
 
-// How far the shoulder sits below the full gain at u. One ramp from the knee eases the slope to the
-// curve's contrast; a second from the highlight peak eases it on to the outlier contrast.
-float ShoulderCompressionPQ(float u, float kneeU, float highlightU, float maxU, float contrast)
+// How far the shoulder sits below the full gain at u, for u up to maxU. One ramp from the knee eases the
+// slope to the curve's contrast, and a second from outlierStartU eases it on to the outlier contrast.
+float ShoulderCompressionPQ(float u, float kneeU, float contrast, float outlierStartU, float outlierScale)
 {
     float t = max(u - kneeU, 0.0);
     float bulk = (t < KNEE_TRANSITION_PQ)
         ? t * t / (2.0 * KNEE_TRANSITION_PQ)
         : t - 0.5 * KNEE_TRANSITION_PQ;
 
-    float outlierStart = max(highlightU, kneeU);
-    float outlierSpan = max(maxU - outlierStart, 1e-6);
-    float v = clamp(u - outlierStart, 0.0, outlierSpan);
+    float v = max(u - outlierStartU, 0.0);
+    return (1.0 - contrast) * bulk + outlierScale * v * v;
+}
 
-    return (1.0 - contrast) * bulk + (contrast - OUTLIER_HIGHLIGHT_CONTRAST) * v * v / (2.0 * outlierSpan);
+// Scale of the second ramp, which reaches the outlier contrast at maxU.
+float OutlierRampScale(float contrast, float outlierStartU, float maxU)
+{
+    return (contrast - OUTLIER_HIGHLIGHT_CONTRAST) / (2.0 * max(maxU - outlierStartU, 1e-6));
 }
 
 // Highest contrast whose shoulder still ends on the panel peak with the knee at black.
@@ -843,8 +851,10 @@ float SolveKneeU(float peakPQ, float highlightU, float maxU, float contrast)
     for (int i = 0; i < KNEE_SEARCH_STEPS; ++i)
     {
         float mid = 0.5 * (lo + hi);
+        float outlierStartU = max(highlightU, mid);
+        float compression = ShoulderCompressionPQ(maxU, mid, contrast, outlierStartU, OutlierRampScale(contrast, outlierStartU, maxU));
 
-        if (maxU - ShoulderCompressionPQ(maxU, mid, highlightU, maxU, contrast) <= peakPQ)
+        if (maxU - compression <= peakPQ)
             lo = mid;
         else
             hi = mid;
@@ -861,7 +871,8 @@ BoostCurve MakeBoostCurve(float gain, float highlightPQ, float maxPQ, float cont
     curve.kneeNits = 10000.0;
     curve.kneeU = 1.0;
     curve.contrast = 1.0;
-    curve.highlightU = 1.0;
+    curve.outlierStartU = 1.0;
+    curve.outlierScale = 0.0;
     curve.maxU = 1.0;
 
     if (PanelPeakNits <= 0.0 || curve.gain <= 1.000001)
@@ -870,18 +881,20 @@ BoostCurve MakeBoostCurve(float gain, float highlightPQ, float maxPQ, float cont
     curve.peakPQ = NitsToPQ(PanelPeakNits);
     maxPQ = clamp(maxPQ, 0.0, curve.peakPQ);
     curve.maxU = GainMapPQ(maxPQ, curve.gain);
-    curve.highlightU = GainMapPQ(clamp(highlightPQ, 0.0, maxPQ), curve.gain);
+    float highlightU = GainMapPQ(clamp(highlightPQ, 0.0, maxPQ), curve.gain);
 
     // When the whole boosted scene fits, the knee sits where the gain reaches the panel peak.
     curve.kneeU = curve.peakPQ;
 
     if (curve.maxU > curve.peakPQ)
     {
-        float fittingContrast = min(contrast, MaxFittingContrast(curve.peakPQ, curve.highlightU, curve.maxU));
+        float fittingContrast = min(contrast, MaxFittingContrast(curve.peakPQ, highlightU, curve.maxU));
         curve.contrast = max(fittingContrast, OUTLIER_HIGHLIGHT_CONTRAST);
-        curve.kneeU = SolveKneeU(curve.peakPQ, curve.highlightU, curve.maxU, curve.contrast);
+        curve.kneeU = SolveKneeU(curve.peakPQ, highlightU, curve.maxU, curve.contrast);
     }
 
+    curve.outlierStartU = max(highlightU, curve.kneeU);
+    curve.outlierScale = OutlierRampScale(curve.contrast, curve.outlierStartU, curve.maxU);
     curve.kneeNits = PQToLinearBT2100(curve.kneeU) * 10000.0 / curve.gain;
     return curve;
 }
@@ -919,7 +932,7 @@ float4 PackBoostCurveKnee(BoostCurve curve)
 
 float4 PackBoostCurveHighlight(BoostCurve curve)
 {
-    return float4(curve.highlightU, curve.maxU, 0.0, 0.0);
+    return float4(curve.outlierStartU, curve.maxU, curve.outlierScale, 0.0);
 }
 
 BoostCurve UnpackBoostCurve(float4 globals, float4 knee, float4 highlight)
@@ -930,8 +943,9 @@ BoostCurve UnpackBoostCurve(float4 globals, float4 knee, float4 highlight)
     curve.kneeNits = knee.x;
     curve.kneeU = knee.y;
     curve.contrast = knee.z;
-    curve.highlightU = highlight.x;
+    curve.outlierStartU = highlight.x;
     curve.maxU = highlight.y;
+    curve.outlierScale = highlight.z;
     return curve;
 }
 
@@ -1022,68 +1036,57 @@ float SegmentLerp(float x, float x0, float y0, float x1, float y1)
     return lerp(y0, y1, Remap01(x, x0, x1));
 }
 
-// Measured APL anchors of the compensation table.
+// 1D compensation table in log2, so lookups need no logs of their own. Each anchor holds log2 of its APL in
+// percent and log2 of the 1060 nit peak at 3% APL divided by the peak measured at that APL.
 static const int APL_ANCHOR_COUNT = 24;
 
-static const float APL_ANCHOR_POINTS[APL_ANCHOR_COUNT] =
+static const float2 APL_ANCHORS[APL_ANCHOR_COUNT] =
 {
-      3.0,   4.0,   5.0,   6.0,   7.0,   8.0,   9.0,  10.0,
-     11.0,  12.0,  13.0,  14.0,  15.0,  17.0,  20.0,  22.0,
-     25.0,  27.0,  30.0,  35.0,  40.0,  50.0,  75.0, 100.0
+    float2(1.584963, 0.000000), // 3%   (1060.0 nits)
+    float2(2.000000, 0.198724), // 4%   (923.6 nits)
+    float2(2.321928, 0.381141), // 5%   (813.9 nits)
+    float2(2.584963, 0.553194), // 6%   (722.4 nits)
+    float2(2.807355, 0.712673), // 7%   (646.8 nits)
+    float2(3.000000, 0.851895), // 8%   (587.3 nits)
+    float2(3.169925, 0.978654), // 9%   (537.9 nits)
+    float2(3.321928, 1.093618), // 10%  (496.7 nits)
+    float2(3.459432, 1.133372), // 11%  (483.2 nits)
+    float2(3.584963, 1.161714), // 12%  (473.8 nits)
+    float2(3.700440, 1.192490), // 13%  (463.8 nits)
+    float2(3.807355, 1.216959), // 14%  (456.0 nits)
+    float2(3.906891, 1.248625), // 15%  (446.1 nits)
+    float2(4.087463, 1.285640), // 17%  (434.8 nits)
+    float2(4.321928, 1.348022), // 20%  (416.4 nits)
+    float2(4.459432, 1.375656), // 22%  (408.5 nits)
+    float2(4.643856, 1.429629), // 25%  (393.5 nits)
+    float2(4.754888, 1.457765), // 27%  (385.9 nits)
+    float2(4.906891, 1.489516), // 30%  (377.5 nits)
+    float2(5.129283, 1.533755), // 35%  (366.1 nits)
+    float2(5.321928, 1.585916), // 40%  (353.1 nits)
+    float2(5.643856, 1.668306), // 50%  (333.5 nits)
+    float2(6.228819, 1.797656), // 75%  (304.9 nits)
+    float2(6.643856, 1.882430)  // 100% (287.5 nits)
 };
 
 
-// 1D compensation, the 1060 nit peak at 3% APL divided by the measured peak at each anchor.
-static const float COMP_APL_1D[APL_ANCHOR_COUNT] =
-{
-    1.000000, // 3%   (1060.0 nits)
-    1.147683, // 4%   (923.6 nits)
-    1.302371, // 5%   (813.9 nits)
-    1.467331, // 6%   (722.4 nits)
-    1.638837, // 7%   (646.8 nits)
-    1.804870, // 8%   (587.3 nits)
-    1.970627, // 9%   (537.9 nits)
-    2.134085, // 10%  (496.7 nits)
-    2.193709, // 11%  (483.2 nits)
-    2.237231, // 12%  (473.8 nits)
-    2.285468, // 13%  (463.8 nits)
-    2.324561, // 14%  (456.0 nits)
-    2.376149, // 15%  (446.1 nits)
-    2.437902, // 17%  (434.8 nits)
-    2.545629, // 20%  (416.4 nits)
-    2.594859, // 22%  (408.5 nits)
-    2.693774, // 25%  (393.5 nits)
-    2.746826, // 27%  (385.9 nits)
-    2.807947, // 30%  (377.5 nits)
-    2.895384, // 35%  (366.1 nits)
-    3.001982, // 40%  (353.1 nits)
-    3.178411, // 50%  (333.5 nits)
-    3.476550, // 75%  (304.9 nits)
-    3.686957  // 100% (287.5 nits)
-};
-
-
-int FindAPLAnchorIndex(float aplPct)
+int FindAPLAnchorIndex(float logAPL)
 {
     int idx = 0;
     [unroll]
     for (int i = 0; i < APL_ANCHOR_COUNT - 1; ++i)
-        idx += int(step(APL_ANCHOR_POINTS[i + 1], aplPct));
+        idx += int(step(APL_ANCHORS[i + 1].x, logAPL));
     return min(idx, APL_ANCHOR_COUNT - 2);
 }
 
 // Log compensation, and so log nits, is linear in log APL between anchors.
 float LookupMeasuredLogComp1D(float aplPct)
 {
-    float clampedAPL = clamp(aplPct, APL_ANCHOR_POINTS[0], APL_ANCHOR_POINTS[APL_ANCHOR_COUNT - 1]);
-    int a0 = FindAPLAnchorIndex(clampedAPL);
-    int a1 = min(a0 + 1, APL_ANCHOR_COUNT - 1);
+    float logAPL = clamp(log2(max(aplPct, 1e-6)), APL_ANCHORS[0].x, APL_ANCHORS[APL_ANCHOR_COUNT - 1].x);
+    int a0 = FindAPLAnchorIndex(logAPL);
+    float2 p0 = APL_ANCHORS[a0];
+    float2 p1 = APL_ANCHORS[a0 + 1];
 
-    return SegmentLerp(
-        log2(clampedAPL),
-        log2(APL_ANCHOR_POINTS[a0]), log2(COMP_APL_1D[a0]),
-        log2(APL_ANCHOR_POINTS[a1]), log2(COMP_APL_1D[a1])
-    );
+    return SegmentLerp(logAPL, p0.x, p0.y, p1.x, p1.y);
 }
 
 float ComputeTemporalBlendFactor(float smoothingSeconds)
@@ -1104,10 +1107,10 @@ float ComputeSceneLogGainFromAPL(float currentAPL)
 
 // Shrinks while the gain trails its target by a large step, and grows back toward TransitionSpeed at the
 // same pace afterwards, so the end of a big change does not slow down again.
-float ComputeSmoothingTime(float previousSmoothingTime, float targetAPL, float smoothedAPL)
+float ComputeSmoothingTime(float previousSmoothingTime, float targetLogGain, float smoothedLogGain)
 {
     float relaxedTime = lerp(previousSmoothingTime, TransitionSpeed, ComputeTemporalBlendFactor(TransitionSpeed));
-    float gainGap = abs(ComputeSceneLogGainFromAPL(targetAPL) - ComputeSceneLogGainFromAPL(smoothedAPL));
+    float gainGap = abs(targetLogGain - smoothedLogGain);
     float gapRatio = gainGap / SMOOTHING_HALVING_GAIN_GAP;
     return min(relaxedTime, TransitionSpeed * exp2(-gapRatio * gapRatio));
 }
@@ -1116,7 +1119,7 @@ float ComputeSmoothingTime(float previousSmoothingTime, float targetAPL, float s
 // Upper bound for the closed-loop gain search.
 float ComputeCandidateMaxLogGain()
 {
-    return ComputeSceneLogGainFromAPL(APL_ANCHOR_POINTS[APL_ANCHOR_COUNT - 1] * 0.01);
+    return APL_ANCHORS[APL_ANCHOR_COUNT - 1].y;
 }
 
 
@@ -1153,7 +1156,7 @@ float ApplyBoostCurveToNits(float nits, BoostCurve curve)
     float y = curve.peakPQ;
 
     if (u < curve.maxU)
-        y = min(u - ShoulderCompressionPQ(u, curve.kneeU, curve.highlightU, curve.maxU, curve.contrast), curve.peakPQ);
+        y = min(u - ShoulderCompressionPQ(u, curve.kneeU, curve.contrast, curve.outlierStartU, curve.outlierScale), curve.peakPQ);
 
     return max(PQToLinearBT2100(y) * 10000.0, safeNits);
 }
@@ -1281,6 +1284,13 @@ float SolveClosedLoopDisplayAPLFromResponseNodes(float rawAPL, float3 responseNo
 
     float solvedGain = 0.5 * (lo + hi);
     return EvaluateDisplayAPLResponseFromLogNodes(logA, solvedGain, gainToNodeScale);
+}
+
+
+float DisplayAPLAtLogGain(float rawAPL, float3 responseNodes, float gMax, float logGain)
+{
+    float4 logA = log2(max(float4(saturate(rawAPL), responseNodes), 1e-6));
+    return EvaluateDisplayAPLResponseFromLogNodes(logA, logGain, 3.0 / gMax);
 }
 
 
@@ -1480,17 +1490,20 @@ float GetFullFieldMeasuredNitsByModeAndIndex(int mode, int idx)
     }
 }
 
+// The windows were measured at 10-bit PQ input codes, so the response interpolates in PQ.
 float SampleMeasuredOutputNitsFullFieldByMode(int mode, float targetNits)
 {
     float clampedNits = clamp(targetNits, FULLFIELD_INPUT_NITS[0], FULLFIELD_INPUT_NITS[FULLFIELD_COUNT - 1]);
     int i0 = FindFullFieldWindowInputIndex(clampedNits);
     int i1 = min(i0 + 1, FULLFIELD_COUNT - 1);
 
-    return SegmentLerp(
-        clampedNits,
-        FULLFIELD_INPUT_NITS[i0], GetFullFieldMeasuredNitsByModeAndIndex(mode, i0),
-        FULLFIELD_INPUT_NITS[i1], GetFullFieldMeasuredNitsByModeAndIndex(mode, i1)
+    float outputPQ = SegmentLerp(
+        NitsToPQ(clampedNits),
+        NitsToPQ(FULLFIELD_INPUT_NITS[i0]), NitsToPQ(GetFullFieldMeasuredNitsByModeAndIndex(mode, i0)),
+        NitsToPQ(FULLFIELD_INPUT_NITS[i1]), NitsToPQ(GetFullFieldMeasuredNitsByModeAndIndex(mode, i1))
     );
+
+    return PQToLinearBT2100(outputPQ) * 10000.0;
 }
 
 float GetFullFieldMeasuredMaxInputNits()
@@ -1577,16 +1590,17 @@ int FindNitIndex(float inputNits)
     return NIT_COUNT - 2;
 }
 
-float LookupGraphCompForAPLRow2D(int aplIdx, float inputNits)
+// The levels were measured at 10-bit PQ input codes, so log compensation interpolates in PQ.
+float LookupGraphLogCompForAPLRow2D(int aplIdx, float inputNits)
 {
     float clampedNits = clamp(inputNits, NIT_POINTS[0], NIT_POINTS[NIT_COUNT - 1]);
     int n0 = FindNitIndex(clampedNits);
     int n1 = min(n0 + 1, NIT_COUNT - 1);
 
     return SegmentLerp(
-        clampedNits,
-        NIT_POINTS[n0], GraphTableComp2D(aplIdx, n0),
-        NIT_POINTS[n1], GraphTableComp2D(aplIdx, n1)
+        NitsToPQ(clampedNits),
+        NitsToPQ(NIT_POINTS[n0]), log2(GraphTableComp2D(aplIdx, n0)),
+        NitsToPQ(NIT_POINTS[n1]), log2(GraphTableComp2D(aplIdx, n1))
     );
 }
 
@@ -1599,17 +1613,18 @@ int FindGraphAPLIndex(float aplPct)
     return min(idx, GRAPH_APL_COUNT - 2);
 }
 
+// Log compensation is linear in log APL between rows, as in the live table.
 float LookupMeasuredComp2DGraph(float aplPct, float inputNits)
 {
     float clampedAPL = clamp(aplPct, GRAPH_APL_POINTS[0], GRAPH_APL_POINTS[GRAPH_APL_COUNT - 1]);
     int a0 = FindGraphAPLIndex(clampedAPL);
     int a1 = min(a0 + 1, GRAPH_APL_COUNT - 1);
 
-    return SegmentLerp(
-        clampedAPL,
-        GRAPH_APL_POINTS[a0], LookupGraphCompForAPLRow2D(a0, inputNits),
-        GRAPH_APL_POINTS[a1], LookupGraphCompForAPLRow2D(a1, inputNits)
-    );
+    return exp2(SegmentLerp(
+        log2(clampedAPL),
+        log2(GRAPH_APL_POINTS[a0]), LookupGraphLogCompForAPLRow2D(a0, inputNits),
+        log2(GRAPH_APL_POINTS[a1]), LookupGraphLogCompForAPLRow2D(a1, inputNits)
+    ));
 }
 
 float SampleRealMeasuredOutputNitsForAPL(float aplPct, float targetNits)
@@ -1995,10 +2010,9 @@ float3 DrawAPLGraphOverlay(float2 texcoord, float3 sceneColor)
 #endif
 
 
-// Linear lookup in the 129-node PQ decode table.
 float APL_FastPQCodeToNits(float pqCode)
 {
-    float u = (saturate(pqCode) * 128.0 + 0.5) * (1.0 / 129.0);
+    float u = (saturate(pqCode) * (APL_FAST_PQ_NODES - 1) + 0.5) * (1.0 / APL_FAST_PQ_NODES);
     return tex2Dlod(SamplerAPLFastPQNits, float4(u, 0.5, 0.0, 0.0)).r;
 }
 
@@ -2305,10 +2319,11 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
 
     int localIndex = int(threadID.x);
 
-    if (localIndex < 129)
+    [loop]
+    for (int node = localIndex; node < APL_FAST_PQ_NODES; node += APL_SETUP_THREADS)
     {
-        float pqCode = float(localIndex) * (1.0 / 128.0);
-        tex2Dstore(StorageAPLFastPQNits, int2(localIndex, 0), PQToLinearBT2100(pqCode) * 10000.0);
+        float pqCode = float(node) / (APL_FAST_PQ_NODES - 1);
+        tex2Dstore(StorageAPLFastPQNits, int2(node, 0), PQToLinearBT2100(pqCode) * 10000.0);
     }
 
     if (localIndex == 0)
@@ -2322,8 +2337,8 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
         float4 previousState = resumedAfterPause ? 0.0.xxxx : tex2Dfetch(SamplerAPL, int2(0, 0));
         float4 previousMaxima = resumedAfterPause ? 0.0.xxxx : tex2Dfetch(SamplerAPL, int2(1, 0));
 
-        // Layout: smoothed APL, this execution's rolling phase, history flag, smoothed highlight PQ.
-        tex2Dstore(StorageAPLPrev, int2(0, 0), float4(previousState.r, float(APL_SetupRollingPhase), previousState.b, previousState.g));
+        // Layout: smoothed log2 gain, this execution's rolling phase, history flag, smoothed highlight PQ.
+        tex2Dstore(StorageAPLPrev, int2(0, 0), float4(previousState.a, float(APL_SetupRollingPhase), previousState.b, previousState.g));
         tex2Dstore(StorageAPLPrev, int2(1, 0), previousMaxima);
     }
     barrier();
@@ -2620,9 +2635,6 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
     float4 prevMaxima = tex2Dfetch(SamplerAPLPrev, int2(1, 0));
     float hasPrev = (prevData.b > 0.0) ? 1.0 : 0.0;
 
-    // The scene levels feed the curves the solve tests, so they take the smoothing time the previous frame set.
-    float sceneAlpha = ComputeTemporalBlendFactor(prevMaxima.z);
-
     float pixelCount = 0.0;
     float sceneNits = 0.0;
     float maxChannelNits = 0.0;
@@ -2652,6 +2664,9 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
             NitsToPQ(sceneMaxNits.x),
             NitsToPQ(sceneMaxNits.y));
         float3 previousScenePQ = saturate(float3(prevData.a, prevMaxima.xy));
+
+        // The scene levels feed the curves the solve tests, so they take the smoothing time the previous frame set.
+        float sceneAlpha = ComputeTemporalBlendFactor(prevMaxima.z);
 
         // Smoothed in PQ so level shifts fade evenly in perceived brightness.
         APL_EvalScenePQ = lerp(
@@ -2730,23 +2745,25 @@ void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThr
         int nextRollingPhase = APL_GetNextRollingPhase(currentRollingPhase);
 
         float currentDisplayAPL = SolveClosedLoopDisplayAPLFromResponseNodes(rawAPL, responseNodes, gMax);
+        float targetLogGain = ComputeSceneLogGainFromAPL(currentDisplayAPL);
         float smoothingTime = (hasPrev > 0.0)
-            ? ComputeSmoothingTime(prevMaxima.z, currentDisplayAPL, saturate(prevData.r))
+            ? ComputeSmoothingTime(prevMaxima.z, targetLogGain, prevData.r)
             : TransitionSpeed;
-        float smoothedAPL = lerp(
-            currentDisplayAPL,
-            lerp(saturate(prevData.r), currentDisplayAPL, ComputeTemporalBlendFactor(smoothingTime)),
+
+        // Smoothed in log2 gain so each step of brightness takes the same time in either direction.
+        float sceneLogGain = lerp(
+            targetLogGain,
+            lerp(prevData.r, targetLogGain, ComputeTemporalBlendFactor(smoothingTime)),
             hasPrev
         );
-
-        float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL);
+        float outputAPL = DisplayAPLAtLogGain(rawAPL, responseNodes, gMax, sceneLogGain);
 
         tex2Dstore(
             StorageAPLInstant,
             int2(0, 0),
             float4(rawAPL, sceneMaxNits.x, float(nextRollingPhase), float(APL_GetFrameStamp()))
         );
-        tex2Dstore(StorageAPL, int2(0, 0), float4(smoothedAPL, scenePQ.x, 1.0, sceneLogGain));
+        tex2Dstore(StorageAPL, int2(0, 0), float4(outputAPL, scenePQ.x, 1.0, sceneLogGain));
         tex2Dstore(StorageAPL, int2(1, 0), float4(scenePQ.yz, smoothingTime, 0.0));
 
         float sceneGain = SceneGainFromLogGain(sceneLogGain);

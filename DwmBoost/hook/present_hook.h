@@ -1,5 +1,5 @@
 // The COverlayContext::Present hook: acquire the FP16 scRGB back buffer, keep a per-monitor clean
-// copy fed from dirty rects, run the ported APL passes on it, and draw the boosted frame back. Runs
+// copy fed from dirty rects, run the EOTF Boost passes on it, and draw the boosted frame back. Runs
 // on the target monitor (FP16 + configured size + host HDR flag) only; every other context and any
 // non-FP16 back buffer passes straight through. No CPU-side wait, blocking Map, or shared-memory
 // poll in the present path — the host config is mirrored into atomics by the DLL's watcher thread.
@@ -14,10 +14,8 @@ void PresentSetOrig(Present_t orig);
 Present_t PresentGetDetour();
 
 // Mirror of the host config, pushed by the watcher thread (never read from shared memory in the
-// present path). resetGeneration bumps force one history-reset run.
-void PresentSetTarget(bool enabled, unsigned int resetGeneration,
-                      int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr,
-                      float monLitFraction);
+// present path).
+void PresentSetTarget(bool enabled, int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr);
 
 // Release all GPU resources and close the settle/content/prime events. Called when the effect is
 // toggled off and at Shutdown. Safe to call repeatedly and when nothing was created.

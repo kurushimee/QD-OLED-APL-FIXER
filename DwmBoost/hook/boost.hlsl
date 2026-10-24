@@ -1,279 +1,330 @@
-// EOTF Boost for DWM — scRGB desktop path, ported from Shaders/EOTF_BoostMod2.0_27M2N6500.fx.
+// EOTF Boost v8.18.7.15 (EOTF_BoostMod3.0.fx) for DWM.
 //
-// The algorithm and output match the ReShade shader at its current defaults. Only the scRGB input
-// path is kept (DWM composes into FP16 scRGB); the PQ-input branch, the fast-PQ decode table, the
-// OSD, the compression heatmap, the debug graph, the calibration LUT, and every runtime uniform are
-// removed, their values baked below. ReShade intrinsics are replaced with plain HLSL: tex2Dstore ->
-// RWTexture store, tex2Dfetch -> Load, atomicAdd -> InterlockedAdd, atomicMax -> InterlockedMax,
-// barrier -> GroupMemoryBarrierWithGroupSync.
+// The shader's code is unchanged. Its uniforms are constants holding the settings below, and the
+// features its preprocessor definitions turn off (the debug graph, the calibration LUT, tooltips) are
+// left out. A shim maps ReShade's intrinsics and the back buffer onto plain D3D11, the back buffer
+// being the hook's clean copy of the composed desktop.
 //
-// Five stages, same sync boundaries as the source:
-//   1  CS_Setup          last run's solve copy, row histogram and frame top clear
-//   2  CS_Build          full-frame row histogram build (reads the clean copy)
-//   3  CS_Reduce         global histogram reduction
-//   4  CS_Solve          APL solve and boost curve fit
-//   5  VS_Boost/PS_Boost fullscreen boost (clean copy -> back buffer)
-//
-// The source's skipped-frame pause detection used ReShade's frame counter, which does not exist
-// here; the host raises ResetFlag instead (on enable, prime, and mode change) to drop the last
-// frame's load.
+// Live pipeline, one dispatch or draw each:
+//   1  CS_SetupAndClearAPLFullFrameRowHistograms        frame setup and rolling-row clear
+//   2  CS_BuildAPLFullFrameRowHistogram                 full-frame row histogram build
+//   3  CS_ReduceAPLFullFrameRowHistogram                global histogram reduction
+//   4  CS_EvaluateSolveAndSmoothAPLFullFrameHistogram   response solve, smoothing and boost parameters
+//   5  PostProcessVS / PS_MainPass                      fullscreen boost
 
-// Baked defaults (ReShade uniform values).
-static const float APLReferenceWhiteNits = 1060.0;
-static const float PanelPeakNits         = 1060.0;
-static const float SIGNAL_REFERENCE_NITS = 80.0;   // scRGB 1.0
+// Preprocessor definitions.
+#define APL_FULLFRAME_ROLLING_PHASES  6
+#define PER_APL_BOOST_STRENGTH_ENABLE 1
 
-// Full-frame histogram layout. Each 16x16 group processes one 32x32 pixel tile.
-#define APL_FFH_TILE_SIZE        32
-#define APL_FFH_THREADS_X        16
-#define APL_FFH_THREADS_Y        16
-#define APL_FFH_PIXELS_X          2
-#define APL_FFH_PIXELS_Y          2
-#define APL_FFH_LUMA_BINS        64
-#define APL_FFH_COLOR_RATIO_BINS  4
-#define APL_FFH_MAX_BINS        256
-#define APL_FFH_BLOCK_W          16
-#define APL_FFH_BLOCK_H          16
-#define APL_FFH_REDUCE_THREADS   64
-#define APL_SETUP_THREADS       256
-
-// Packed value: pixel count in the upper bits, summed bin position in the lower bits.
-#define APL_FFH_PACK_COUNT_SHIFT  20
-#define APL_FFH_PACK_OFFSET_MASK  ((1 << APL_FFH_PACK_COUNT_SHIFT) - 1)
-#define APL_FFH_PACK_OFFSET_SCALE 1023
-#define APL_FFH_PACK_ONE_COUNT    (1 << APL_FFH_PACK_COUNT_SHIFT)
-
-#define APL_FFH_TILE_COUNT_Y ((BUFFER_HEIGHT + APL_FFH_TILE_SIZE - 1) / APL_FFH_TILE_SIZE)
-
-// Rows take tile sums of squared bin positions in units of 256, so a whole row still fits an int.
-#define APL_FFH_ROW_OFFSET_SQ_UNIT 256
-
-// The curve above the knee is a table of output PQ codes over equal cells of full-gain PQ. One pixel can change
-// one cell's slope, so the cells are narrow enough that this moves no level by a whole 10-bit step.
-#define BOOST_CURVE_CELLS        512
-#define BOOST_CURVE_SOLVE_STEPS   32
-
-// The solve runs one thread per curve cell, and the first threads also read one histogram bin each.
-#define APL_EVAL_THREADS         BOOST_CURVE_CELLS
+// Settings.
+static const bool  EnableEOTFBoost              = true;
+static const int   APLInputMode                 = 0;        // scRGB Normalized
+static const float APLReferenceWhiteNits        = 150.0;
+static const float CompensationFreezeAPLPercent = 80.0;
+static const float MaxAPLBoostStrength          = 0.25;
+static const bool  EnablePerAPLBoostStrength    = true;
+static const float APLBoostStrength03           = 0.25;
+static const float APLBoostStrength05           = 0.25;
+static const float APLBoostStrength07           = 0.26;
+static const float APLBoostStrength10           = 0.26;
+static const float APLBoostStrength14           = 0.27;
+static const float APLBoostStrength18           = 0.27;
+static const float APLBoostStrength22           = 0.28;
+static const float APLBoostStrength25           = 0.28;
+static const float APLBoostStrength35           = 0.30;
+static const float APLBoostStrength50           = 0.55;
+static const float BoostRollOff                 = 800.0;
+static const float BoostRollOffShape            = 1.20;
+static const float TransitionSpeed              = 0.50;
+static const bool  EnableColorPreservingBoostMode = true;
+static const float COLOR_PRESERVING_BOOST_KNEE  = 0.85;
+static const float SIGNAL_REFERENCE_NITS        = 150.0;
+static const bool  ShowOSD                      = false;
+static const float OSDBrightness                = 0.50;
 
 
-cbuffer BoostCB : register(b0)
+// -------- ReShade shim --------
+
+cbuffer EOTFBoostCB : register(b0)
 {
-    uint  ResetFlag;       // 1 = resume after a pause: drop the last frame's load
-    uint  BufferWidthPx;   // target back-buffer size; sets the histogram geometry
+    uint  BufferWidthPx;
     uint  BufferHeightPx;
-    float LitFraction;     // share of the native panel the buffer covers; the rest is black bars
+    float FrameTime;        // ms since the last run, ReShade's "frametime" source
 };
 
 #define BUFFER_WIDTH  int(BufferWidthPx)
 #define BUFFER_HEIGHT int(BufferHeightPx)
 
+#define ScreenSize float2(BUFFER_WIDTH, BUFFER_HEIGHT)
 
-// -------- color and transfer helpers --------
+// SRVs keep one slot across all passes. UAVs are bound per pass, and passes never share a slot's texture.
+Texture2D<float4> BackBuffer                   : register(t0);
+Texture2D<float4> SamplerAPL                   : register(t1);
+Texture2D<float4> SamplerCandidateBoostParams  : register(t2);
+Texture2D<float4> SamplerBoostParams           : register(t3);
+Texture2D<float4> SamplerAPLInstant            : register(t4);
+Texture2D<float4> SamplerAPLPrev               : register(t5);
+Texture2D<float>  SamplerAPLFastPQNits         : register(t6);
+Texture2D<int>    SamplerAPLRowHistCount       : register(t7);
+Texture2D<int>    SamplerAPLRowHistOffset10    : register(t8);
+Texture2D<int>    SamplerAPLRowHistMaxNits     : register(t9);
+Texture2D<int>    SamplerAPLRowMeta            : register(t10);
+Texture2D<int>    SamplerAPLGlobalHistCount    : register(t11);
+Texture2D<float>  SamplerAPLGlobalHistOffset10 : register(t12);
+Texture2D<float>  SamplerAPLGlobalHistMaxNits  : register(t13);
+
+// Pass 1
+RWTexture2D<float4> StorageCandidateBoostParams : register(u0);
+RWTexture2D<float>  StorageAPLFastPQNits        : register(u1);
+RWTexture2D<float4> StorageAPLPrev              : register(u2);
+
+// Passes 1 and 2
+RWTexture2D<int>    StorageAPLRowHistCount      : register(u3);
+RWTexture2D<int>    StorageAPLRowHistOffset10   : register(u4);
+RWTexture2D<int>    StorageAPLRowHistMaxNits    : register(u5);
+RWTexture2D<int>    StorageAPLRowMeta           : register(u6);
+
+// Pass 3
+RWTexture2D<int>    StorageAPLGlobalHistCount    : register(u0);
+RWTexture2D<float>  StorageAPLGlobalHistOffset10 : register(u1);
+RWTexture2D<float>  StorageAPLGlobalHistMaxNits  : register(u2);
+
+// Pass 4
+RWTexture2D<float4> StorageAPLInstant           : register(u0);
+RWTexture2D<float4> StorageAPL                  : register(u1);
+RWTexture2D<float4> StorageBoostParams          : register(u2);
+
+// The fast PQ table filters linearly, every other sampler reads texel centers.
+SamplerState PointClamp  : register(s0);
+SamplerState LinearClamp : register(s1);
+
+float4 tex2D(Texture2D<float4> t, float2 uv)     { return t.SampleLevel(PointClamp, uv, 0.0); }
+float4 tex2Dlod(Texture2D<float4> t, float4 uv)  { return t.SampleLevel(PointClamp, uv.xy, uv.w); }
+float  tex2Dlod(Texture2D<float> t, float4 uv)   { return t.SampleLevel(LinearClamp, uv.xy, uv.w); }
+
+int    tex2Dfetch(Texture2D<int> t, int2 c)      { return t.Load(int3(c, 0)); }
+float  tex2Dfetch(Texture2D<float> t, int2 c)    { return t.Load(int3(c, 0)); }
+float4 tex2Dfetch(Texture2D<float4> t, int2 c)   { return t.Load(int3(c, 0)); }
+
+void tex2Dstore(RWTexture2D<int> t, int2 c, int v)       { t[c] = v; }
+void tex2Dstore(RWTexture2D<float> t, int2 c, float v)   { t[c] = v; }
+void tex2Dstore(RWTexture2D<float4> t, int2 c, float4 v) { t[c] = v; }
+
+void atomicAdd(RWTexture2D<int> t, int2 c, int v) { InterlockedAdd(t[c], v); }
+void atomicMax(RWTexture2D<int> t, int2 c, int v) { InterlockedMax(t[c], v); }
+
+void barrier() { GroupMemoryBarrierWithGroupSync(); }
+
+// ReShade.fxh's fullscreen triangle.
+void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD)
+{
+    texcoord.x = (id == 2) ? 2.0 : 0.0;
+    texcoord.y = (id == 1) ? 2.0 : 0.0;
+    position = float4(texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+
+// -------- EOTF_BoostMod3.0.fx --------
+
+// Full-frame histogram layout. Each 16x16 group processes one 32x32 pixel tile.
+#define APL_FFH_TILE_SIZE             32
+#define APL_FFH_THREADS_X             16
+#define APL_FFH_THREADS_Y             16
+#define APL_FFH_PIXELS_X               2
+#define APL_FFH_PIXELS_Y               2
+#define APL_FFH_LUMA_BINS              64
+#define APL_FFH_COLOR_LUMA_BINS        64
+#define APL_FFH_COLOR_RATIO_BINS        4
+#define APL_FFH_MAX_BINS              256
+#define APL_FFH_BLOCK_W                16
+#define APL_FFH_BLOCK_H                16
+#define APL_FFH_AUX_X                  APL_FFH_BLOCK_W
+#define APL_FFH_REDUCE_THREADS         64
+
+
+// Packed value: pixel count in the upper bits and summed bin position in the lower bits.
+#define APL_FFH_PACK_COUNT_SHIFT       20
+#define APL_FFH_PACK_OFFSET_MASK       ((1 << APL_FFH_PACK_COUNT_SHIFT) - 1)
+#define APL_FFH_PACK_OFFSET_SCALE      1023
+#define APL_FFH_PACK_ONE_COUNT         (1 << APL_FFH_PACK_COUNT_SHIFT)
+
+#define APL_FFH_TILE_COUNT_X ((BUFFER_WIDTH  + APL_FFH_TILE_SIZE - 1) / APL_FFH_TILE_SIZE)
+#define APL_FFH_TILE_COUNT_Y ((BUFFER_HEIGHT + APL_FFH_TILE_SIZE - 1) / APL_FFH_TILE_SIZE)
+
+
+// 0 refreshes all rows each frame. N refreshes one of N interleaved row phases.
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    #define APL_FFH_ROLLING_ROW_SLOTS ((APL_FFH_TILE_COUNT_Y + APL_FULLFRAME_ROLLING_PHASES - 1) / APL_FULLFRAME_ROLLING_PHASES)
+
+
+    // Metadata stores a runtime signature and the completed row pixel count.
+    #define APL_FFH_ROW_META_COUNT_BITS 20
+    #define APL_FFH_ROW_META_COUNT_MASK ((1 << APL_FFH_ROW_META_COUNT_BITS) - 1)
+#else
+    #define APL_FFH_ROLLING_ROW_SLOTS APL_FFH_TILE_COUNT_Y
+#endif
+
+#if (APL_FFH_THREADS_X * APL_FFH_PIXELS_X != APL_FFH_TILE_SIZE) || (APL_FFH_THREADS_Y * APL_FFH_PIXELS_Y != APL_FFH_TILE_SIZE)
+    #error "Full-frame APL histogram tile/thread dimensions are inconsistent"
+#endif
+#if (APL_FFH_BLOCK_W * APL_FFH_BLOCK_H != APL_FFH_MAX_BINS)
+    #error "Full-frame APL histogram block dimensions do not match maximum bin count"
+#endif
+#if (APL_FFH_COLOR_LUMA_BINS * APL_FFH_COLOR_RATIO_BINS != APL_FFH_MAX_BINS)
+    #error "Color-preserving full-frame APL histogram dimensions are inconsistent"
+#endif
 
 float GetLuma709(float3 color)
 {
     return dot(color, float3(0.2126, 0.7152, 0.0722));
 }
 
-float Max3(float3 v)
+float GetLuma2020(float3 color)
 {
-    return max(max(v.r, v.g), v.b);
+    return dot(color, float3(0.2627, 0.6780, 0.0593));
 }
 
-// Channel limits are judged in Rec.2020, the gamut of the HDR10 signal the panel receives.
-float3 Rec709ToRec2020(float3 rgb)
+// ST.2084 transfer functions.
+float3 PQToLinearBT2100(float3 v)
 {
-    return float3(
-        dot(rgb, float3(0.6274040, 0.3292820, 0.0433136)),
-        dot(rgb, float3(0.0690970, 0.9195400, 0.0113612)),
-        dot(rgb, float3(0.0163916, 0.0880132, 0.8955950))
-    );
-}
 
-// The panel's own primaries from its EDID, with the D65 white the signal's gray sits on.
-float3 Rec2020ToPanel(float3 rgb)
-{
-    return float3(
-        dot(rgb, float3( 1.215214748, -0.179592899, -0.035621849)),
-        dot(rgb, float3(-0.033322071,  1.046218857, -0.012896786)),
-        dot(rgb, float3(-0.008296491, -0.018309355,  1.026605846))
-    );
-}
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
 
-// Load of a pure panel primary as a share of white's at the same channel level, from ABL_NullTest's color checks.
-static const float SINGLE_PRIMARY_LOAD = 0.75;
-
-// The panel counts a pixel partly by its brightest subpixel and partly by the mean of all three, so a pure
-// primary loads it nearly as much as white at the same channel level. Gray loads at its luma either way, and
-// a color past the panel's gamut drives no channel below zero.
-float GetPanelLoadNits(float3 rec2020Nits)
-{
-    float3 channels = max(Rec2020ToPanel(rec2020Nits), 0.0);
-    float brightestShare = (3.0 * SINGLE_PRIMARY_LOAD - 1.0) * 0.5;
-    return lerp(dot(channels, 1.0 / 3.0), Max3(channels), brightestShare);
-}
-
-static const float PQ_M1 = 0.1593017578125;
-static const float PQ_M2 = 78.84375;
-static const float PQ_C1 = 0.8359375;
-static const float PQ_C2 = 18.8515625;
-static const float PQ_C3 = 18.6875;
-
-float PQToLinearBT2100(float v)
-{
-    float vp = pow(saturate(v), 1.0 / PQ_M2);
-    float num = max(vp - PQ_C1, 0.0);
-    float den = PQ_C2 - PQ_C3 * vp;
-    return pow(num / max(den, 1e-6), 1.0 / PQ_M1);
-}
-
-// Monotonic above 1.0, so gain offsets stay ordered past 10000 nits.
-float LinearToPQBT2100Unclamped(float linearValue)
-{
-    float Lm1 = pow(max(linearValue, 0.0), PQ_M1);
-    return pow((PQ_C1 + PQ_C2 * Lm1) / (1.0 + PQ_C3 * Lm1), PQ_M2);
+    float3 vp = pow(saturate(v), 1.0 / m2);
+    float3 num = max(vp - c1, 0.0);
+    float3 den = c2 - c3 * vp;
+    return pow(num / max(den, 1e-6), 1.0 / m1);
 }
 
 float LinearToPQBT2100(float linearValue)
 {
-    return LinearToPQBT2100Unclamped(saturate(linearValue));
+
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+
+    float L = saturate(linearValue);
+    float Lm1 = pow(L, m1);
+    float num = c1 + c2 * Lm1;
+    float den = 1.0 + c3 * Lm1;
+    return pow(num / max(den, 1e-6), m2);
 }
 
-float NitsToPQ(float nits)          { return LinearToPQBT2100(nits / 10000.0); }
-float NitsToPQUnclamped(float nits) { return LinearToPQBT2100Unclamped(nits / 10000.0); }
 
-
-// -------- boost curve --------
-
-// PQ contrast the fixed shoulder eases to. Content above the panel peak keeps at most this and no level keeps less.
-static const float HIGHLIGHT_CONTRAST = 0.25;
-
-// PQ width over which slopes ease between the full gain and the highlight contrast.
-static const float KNEE_TRANSITION_PQ = 0.04;
-
-// PQ size of the fine detail a pixel carries, the 0.2 average local RMS contrast of natural images (Frazor and
-// Geisler 2006) at highlight levels, where a unit of natural log luminance spans about 0.108 PQ.
-static const float DETAIL_PQ = 0.022;
-
-// Full gain up to the knee. Above it the output PQ codes come from a table fitted to the frame, up to maxU, the
-// full-gain PQ code of a 10000 nit signal. Levels named U are PQ codes after the full gain.
-struct BoostCurve
+float3 LinearToPQBT2100(float3 v)
 {
-    float gain;
-    float peakPQ;
-    float kneeNits;
-    float kneeU;
-    float maxU;
-    float departureU;
-};
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
 
-// How far the shoulder sits below the full gain at u.
-float ShoulderCompressionPQ(float u, float kneeU)
-{
-    float t = max(u - kneeU, 0.0);
-    float eased = (t < KNEE_TRANSITION_PQ)
-        ? t * t / (2.0 * KNEE_TRANSITION_PQ)
-        : t - 0.5 * KNEE_TRANSITION_PQ;
-
-    return (1.0 - HIGHLIGHT_CONTRAST) * eased;
+    float3 Lm1 = pow(saturate(v), m1);
+    float3 num = c1 + c2 * Lm1;
+    float3 den = 1.0 + c3 * Lm1;
+    return pow(num / max(den, 1e-6), m2);
 }
 
-// The fixed shoulder depends only on the gain. It eases from the knee to the highlight contrast and lands a 10000
-// nit signal on the panel peak, and the fitted curve never goes under it or flatter than it.
-BoostCurve MakeBoostCurve(float gain)
+
+float PQToLinearScalar(float v)
 {
-    BoostCurve curve;
-    curve.gain = max(gain, 1.0);
-    curve.peakPQ = 1.0;
-    curve.kneeNits = 10000.0;
-    curve.kneeU = 1.0;
-    curve.maxU = 1.0;
-    curve.departureU = 1.0;
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
 
-    if (PanelPeakNits <= 0.0)
-        return curve;
-
-    curve.peakPQ = NitsToPQ(PanelPeakNits);
-    curve.maxU = NitsToPQUnclamped(10000.0 * curve.gain);
-
-    // The shoulder span that absorbs the overshoot, ending inside the slope ease or past it.
-    float eased = (curve.maxU - curve.peakPQ) / (1.0 - HIGHLIGHT_CONTRAST);
-    float span = (eased < 0.5 * KNEE_TRANSITION_PQ)
-        ? sqrt(2.0 * KNEE_TRANSITION_PQ * eased)
-        : eased + 0.5 * KNEE_TRANSITION_PQ;
-
-    curve.kneeU = curve.maxU - span;
-    curve.kneeNits = PQToLinearBT2100(curve.kneeU) * 10000.0 / curve.gain;
-    curve.departureU = curve.kneeU;
-    return curve;
+    float vp = pow(saturate(v), 1.0 / m2);
+    float num = max(vp - c1, 0.0);
+    float den = c2 - c3 * vp;
+    return pow(num / max(den, 1e-6), 1.0 / m1); // Relative to 10000 nits.
 }
 
-// The first texel holds the gain and the knee, the second the curve's top and where it leaves the full gain.
-float4 PackBoostCurve(BoostCurve curve, int texel)
+float NitsToPQ(float nits)
 {
-    if (texel == 0)
-        return float4(curve.gain, curve.peakPQ, curve.kneeNits, curve.kneeU);
-
-    return float4(curve.maxU, curve.departureU, 0.0, 0.0);
+    return LinearToPQBT2100(saturate(nits / 10000.0));
 }
 
-BoostCurve UnpackBoostCurve(float4 knee, float4 top)
+bool NeedsAPLProcessing()
 {
-    BoostCurve curve;
-    curve.gain = knee.x;
-    curve.peakPQ = knee.y;
-    curve.kneeNits = knee.z;
-    curve.kneeU = knee.w;
-    curve.maxU = top.x;
-    curve.departureU = top.y;
-    return curve;
+    return EnableEOTFBoost;
 }
 
-float CurveCellWidth(BoostCurve curve)
+
+
+// PQ-space highlight roll-off.
+static const float PQ_BLACK = 7.309559025783966e-07;
+
+
+float ComputeBT2390ShapedKneeStart(float maxLum, float shapeControl)
 {
-    return (curve.maxU - curve.kneeU) / BOOST_CURVE_CELLS;
+    float standardKneeStart = saturate(1.5 * maxLum - 0.5);
+
+
+    if (abs(shapeControl - 1.0) <= 1e-4)
+        return standardKneeStart;
+
+    float safeShapeControl = max(shapeControl, 1e-4);
+    float shapeBias = log2(safeShapeControl);
+
+    if (shapeBias > 0.0)
+    {
+        float hardT = saturate(shapeBias * 0.5);
+        float aggressiveKneeStart = standardKneeStart * 0.15;
+        return saturate(lerp(standardKneeStart, aggressiveKneeStart, hardT));
+    }
+
+    if (shapeBias < 0.0)
+    {
+        float softT = saturate(-shapeBias * 0.5);
+        float softerKneeStart = standardKneeStart + (maxLum - standardKneeStart) * 0.85;
+        return min(lerp(standardKneeStart, softerKneeStart, softT), maxLum - 1e-6);
+    }
+
+    return standardKneeStart;
 }
 
-// Full-gain PQ code at a cell edge.
-float CurveNodeU(int node, BoostCurve curve)
+
+
+float GetDigit(int digit, float2 uv)
 {
-    return curve.kneeU + node * CurveCellWidth(curve);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+        return 0.0;
+
+    int patterns[10] = { 31599, 9362, 29671, 29391, 23497, 31183, 31215, 29257, 31727, 31695 };
+    int num = patterns[clamp(digit, 0, 9)];
+    int x = int(uv.x * 3.0);
+    int y = int((1.0 - uv.y) * 5.0);
+
+    return (num >> (x + y * 3)) & 1;
 }
 
-// Cell of the curve that holds u, and how far through the cell u sits.
-int CurveCell(float u, BoostCurve curve, out float fraction)
+float GetPercent(float2 uv)
 {
-    float position = (min(u, curve.maxU) - curve.kneeU) / CurveCellWidth(curve);
-    int cell = min(int(position), BOOST_CURVE_CELLS - 1);
-    fraction = position - cell;
-    return cell;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+        return 0.0;
+
+    float2 d0 = uv - float2(0.3, 0.25);
+    float2 d1 = uv - float2(0.7, 0.75);
+    bool slash = abs(uv.x - (1.0 - uv.y)) < 0.15;
+    bool circles = (dot(d0, d0) < 0.04) || (dot(d1, d1) < 0.04);
+
+    return (slash || circles) ? 1.0 : 0.0;
 }
 
-// PQ code after the full gain, inside the curve's range.
-float FullGainPQ(float nits, BoostCurve curve)
+float GetDot(float2 uv)
 {
-    return NitsToPQUnclamped(clamp(nits, 0.0, 10000.0) * curve.gain);
-}
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+        return 0.0;
 
-// Signal nits of a level whose curve output is the PQ code y.
-float CurveOutputNits(float nits, float y, BoostCurve curve)
-{
-    float safeNits = max(nits, 0.0);
-
-    if (safeNits <= curve.kneeNits)
-        return safeNits * curve.gain;
-
-    return PQToLinearBT2100(min(y, curve.peakPQ)) * 10000.0;
-}
-
-// One scale for all channels. Luma follows the curve, and the brightest channel follows it too, which keeps it
-// under the panel peak.
-float CurveBoostScale(float lumaNits, float lumaY, float maxChannelNits, float maxChannelY, BoostCurve curve)
-{
-    return min(
-        CurveOutputNits(lumaNits, lumaY, curve) / max(lumaNits, 1e-6),
-        CurveOutputNits(maxChannelNits, maxChannelY, curve) / max(maxChannelNits, 1e-6));
+    float y = 1.0 - uv.y;
+    return (uv.x > 0.35 && uv.x < 0.65 && y > 0.00 && y < 0.20) ? 1.0 : 0.0;
 }
 
 float Remap01(float x, float a, float b)
@@ -286,80 +337,523 @@ float SegmentLerp(float x, float x0, float y0, float x1, float y1)
     return lerp(y0, y1, Remap01(x, x0, x1));
 }
 
-// 1D compensation table in log2, so lookups need no logs of their own. Each anchor holds log2 of its APL in
-// percent and log2 of the 1060 nit peak at 3% APL divided by the peak measured at that APL.
-static const int APL_ANCHOR_COUNT = 24;
+// Measured APL data used by the optional graph and per-APL controls.
+static const int GRAPH_APL_COUNT = 10;
+static const int NIT_COUNT = 24;
 
-static const float2 APL_ANCHORS[APL_ANCHOR_COUNT] =
+
+static const float GRAPH_APL_POINTS[GRAPH_APL_COUNT] =
 {
-    float2(1.584963, 0.000000), // 3%   (1060.0 nits)
-    float2(2.000000, 0.198724), // 4%   (923.6 nits)
-    float2(2.321928, 0.384513), // 5%   (812.0 nits)
-    float2(2.584963, 0.559800), // 6%   (719.1 nits)
-    float2(2.807355, 0.720276), // 7%   (643.4 nits)
-    float2(3.000000, 0.860765), // 8%   (583.7 nits)
-    float2(3.169925, 0.988072), // 9%   (534.4 nits)
-    float2(3.321928, 1.104405), // 10%  (493.0 nits)
-    float2(3.459432, 1.146569), // 11%  (478.8 nits)
-    float2(3.584963, 1.173946), // 12%  (469.8 nits)
-    float2(3.700440, 1.204986), // 13%  (459.8 nits)
-    float2(3.807355, 1.230627), // 14%  (451.7 nits)
-    float2(3.906891, 1.260641), // 15%  (442.4 nits)
-    float2(4.087463, 1.299644), // 17%  (430.6 nits)
-    float2(4.321928, 1.362298), // 20%  (412.3 nits)
-    float2(4.459432, 1.391637), // 22%  (404.0 nits)
-    float2(4.643856, 1.443258), // 25%  (389.8 nits)
-    float2(4.754888, 1.474309), // 27%  (381.5 nits)
-    float2(4.906891, 1.506043), // 30%  (373.2 nits)
-    float2(5.129283, 1.551199), // 35%  (361.7 nits)
-    float2(5.321928, 1.606491), // 40%  (348.1 nits)
-    float2(5.643856, 1.689660), // 50%  (328.6 nits)
-    float2(6.228819, 1.824882), // 75%  (299.2 nits)
-    float2(6.643856, 1.914396)  // 100% (281.2 nits)
+    3.000000, 5.000000, 7.000000, 10.000000, 14.000000, 18.000000, 22.000000, 25.000000, 35.000000, 50.000000
 };
 
-int FindAPLAnchorIndex(float logAPL)
+static const float NIT_POINTS[NIT_COUNT] =
+{
+    10.302358, 13.132379, 16.611621, 20.870708, 26.064850, 32.378420, 40.030390, 49.280814, 60.438551, 73.870492, 90.012580, 109.383004, 130.598006, 157.390856, 190.634650, 230.369755, 282.836899, 334.517130, 400.180165, 480.942985, 580.341000, 702.414628, 840.814884, 1000.932391
+};
+
+
+// Dense live compensation table. Values correspond to COMP_APL_POINTS.
+static const int COMP_APL_COUNT = 10;
+
+static const float COMP_APL_POINTS[COMP_APL_COUNT] =
+{
+    3.000000,
+    5.000000,
+    7.000000,
+    10.000000,
+    14.000000,
+    18.000000,
+    22.000000,
+    25.000000,
+    35.000000,
+    50.000000
+};
+
+// Representative 1D compensation values for the 8 APL anchors above.
+// These values are taken/approximated from the original denser tables so the
+// reduced table preserves the overall shape of the compensation curve.
+static const float COMP_APL_1D[COMP_APL_COUNT] =
+{
+    1.000000, // 3%
+    1.352556, // 5%
+    1.673813, // 7%
+    2.151376, // 10%
+    2.455437, // 14% (approx from 15%)
+    2.636610, // 18%
+    2.760512, // 22%
+    2.839076, // 25%
+    3.064304, // 35%
+    3.345667  // 50%
+};
+
+
+int FindCompAPLIndex(float aplPct)
+{
+
+    int idx = 0;
+    [unroll]
+    for (int i = 0; i < COMP_APL_COUNT - 1; ++i)
+        idx += int(step(COMP_APL_POINTS[i + 1], aplPct));
+    return min(idx, COMP_APL_COUNT - 2);
+}
+
+int FindGraphAPLIndex(float aplPct)
 {
     int idx = 0;
     [unroll]
-    for (int i = 0; i < APL_ANCHOR_COUNT - 1; ++i)
-        idx += int(step(APL_ANCHORS[i + 1].x, logAPL));
-    return min(idx, APL_ANCHOR_COUNT - 2);
+    for (int i = 0; i < GRAPH_APL_COUNT - 1; ++i)
+        idx += int(step(GRAPH_APL_POINTS[i + 1], aplPct));
+    return min(idx, GRAPH_APL_COUNT - 2);
 }
 
-// Log compensation, and so log nits, is linear in log APL between anchors.
-float LookupMeasuredLogComp1D(float aplPct)
+float ApplyCompensationFreezeAPL(float aplPct)
 {
-    float logAPL = clamp(log2(max(aplPct, 1e-6)), APL_ANCHORS[0].x, APL_ANCHORS[APL_ANCHOR_COUNT - 1].x);
-    int a0 = FindAPLAnchorIndex(logAPL);
-    float2 p0 = APL_ANCHORS[a0];
-    float2 p1 = APL_ANCHORS[a0 + 1];
+    float freezeAPL = CompensationFreezeAPLPercent;
+    if (freezeAPL > 0.0)
+        aplPct = min(aplPct, freezeAPL);
 
-    return SegmentLerp(logAPL, p0.x, p0.y, p1.x, p1.y);
+    return aplPct;
+}
+
+float LookupMeasuredComp1D(float aplPct)
+{
+    float lookupAPL = ApplyCompensationFreezeAPL(aplPct);
+    float clampedAPL = clamp(lookupAPL, COMP_APL_POINTS[0], COMP_APL_POINTS[COMP_APL_COUNT - 1]);
+    int a0 = FindCompAPLIndex(clampedAPL);
+    int a1 = min(a0 + 1, COMP_APL_COUNT - 1);
+
+    return SegmentLerp(
+        clampedAPL,
+        COMP_APL_POINTS[a0], COMP_APL_1D[a0],
+        COMP_APL_POINTS[a1], COMP_APL_1D[a1]
+    );
+}
+
+#if PER_APL_BOOST_STRENGTH_ENABLE
+float GetPerAPLBoostStrengthAtIndex(int idx)
+{
+    if (idx == 0) return APLBoostStrength03;
+    if (idx == 1) return APLBoostStrength05;
+    if (idx == 2) return APLBoostStrength07;
+    if (idx == 3) return APLBoostStrength10;
+    if (idx == 4) return APLBoostStrength14;
+    if (idx == 5) return APLBoostStrength18;
+    if (idx == 6) return APLBoostStrength22;
+    if (idx == 7) return APLBoostStrength25;
+    if (idx == 8) return APLBoostStrength35;
+    return APLBoostStrength50;
+}
+
+float LookupPerAPLBoostStrength(float aplPct)
+{
+    if (!EnablePerAPLBoostStrength)
+        return MaxAPLBoostStrength;
+
+    float clampedAPL = clamp(aplPct, GRAPH_APL_POINTS[0], GRAPH_APL_POINTS[GRAPH_APL_COUNT - 1]);
+    int a0 = FindGraphAPLIndex(clampedAPL);
+    int a1 = min(a0 + 1, GRAPH_APL_COUNT - 1);
+
+    return SegmentLerp(
+        clampedAPL,
+        GRAPH_APL_POINTS[a0], GetPerAPLBoostStrengthAtIndex(a0),
+        GRAPH_APL_POINTS[a1], GetPerAPLBoostStrengthAtIndex(a1)
+    );
+}
+#endif
+
+float ComputeTemporalBlendFactor(float smoothingSeconds)
+{
+    if (smoothingSeconds <= 1e-6)
+        return 1.0;
+
+    float dtSeconds = max(FrameTime, 0.0) * 0.001;
+    return saturate(1.0 - exp(-dtSeconds / max(smoothingSeconds, 1e-6)));
+}
+
+
+float ComputeSceneBoostStrength(float currentAPL)
+{
+#if PER_APL_BOOST_STRENGTH_ENABLE
+    float aplPct = saturate(currentAPL) * 100.0;
+    float boostStrength = LookupPerAPLBoostStrength(aplPct);
+#else
+    float boostStrength = MaxAPLBoostStrength;
+#endif
+    return max(boostStrength, 0.0);
+}
+
+
+float ComputeSceneLogGainFromMeasuredComp(float measuredComp, float currentAPL)
+{
+    float safeMeasuredComp = max(measuredComp, 1.0);
+    return log2(safeMeasuredComp) * ComputeSceneBoostStrength(currentAPL);
 }
 
 float ComputeSceneLogGainFromAPL(float currentAPL)
 {
     float aplPct = saturate(currentAPL) * 100.0;
-    return max(LookupMeasuredLogComp1D(aplPct), 0.0);
+    float measuredComp = max(LookupMeasuredComp1D(aplPct), 1.0);
+    return ComputeSceneLogGainFromMeasuredComp(measuredComp, currentAPL);
 }
 
-float SceneGainFromLogGain(float sceneLogGain)
+
+// Upper bound for the closed-loop gain search.
+float ComputeCandidateMaxLogGain()
 {
-    return exp2(max(sceneLogGain, 0.0));
+    float maxComp = max(LookupMeasuredComp1D(COMP_APL_POINTS[COMP_APL_COUNT - 1]), 1.0);
+    float maxStrength = MaxAPLBoostStrength;
+
+#if PER_APL_BOOST_STRENGTH_ENABLE
+    if (EnablePerAPLBoostStrength)
+    {
+        maxStrength = 0.0;
+        [unroll]
+        for (int j = 0; j < GRAPH_APL_COUNT; ++j)
+            maxStrength = max(maxStrength, GetPerAPLBoostStrengthAtIndex(j));
+    }
+#endif
+
+    return max(log2(maxComp) * max(maxStrength, 0.0), 0.0);
 }
 
 
-// -------- histogram quantization and binning --------
+float ComputeRollOffAnchorBoostedNitsFromSceneLogGain(float sceneLogGain)
+{
+    float rollOffEndNits = max(BoostRollOff, 0.0);
+
+    if (rollOffEndNits <= 0.0)
+        return 0.0;
+
+    float referenceInputNits = max(rollOffEndNits, 1e-4);
+    return referenceInputNits * exp2(sceneLogGain);
+}
+
+
+// Build scene-uniform gain and roll-off parameters.
+float4 ComputeBoostRolloffParamsFromSceneLogGain(float sceneLogGain)
+{
+    if (sceneLogGain <= 1e-6)
+        return float4(1.0, 0.0, 1.0, 0.0);
+
+    float sceneGain = exp2(sceneLogGain);
+    float rollOffEndNits = max(BoostRollOff, 0.0);
+    float anchorBoostedNits = ComputeRollOffAnchorBoostedNitsFromSceneLogGain(sceneLogGain);
+
+    if (rollOffEndNits <= 0.0)
+        return float4(sceneGain, 0.0, 1.0, 0.0);
+
+    float sourcePeakNits = max(anchorBoostedNits, rollOffEndNits + 1e-4);
+    float sourceWhitePQ = max(NitsToPQ(sourcePeakNits), PQ_BLACK + 1e-6);
+    float targetWhitePQ = min(NitsToPQ(rollOffEndNits), sourceWhitePQ - 1e-6);
+
+    float pqRange = max(sourceWhitePQ - PQ_BLACK, 1e-6);
+    float maxLum = saturate((targetWhitePQ - PQ_BLACK) / pqRange);
+
+    if (maxLum >= 1.0 - 1e-6)
+        return float4(sceneGain, 0.0, 1.0, 0.0);
+
+    float kneeStart = ComputeBT2390ShapedKneeStart(maxLum, BoostRollOffShape);
+    float compressionSpan = max(maxLum - kneeStart, 1e-6);
+
+    return float4(sceneGain, pqRange, kneeStart, compressionSpan);
+}
+
+float4 LoadCandidateBoostParams(int candidateIndex)
+{
+    int idx = clamp(candidateIndex, 1, 3);
+    float u = (float(idx) - 0.5) / 3.0;
+    return tex2Dlod(SamplerCandidateBoostParams, float4(u, 0.5, 0.0, 0.0));
+}
+
+// Apply roll-off only to added boost; source luminance is preserved.
+float ApplyBT2390EETFToNitsWithPrecomputedParams(float inputNits, float4 boostParams)
+{
+    float safeInputNits = max(inputNits, 0.0);
+    float pqRange = boostParams.g;
+
+    if (pqRange <= 0.0)
+        return safeInputNits;
+
+    float inputPQ = NitsToPQ(safeInputNits);
+    float kneeStart = saturate(boostParams.b);
+    float e1 = saturate((inputPQ - PQ_BLACK) / pqRange);
+
+
+    if (e1 < kneeStart)
+        return safeInputNits;
+
+    float shoulderSpan = max(1.0 - kneeStart, 1e-6);
+    float compressionSpan = max(boostParams.a, 1e-6);
+    float u = saturate((e1 - kneeStart) / shoulderSpan);
+    float shoulderPower = max(shoulderSpan / compressionSpan, 1.0);
+    float e2 = kneeStart + compressionSpan * (1.0 - pow(1.0 - u, shoulderPower));
+    float outputPQ = saturate(e2 * pqRange + PQ_BLACK);
+
+    return max(PQToLinearScalar(outputPQ) * 10000.0, 0.0);
+}
+
+float ComputeBoostedLumaNitsFromPrecomputedParams(float inputLumaNits, float4 boostParams)
+{
+
+    float safeInputLumaNits = max(inputLumaNits, 0.0);
+    float fullyBoostedNits = safeInputLumaNits * max(boostParams.r, 0.0);
+
+    if (boostParams.g <= 0.0)
+        return fullyBoostedNits;
+
+    return max(ApplyBT2390EETFToNitsWithPrecomputedParams(fullyBoostedNits, boostParams), safeInputLumaNits);
+}
+
+float Max3(float3 v)
+{
+    return max(max(v.r, v.g), v.b);
+}
+
+// Compute channel headroom for ratio-preserving boost.
+float ComputeMaxHuePreservingScale(float3 rgb, float channelLimit)
+{
+    float maxChannel = Max3(rgb);
+
+    if (maxChannel <= 1e-6)
+        return 1.0;
+
+    return max(channelLimit / maxChannel, 0.0);
+}
+
+float SoftLimitBoostScale(float desiredScale, float maxScale, float kneeFraction)
+{
+
+
+    // The limiter only removes added gain.
+    float safeDesired = max(desiredScale, 1.0);
+    float safeMax = max(maxScale, 1.0);
+
+    if (safeDesired <= 1.0 || safeMax <= 1.0 + 1e-6)
+        return 1.0;
+
+    float kneeStart = lerp(1.0, safeMax, saturate(kneeFraction));
+
+    if (safeDesired <= kneeStart)
+        return safeDesired;
+
+    float span = max(safeMax - kneeStart, 1e-6);
+    float x = (safeDesired - kneeStart) / span;
+
+    return min(kneeStart + span * (x / (1.0 + x)), safeMax);
+}
+
+float3 ApplyBoostPreserveColorFromPrecomputedParams(float3 color, float4 boostParams)
+{
+    if (boostParams.r <= 1.000001 && boostParams.g <= 0.0)
+        return color;
+
+    if (APLInputMode == 1)
+    {
+        float3 linearColorNits = PQToLinearBT2100(saturate(color)) * 10000.0;
+        float originalLumaNits = max(GetLuma2020(linearColorNits), 0.0);
+
+        if (originalLumaNits <= 1e-6)
+            return color;
+
+        float boostedLumaNits = ComputeBoostedLumaNitsFromPrecomputedParams(originalLumaNits, boostParams);
+        float colorScale = boostedLumaNits / originalLumaNits;
+
+        if (EnableColorPreservingBoostMode)
+        {
+
+
+            float outputChannelLimitNits = (BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0;
+            float maxHuePreservingScale = ComputeMaxHuePreservingScale(linearColorNits, outputChannelLimitNits);
+            colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
+        }
+
+        float3 boostedColorNits = linearColorNits * colorScale;
+
+        return LinearToPQBT2100(saturate(max(boostedColorNits, 0.0) / 10000.0));
+    }
+
+    float3 linearColor = color;
+
+
+    float originalLumaNits = max(GetLuma709(linearColor) * SIGNAL_REFERENCE_NITS, 0.0);
+
+    if (originalLumaNits <= 1e-6)
+        return color;
+
+    float boostedLumaNits = ComputeBoostedLumaNitsFromPrecomputedParams(originalLumaNits, boostParams);
+    float colorScale = boostedLumaNits / originalLumaNits;
+
+    if (EnableColorPreservingBoostMode)
+    {
+
+
+        float outputChannelLimit = ((BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0) / max(SIGNAL_REFERENCE_NITS, 1.0);
+        float maxHuePreservingScale = ComputeMaxHuePreservingScale(max(linearColor, 0.0.xxx), outputChannelLimit);
+        colorScale = SoftLimitBoostScale(colorScale, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
+    }
+
+    return linearColor * colorScale;
+}
+
+
+// Scalar response used by live APL analysis and graph simulation.
+float ComputePostBoostNitsForSample(float lumaNits, float maxChannelNits, float4 boostParams)
+{
+    if (lumaNits <= 1e-6)
+        return 0.0;
+
+    float boostedLumaNits = ComputeBoostedLumaNitsFromPrecomputedParams(lumaNits, boostParams);
+
+    if (EnableColorPreservingBoostMode && maxChannelNits > 1e-6)
+    {
+
+        float outputChannelLimitNits = (BoostRollOff > 0.0) ? clamp(BoostRollOff, 1.0, 10000.0) : 10000.0;
+        float maxHuePreservingScale = max(outputChannelLimitNits / maxChannelNits, 0.0);
+        float colorScale = SoftLimitBoostScale(boostedLumaNits / lumaNits, maxHuePreservingScale, COLOR_PRESERVING_BOOST_KNEE);
+        boostedLumaNits = lumaNits * colorScale;
+    }
+
+    return boostedLumaNits;
+}
+
+
+float ComputePostBoostMetricForSample(float lumaNits, float maxChannelNits, float4 boostParams)
+{
+    return saturate(
+        ComputePostBoostNitsForSample(lumaNits, maxChannelNits, boostParams) /
+        max(APLReferenceWhiteNits, 1.0)
+    );
+}
+
+
+// Interpolate APL response at four log-gain nodes.
+float EvaluateDisplayAPLResponseFromLogNodes(float4 logA, float logGain, float gainToNodeScale)
+{
+    float t = clamp(logGain * gainToNodeScale, 0.0, 3.0);
+    float logEst;
+
+    if (t <= 1.0)
+        logEst = lerp(logA.x, logA.y, t);
+    else if (t <= 2.0)
+        logEst = lerp(logA.y, logA.z, t - 1.0);
+    else
+        logEst = lerp(logA.z, logA.w, t - 2.0);
+
+    return saturate(exp2(logEst));
+}
+
+
+// Solve gain = compensation(APL response) with ten bisection steps.
+float SolveClosedLoopDisplayAPLFromResponseNodes(float rawAPL, float3 responseNodes, float gMax)
+{
+    float safeRawAPL = saturate(rawAPL);
+
+    if (safeRawAPL <= 1e-6)
+        return 0.0;
+
+    if (gMax <= 1e-6)
+        return safeRawAPL;
+
+
+    float4 logA = log2(max(float4(safeRawAPL, responseNodes), 1e-6));
+    float gainToNodeScale = 3.0 / gMax;
+
+    float lo = 0.0;
+    float hi = gMax;
+
+    float aplLo = safeRawAPL;           // A(0)
+    float fLo = clamp(ComputeSceneLogGainFromAPL(aplLo), 0.0, gMax);
+
+
+    if (fLo <= 1e-6)
+        return aplLo;
+
+    float aplHi = saturate(responseNodes.z); // A(gMax)
+    float fHi = clamp(ComputeSceneLogGainFromAPL(aplHi), 0.0, gMax) - gMax;
+
+    if (fHi >= -1e-6)
+        return aplHi;
+
+
+    [loop]
+    for (int i = 0; i < 10; ++i)
+    {
+        float mid = 0.5 * (lo + hi);
+        float aplMid = EvaluateDisplayAPLResponseFromLogNodes(logA, mid, gainToNodeScale);
+        float fMid = clamp(ComputeSceneLogGainFromAPL(aplMid), 0.0, gMax) - mid;
+
+        if (fMid > 0.0)
+            lo = mid;
+        else
+            hi = mid;
+    }
+
+    float solvedGain = 0.5 * (lo + hi);
+    return EvaluateDisplayAPLResponseFromLogNodes(logA, solvedGain, gainToNodeScale);
+}
+
+
+float SolveUniformSceneDisplayAPL(float rawAPL)
+{
+    float safeRawAPL = saturate(rawAPL);
+
+    if (safeRawAPL <= 1e-6 || !EnableEOTFBoost)
+        return safeRawAPL;
+
+    float gMax = ComputeCandidateMaxLogGain();
+
+    if (gMax <= 1e-6)
+        return safeRawAPL;
+
+    float representativeNits = safeRawAPL * max(APLReferenceWhiteNits, 1.0);
+    float3 responseNodes;
+
+    [unroll]
+    for (int k = 1; k <= 3; ++k)
+    {
+        responseNodes[k - 1] = ComputePostBoostMetricForSample(
+            representativeNits,
+            representativeNits,
+            LoadCandidateBoostParams(k)
+        );
+    }
+
+    return SolveClosedLoopDisplayAPLFromResponseNodes(safeRawAPL, responseNodes, gMax);
+}
+
+// Bilinear lookup in the 129-node PQ decode table.
+float APL_FastPQCodeToNits(float pqCode)
+{
+
+
+    float u = (saturate(pqCode) * 128.0 + 0.5) * (1.0 / 129.0);
+    return tex2Dlod(SamplerAPLFastPQNits, float4(u, 0.5, 0.0, 0.0)).r;
+}
+
+float3 APL_FastPQToNits(float3 pq)
+{
+    return float3(
+        APL_FastPQCodeToNits(pq.r),
+        APL_FastPQCodeToNits(pq.g),
+        APL_FastPQCodeToNits(pq.b));
+}
 
 int APL_QuantizeNitsQ4(float nits)
 {
-    return (int)floor(clamp(nits, 0.0, 10000.0) * 4.0 + 0.5);
+    return clamp((int)floor(max(nits, 0.0) * 4.0 + 0.5), 0, 40000);
 }
 
 int APL_QuantizeMaxNits2(float nits)
 {
-    return (int)floor(clamp(nits, 0.0, 10000.0) * 0.5 + 0.5);
+
+
+    return clamp((int)floor(max(nits, 0.0) * 0.5 + 0.5), 0, 5000);
+}
+
+int APL_ActiveHistogramBins()
+{
+    return (EnableEOTFBoost && EnableColorPreservingBoostMode) ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
 }
 
 int APL_HistogramLumaBin64(int lumaQ4)
@@ -420,9 +914,9 @@ int APL_EncodeWithinBinOffset10(int lumaQ4, int lumaBin)
     return int(min(offset10, uint(APL_FFH_PACK_OFFSET_SCALE)));
 }
 
-float APL_ReconstructMeanLumaQ4(int binIndex, float pixelCount, float offsetSum10)
+float APL_ReconstructMeanLumaQ4(int binIndex, bool colorHistogram, float pixelCount, float offsetSum10)
 {
-    int lumaBin = binIndex / APL_FFH_COLOR_RATIO_BINS;
+    int lumaBin = colorHistogram ? (binIndex / APL_FFH_COLOR_RATIO_BINS) : binIndex;
     int lowerQ4 = 0;
     int upperQ4 = 0;
     APL_HistogramLumaBinBoundsQ4(lumaBin, lowerQ4, upperQ4);
@@ -437,7 +931,7 @@ float APL_ReconstructMeanLumaQ4(int binIndex, float pixelCount, float offsetSum1
 
 int2 APL_HistogramBlockCoord(int binIndex)
 {
-    return int2(binIndex % APL_FFH_BLOCK_W, binIndex / APL_FFH_BLOCK_W);
+    return int2(binIndex & 15, binIndex >> 4);
 }
 
 int2 APL_RowHistogramCoord(int rowIndex, int binIndex)
@@ -446,244 +940,377 @@ int2 APL_RowHistogramCoord(int rowIndex, int binIndex)
     return int2(binCoord.x, rowIndex * APL_FFH_BLOCK_H + binCoord.y);
 }
 
-// =====================================================================================
-// Pass 1: copy the last run's solve and clear the row histograms and the frame top. APLInstant holds the last
-// run's raw APL, solved display APL, and a written flag.
-// SRV  t0 = APLInstant
-// UAV  u0 = RowHistCount u1 = RowHistOffset10 u2 = RowHistMaxNits u3 = RowHistLoad u4 = APLPrev
-//      u5 = RowHistOffsetSq u6 = FrameTop
-// =====================================================================================
-Texture2D<float4>   Setup_APLInstant  : register(t0);
-RWTexture2D<int>    Setup_RowCount    : register(u0);
-RWTexture2D<int>    Setup_RowOffset   : register(u1);
-RWTexture2D<int>    Setup_RowMaxNits  : register(u2);
-RWTexture2D<int>    Setup_RowLoad     : register(u3);
-RWTexture2D<float4> Setup_APLPrev     : register(u4);
-RWTexture2D<int>    Setup_RowOffsetSq : register(u5);
-RWTexture2D<int>    Setup_FrameTop    : register(u6);
-
-[numthreads(APL_SETUP_THREADS, 1, 1)]
-void CS_Setup(uint3 threadID : SV_GroupThreadID)
+int2 APL_RowExactMaxLumaCoord(int rowIndex)
 {
-    int localIndex = int(threadID.x);
-
-    if (localIndex == 0)
-    {
-        float4 instantData = Setup_APLInstant.Load(int3(0, 0, 0));
-
-        // Before a reset the panel showed the frames unboosted, so the stored load is stale.
-        if (ResetFlag != 0u)
-            instantData.z = 0.0;
-
-        Setup_APLPrev[int2(0, 0)] = instantData;
-        Setup_FrameTop[int2(0, 0)] = 0;
-    }
-
-    [loop]
-    for (int entry = localIndex; entry < APL_FFH_TILE_COUNT_Y * APL_FFH_MAX_BINS; entry += APL_SETUP_THREADS)
-    {
-        int rowIndex = entry / APL_FFH_MAX_BINS;
-        int binIndex = entry - rowIndex * APL_FFH_MAX_BINS;
-        int2 coord = APL_RowHistogramCoord(rowIndex, binIndex);
-        Setup_RowCount[coord] = 0;
-        Setup_RowOffset[coord] = 0;
-        Setup_RowMaxNits[coord] = 0;
-        Setup_RowLoad[coord] = 0;
-        Setup_RowOffsetSq[coord] = 0;
-    }
+    return int2(APL_FFH_AUX_X, rowIndex * APL_FFH_BLOCK_H);
 }
 
+int2 APL_GlobalExactMaxLumaCoord()
+{
+    return int2(APL_FFH_AUX_X, 0);
+}
 
-// =====================================================================================
-// Pass 2: decode source pixels, accumulate row histograms and raise the frame top.
-// SRV  t0 = CleanCopy
-// UAV  u0 = RowHistCount u1 = RowHistOffset10 u2 = RowHistMaxNits u3 = RowHistLoad u4 = RowHistOffsetSq
-//      u5 = FrameTop
-// =====================================================================================
-Texture2D<float4> Build_CleanCopy   : register(t0);
-RWTexture2D<int>  Build_RowCount    : register(u0);
-RWTexture2D<int>  Build_RowOffset   : register(u1);
-RWTexture2D<int>  Build_RowMaxNits  : register(u2);
-RWTexture2D<int>  Build_RowLoad     : register(u3);
-RWTexture2D<int>  Build_RowOffsetSq : register(u4);
-RWTexture2D<int>  Build_FrameTop    : register(u5);
+int APL_DecodeStoredRollingPhase(float storedPhase)
+{
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    return clamp(int(floor(storedPhase + 0.5)), 0, APL_FULLFRAME_ROLLING_PHASES - 1);
+#else
+    return 0;
+#endif
+}
 
-groupshared int APL_TilePackedCountLuma[APL_FFH_MAX_BINS];
-groupshared int APL_TileMaxNits[APL_FFH_MAX_BINS];
-groupshared int APL_TileLoad[APL_FFH_MAX_BINS];
-groupshared int APL_TileOffsetSq[APL_FFH_MAX_BINS];
-groupshared int APL_TileTop;
+int APL_GetNextRollingPhase(int currentPhase)
+{
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    int nextPhase = currentPhase + 1;
+    return (nextPhase < APL_FULLFRAME_ROLLING_PHASES) ? nextPhase : 0;
+#else
+    return 0;
+#endif
+}
 
-void APL_DecodePackedFullFrameSample(int2 pixel, out int binIndex, out int packedContribution, out int maxNits2, out int loadQ4, out int offsetSq10, out int maxQ4, out int valid)
+int APL_GetPhysicalRowFromDispatchSlot(int dispatchRowSlot, int rollingPhase)
+{
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    return rollingPhase + dispatchRowSlot * APL_FULLFRAME_ROLLING_PHASES;
+#else
+    return dispatchRowSlot;
+#endif
+}
+
+int APL_GetExpectedRowPixelCount(int rowIndex)
+{
+    int rowStartY = rowIndex * APL_FFH_TILE_SIZE;
+    int rowHeight = clamp(BUFFER_HEIGHT - rowStartY, 0, APL_FFH_TILE_SIZE);
+    return BUFFER_WIDTH * rowHeight;
+}
+
+int APL_GetExpectedTilePixelCount(int tileX, int rowIndex)
+{
+    int tileStartX = tileX * APL_FFH_TILE_SIZE;
+    int tileStartY = rowIndex * APL_FFH_TILE_SIZE;
+    int tileWidth = clamp(BUFFER_WIDTH - tileStartX, 0, APL_FFH_TILE_SIZE);
+    int tileHeight = clamp(BUFFER_HEIGHT - tileStartY, 0, APL_FFH_TILE_SIZE);
+    return tileWidth * tileHeight;
+}
+
+// Signature prevents rows built with different runtime settings from mixing.
+int APL_GetRollingHistogramSignature(bool colorHistogram)
+{
+
+
+    int signalRef = clamp(int(SIGNAL_REFERENCE_NITS + 0.5), 1, 200);
+    return clamp(APLInputMode, 0, 1) + (colorHistogram ? 2 : 0) + signalRef * 4;
+}
+
+void APL_DecodePackedFullFrameSample(
+    int2 pixel,
+    bool needsMaxHistogram,
+    out int binIndex,
+    out int packedContribution,
+    out int maxNits2,
+    out int lumaQ4,
+    out int valid)
 {
     binIndex = 0;
     packedContribution = 0;
     maxNits2 = 0;
-    loadQ4 = 0;
-    offsetSq10 = 0;
-    maxQ4 = 0;
+    lumaQ4 = 0;
     valid = 0;
 
     if (pixel.x < 0 || pixel.y < 0 || pixel.x >= BUFFER_WIDTH || pixel.y >= BUFFER_HEIGHT)
         return;
 
-    float3 color = Build_CleanCopy.Load(int3(pixel, 0)).rgb;
-    float3 channelNits = Rec709ToRec2020(color) * SIGNAL_REFERENCE_NITS;
-    float sceneNits = max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
-    float maxChannelNits = max(Max3(channelNits), 0.0);
-    loadQ4 = APL_QuantizeNitsQ4(GetPanelLoadNits(channelNits));
+    float3 color = tex2Dfetch(BackBuffer, pixel).rgb;
+    float sceneNits = 0.0;
+    float maxChannelNits = 0.0;
 
-    int lumaQ4 = APL_QuantizeNitsQ4(sceneNits);
-    maxQ4 = APL_QuantizeNitsQ4(maxChannelNits);
+    if (APLInputMode == 1)
+    {
+        float3 channelNits = APL_FastPQToNits(color);
+        sceneNits = max(GetLuma2020(channelNits), 0.0);
+        if (needsMaxHistogram)
+            maxChannelNits = max(max(channelNits.r, channelNits.g), channelNits.b);
+    }
+    else
+    {
+        sceneNits = max(GetLuma709(color) * SIGNAL_REFERENCE_NITS, 0.0);
+        if (needsMaxHistogram)
+        {
+            float3 positiveColor = max(color, 0.0.xxx);
+            maxChannelNits = max(max(positiveColor.r, positiveColor.g), positiveColor.b) * SIGNAL_REFERENCE_NITS;
+        }
+    }
+
+    lumaQ4 = APL_QuantizeNitsQ4(sceneNits);
+    int maxQ4 = needsMaxHistogram ? APL_QuantizeNitsQ4(maxChannelNits) : 0;
     int lumaBin = APL_HistogramLumaBin64(lumaQ4);
-    binIndex = lumaBin * APL_FFH_COLOR_RATIO_BINS + APL_HistogramColorRatioBin(lumaQ4, maxQ4);
+    binIndex = needsMaxHistogram
+        ? lumaBin * APL_FFH_COLOR_RATIO_BINS + APL_HistogramColorRatioBin(lumaQ4, maxQ4)
+        : lumaBin;
 
     int offset10 = APL_EncodeWithinBinOffset10(lumaQ4, lumaBin);
     packedContribution = APL_FFH_PACK_ONE_COUNT + offset10;
-    maxNits2 = APL_QuantizeMaxNits2(maxChannelNits);
-    offsetSq10 = offset10 * offset10;
+    maxNits2 = needsMaxHistogram ? APL_QuantizeMaxNits2(maxChannelNits) : 0;
     valid = 1;
 }
 
-void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int maxNits2, int loadQ4, int offsetSq10, int valid)
+groupshared int APL_SetupRollingPhase;
+groupshared int APL_TilePackedCountLuma[APL_FFH_MAX_BINS];
+groupshared int APL_TileMaxNits[APL_FFH_MAX_BINS];
+groupshared int APL_TileExactMaxLumaQ4;
+groupshared int APL_BuildRollingPhase;
+
+void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int maxNits2, int valid, bool needsMaxHistogram)
 {
     if (valid == 0)
         return;
+
     InterlockedAdd(APL_TilePackedCountLuma[binIndex], packedContribution);
-    InterlockedAdd(APL_TileMaxNits[binIndex], maxNits2);
-    InterlockedAdd(APL_TileLoad[binIndex], loadQ4);
-    InterlockedAdd(APL_TileOffsetSq[binIndex], offsetSq10);
+    if (needsMaxHistogram)
+        InterlockedAdd(APL_TileMaxNits[binIndex], maxNits2);
 }
 
-[numthreads(APL_FFH_THREADS_X, APL_FFH_THREADS_Y, 1)]
-void CS_Build(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
-{
-    uint localIndex = threadID.y * APL_FFH_THREADS_X + threadID.x;
 
-    if (localIndex < APL_FFH_MAX_BINS)
+[numthreads(256, 1, 1)]
+// Pass 1: build frame constants, copy APL history, and clear updated rows.
+void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID)
+{
+    bool aplActive = NeedsAPLProcessing();
+    int localIndex = int(threadID.x);
+    int activeBins = APL_ActiveHistogramBins();
+    bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    bool trackExactMax = aplActive && ShowOSD;
+
+
+    if (localIndex < 3)
+    {
+        float4 candidateParams = float4(1.0, 0.0, 1.0, 0.0);
+        if (aplActive)
+        {
+            float gMax = ComputeCandidateMaxLogGain();
+            float candidateLogGain = gMax * (float(localIndex + 1) / 3.0);
+            candidateParams = ComputeBoostRolloffParamsFromSceneLogGain(candidateLogGain);
+        }
+        tex2Dstore(StorageCandidateBoostParams, int2(localIndex, 0), candidateParams);
+    }
+
+
+    if (aplActive && localIndex < 129)
+    {
+        float pqCode = float(localIndex) * (1.0 / 128.0);
+        tex2Dstore(StorageAPLFastPQNits, int2(localIndex, 0), PQToLinearScalar(pqCode) * 10000.0);
+    }
+
+
+    if (localIndex == 0)
+    {
+        float4 previousAPL = aplActive
+            ? tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0))
+            : 0.0.xxxx;
+        float storedPhase = aplActive
+            ? tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0)).b
+            : 0.0;
+        APL_SetupRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
+
+        // TexAPLPrev.g is unused by the solver and carries this execution's phase.
+        previousAPL.g = float(APL_SetupRollingPhase);
+        tex2Dstore(StorageAPLPrev, int2(0, 0), previousAPL);
+    }
+    barrier();
+
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+    int rowSlots = APL_FFH_ROLLING_ROW_SLOTS;
+    int totalEntries = rowSlots * activeBins;
+    int signature = APL_GetRollingHistogramSignature(needsMaxHistogram);
+#else
+    int rowSlots = APL_FFH_TILE_COUNT_Y;
+    int totalEntries = rowSlots * activeBins;
+#endif
+
+
+    if (!trackExactMax)
+    {
+        [loop]
+        for (int rowIndex = localIndex; rowIndex < APL_FFH_TILE_COUNT_Y; rowIndex += 256)
+            tex2Dstore(StorageAPLRowHistCount, APL_RowExactMaxLumaCoord(rowIndex), 0);
+    }
+
+    if (aplActive)
+    {
+        [loop]
+        for (int entry = localIndex; entry < totalEntries; entry += 256)
+        {
+            int rowSlot = entry / activeBins;
+            int binIndex = entry - rowSlot * activeBins;
+            int rowIndex = APL_GetPhysicalRowFromDispatchSlot(rowSlot, APL_SetupRollingPhase);
+            if (rowIndex < APL_FFH_TILE_COUNT_Y)
+            {
+                int2 coord = APL_RowHistogramCoord(rowIndex, binIndex);
+                tex2Dstore(StorageAPLRowHistCount, coord, 0);
+                tex2Dstore(StorageAPLRowHistOffset10, coord, 0);
+                if (needsMaxHistogram)
+                    tex2Dstore(StorageAPLRowHistMaxNits, coord, 0);
+                if (binIndex == 0)
+                {
+                    if (trackExactMax)
+                        tex2Dstore(StorageAPLRowHistCount, APL_RowExactMaxLumaCoord(rowIndex), 0);
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+                    tex2Dstore(StorageAPLRowMeta, int2(0, rowIndex), signature << APL_FFH_ROW_META_COUNT_BITS);
+#endif
+                }
+            }
+        }
+    }
+}
+
+[numthreads(16, 16, 1)]
+// Pass 2: decode source pixels and accumulate row histograms.
+void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+
+    bool aplActive = NeedsAPLProcessing();
+    uint localIndex = threadID.y * APL_FFH_THREADS_X + threadID.x;
+    int activeBins = APL_ActiveHistogramBins();
+    bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    bool trackExactMax = aplActive && ShowOSD;
+
+    if (localIndex == 0)
+    {
+        float storedPhase = tex2Dlod(SamplerAPLPrev, float4(0.5, 0.5, 0.0, 0.0)).g;
+        APL_BuildRollingPhase = APL_DecodeStoredRollingPhase(storedPhase);
+    }
+
+    if (localIndex < activeBins)
     {
         APL_TilePackedCountLuma[localIndex] = 0;
         APL_TileMaxNits[localIndex] = 0;
-        APL_TileLoad[localIndex] = 0;
-        APL_TileOffsetSq[localIndex] = 0;
     }
-    if (localIndex == 0)
-        APL_TileTop = 0;
-    GroupMemoryBarrierWithGroupSync();
+    if (trackExactMax && localIndex == 0)
+        APL_TileExactMaxLumaQ4 = 0;
+    barrier();
 
-    int row = int(groupID.y);
-    int2 pixelBase = int2(int(groupID.x) * APL_FFH_TILE_SIZE, row * APL_FFH_TILE_SIZE) + int2(threadID.xy) * int2(APL_FFH_PIXELS_X, APL_FFH_PIXELS_Y);
+    int physicalRow = APL_GetPhysicalRowFromDispatchSlot(int(groupID.y), APL_BuildRollingPhase);
+    bool validPhysicalRow = physicalRow < APL_FFH_TILE_COUNT_Y;
+    bool decodeThisGroup = aplActive && validPhysicalRow;
 
-    int b0, p0, m0, w0, q0, t0, v0;
-    int b1, p1, m1, w1, q1, t1, v1;
-    int b2, p2, m2, w2, q2, t2, v2;
-    int b3, p3, m3, w3, q3, t3, v3;
-    APL_DecodePackedFullFrameSample(pixelBase + int2(0, 0), b0, p0, m0, w0, q0, t0, v0);
-    APL_DecodePackedFullFrameSample(pixelBase + int2(1, 0), b1, p1, m1, w1, q1, t1, v1);
-    APL_DecodePackedFullFrameSample(pixelBase + int2(0, 1), b2, p2, m2, w2, q2, t2, v2);
-    APL_DecodePackedFullFrameSample(pixelBase + int2(1, 1), b3, p3, m3, w3, q3, t3, v3);
-    InterlockedMax(APL_TileTop, max(max(t0, t1), max(t2, t3)));
+    if (decodeThisGroup)
+    {
+        int2 pixelBase = int2(int(groupID.x) * APL_FFH_TILE_SIZE, physicalRow * APL_FFH_TILE_SIZE) + int2(threadID.xy) * 2;
 
-    if (v1 != 0 && v0 != 0 && b1 == b0) { p0 += p1; m0 += m1; w0 += w1; q0 += q1; v1 = 0; }
-    if (v2 != 0 && v0 != 0 && b2 == b0) { p0 += p2; m0 += m2; w0 += w2; q0 += q2; v2 = 0; }
-    if (v2 != 0 && v1 != 0 && b2 == b1) { p1 += p2; m1 += m2; w1 += w2; q1 += q2; v2 = 0; }
-    if (v3 != 0 && v0 != 0 && b3 == b0) { p0 += p3; m0 += m3; w0 += w3; q0 += q3; v3 = 0; }
-    if (v3 != 0 && v1 != 0 && b3 == b1) { p1 += p3; m1 += m3; w1 += w3; q1 += q3; v3 = 0; }
-    if (v3 != 0 && v2 != 0 && b3 == b2) { p2 += p3; m2 += m3; w2 += w3; q2 += q3; v3 = 0; }
+        int b0, p0, m0, l0, v0;
+        int b1, p1, m1, l1, v1;
+        int b2, p2, m2, l2, v2;
+        int b3, p3, m3, l3, v3;
+        APL_DecodePackedFullFrameSample(pixelBase + int2(0, 0), needsMaxHistogram, b0, p0, m0, l0, v0);
+        APL_DecodePackedFullFrameSample(pixelBase + int2(1, 0), needsMaxHistogram, b1, p1, m1, l1, v1);
+        APL_DecodePackedFullFrameSample(pixelBase + int2(0, 1), needsMaxHistogram, b2, p2, m2, l2, v2);
+        APL_DecodePackedFullFrameSample(pixelBase + int2(1, 1), needsMaxHistogram, b3, p3, m3, l3, v3);
 
-    APL_AtomicAddMergedTileSample(b0, p0, m0, w0, q0, v0);
-    APL_AtomicAddMergedTileSample(b1, p1, m1, w1, q1, v1);
-    APL_AtomicAddMergedTileSample(b2, p2, m2, w2, q2, v2);
-    APL_AtomicAddMergedTileSample(b3, p3, m3, w3, q3, v3);
-    GroupMemoryBarrierWithGroupSync();
+        if (trackExactMax)
+            InterlockedMax(APL_TileExactMaxLumaQ4, max(max(l0, l1), max(l2, l3)));
 
-    if (localIndex == 0)
-        InterlockedMax(Build_FrameTop[int2(0, 0)], APL_TileTop);
 
-    if (localIndex < APL_FFH_MAX_BINS)
+        if (v1 != 0 && v0 != 0 && b1 == b0) { p0 += p1; m0 += m1; v1 = 0; }
+        if (v2 != 0 && v0 != 0 && b2 == b0) { p0 += p2; m0 += m2; v2 = 0; }
+        if (v2 != 0 && v1 != 0 && b2 == b1) { p1 += p2; m1 += m2; v2 = 0; }
+        if (v3 != 0 && v0 != 0 && b3 == b0) { p0 += p3; m0 += m3; v3 = 0; }
+        if (v3 != 0 && v1 != 0 && b3 == b1) { p1 += p3; m1 += m3; v3 = 0; }
+        if (v3 != 0 && v2 != 0 && b3 == b2) { p2 += p3; m2 += m3; v3 = 0; }
+
+        APL_AtomicAddMergedTileSample(b0, p0, m0, v0, needsMaxHistogram);
+        APL_AtomicAddMergedTileSample(b1, p1, m1, v1, needsMaxHistogram);
+        APL_AtomicAddMergedTileSample(b2, p2, m2, v2, needsMaxHistogram);
+        APL_AtomicAddMergedTileSample(b3, p3, m3, v3, needsMaxHistogram);
+    }
+    barrier();
+
+    if (trackExactMax && decodeThisGroup && localIndex == 0)
+        atomicMax(StorageAPLRowHistCount, APL_RowExactMaxLumaCoord(physicalRow), APL_TileExactMaxLumaQ4);
+
+    if (decodeThisGroup && localIndex < activeBins)
     {
         int packedValue = APL_TilePackedCountLuma[localIndex];
         int count = packedValue >> APL_FFH_PACK_COUNT_SHIFT;
         if (count > 0)
         {
             int offsetSum10 = packedValue & APL_FFH_PACK_OFFSET_MASK;
-            int2 rowCoord = APL_RowHistogramCoord(row, int(localIndex));
-            InterlockedAdd(Build_RowCount[rowCoord], count);
-            InterlockedAdd(Build_RowOffset[rowCoord], offsetSum10);
-            InterlockedAdd(Build_RowMaxNits[rowCoord], APL_TileMaxNits[localIndex]);
-
-            // Rows take whole nits so a row of 10000 nit pixels still fits an int.
-            InterlockedAdd(Build_RowLoad[rowCoord], (APL_TileLoad[localIndex] + 2) >> 2);
-
-            InterlockedAdd(Build_RowOffsetSq[rowCoord], (APL_TileOffsetSq[localIndex] + APL_FFH_ROW_OFFSET_SQ_UNIT / 2) / APL_FFH_ROW_OFFSET_SQ_UNIT);
+            int2 rowCoord = APL_RowHistogramCoord(physicalRow, int(localIndex));
+            atomicAdd(StorageAPLRowHistCount, rowCoord, count);
+            atomicAdd(StorageAPLRowHistOffset10, rowCoord, offsetSum10);
+            if (needsMaxHistogram)
+                atomicAdd(StorageAPLRowHistMaxNits, rowCoord, APL_TileMaxNits[localIndex]);
         }
     }
+
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+
+
+    if (decodeThisGroup && localIndex == 0)
+    {
+        int tilePixelCount = APL_GetExpectedTilePixelCount(int(groupID.x), physicalRow);
+        if (tilePixelCount > 0)
+            atomicAdd(StorageAPLRowMeta, int2(0, physicalRow), tilePixelCount);
+    }
+#endif
 }
 
-
-// =====================================================================================
-// Pass 3: reduce the row histograms into one global histogram.
-// SRV  t0 = RowHistCount t1 = RowHistOffset10 t2 = RowHistMaxNits t3 = RowHistLoad t4 = RowHistOffsetSq
-// UAV  u0 = GlobalHistCount u1 = GlobalHistOffset10 u2 = GlobalHistMaxNits u3 = GlobalHistLoad
-//      u4 = GlobalHistOffsetSq
-// =====================================================================================
-Texture2D<int>      Reduce_RowCount    : register(t0);
-Texture2D<int>      Reduce_RowOffset   : register(t1);
-Texture2D<int>      Reduce_RowMaxNits  : register(t2);
-Texture2D<int>      Reduce_RowLoad     : register(t3);
-Texture2D<int>      Reduce_RowOffsetSq : register(t4);
-RWTexture2D<int>    Reduce_GlobalCount    : register(u0);
-RWTexture2D<float>  Reduce_GlobalOffset   : register(u1);
-RWTexture2D<float>  Reduce_GlobalMaxNits  : register(u2);
-RWTexture2D<float>  Reduce_GlobalLoad     : register(u3);
-RWTexture2D<float>  Reduce_GlobalOffsetSq : register(u4);
-
-groupshared int   APL_ReduceCount[APL_FFH_REDUCE_THREADS];
+groupshared int APL_ReduceCount[APL_FFH_REDUCE_THREADS];
 groupshared float APL_ReduceOffset10[APL_FFH_REDUCE_THREADS];
 groupshared float APL_ReduceMaxNits[APL_FFH_REDUCE_THREADS];
-groupshared float APL_ReduceLoad[APL_FFH_REDUCE_THREADS];
-groupshared float APL_ReduceOffsetSq[APL_FFH_REDUCE_THREADS];
 
 #define APL_REDUCE_ROW_STAGE(S) \
     if (localIndex < S) { \
         APL_ReduceCount[localIndex] += APL_ReduceCount[localIndex + S]; \
         APL_ReduceOffset10[localIndex] += APL_ReduceOffset10[localIndex + S]; \
-        APL_ReduceMaxNits[localIndex] += APL_ReduceMaxNits[localIndex + S]; \
-        APL_ReduceLoad[localIndex] += APL_ReduceLoad[localIndex + S]; \
-        APL_ReduceOffsetSq[localIndex] += APL_ReduceOffsetSq[localIndex + S]; \
+        if (needsMaxHistogram) APL_ReduceMaxNits[localIndex] += APL_ReduceMaxNits[localIndex + S]; \
     } \
-    GroupMemoryBarrierWithGroupSync();
+    barrier();
 
-[numthreads(APL_FFH_REDUCE_THREADS, 1, 1)]
-void CS_Reduce(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+[numthreads(64, 1, 1)]
+// Pass 3: reduce valid persistent rows into one global histogram.
+void CS_ReduceAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
 {
+    bool aplActive = NeedsAPLProcessing();
     int localIndex = int(threadID.x);
     int2 localBinCoord = int2(groupID.xy);
     int binIndex = localBinCoord.y * APL_FFH_BLOCK_W + localBinCoord.x;
+    int activeBins = APL_ActiveHistogramBins();
+    bool validBin = binIndex < activeBins;
+    bool needsMaxHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    bool trackExactMax = aplActive && ShowOSD;
 
     int countSum = 0;
     float offsetSum10 = 0.0;
     float maxSumNits = 0.0;
-    float loadSumNits = 0.0;
-    float offsetSqSum = 0.0;
-
-    [loop]
-    for (int rowIndex = localIndex; rowIndex < APL_FFH_TILE_COUNT_Y; rowIndex += APL_FFH_REDUCE_THREADS)
+    if (aplActive && validBin)
     {
-        int2 sourceCoord = APL_RowHistogramCoord(rowIndex, binIndex);
-        countSum += Reduce_RowCount.Load(int3(sourceCoord, 0));
-        offsetSum10 += float(Reduce_RowOffset.Load(int3(sourceCoord, 0)));
-        maxSumNits += float(Reduce_RowMaxNits.Load(int3(sourceCoord, 0)));
-        loadSumNits += float(Reduce_RowLoad.Load(int3(sourceCoord, 0)));
-        offsetSqSum += float(Reduce_RowOffsetSq.Load(int3(sourceCoord, 0)));
+        [loop]
+        for (int rowIndex = localIndex; rowIndex < APL_FFH_TILE_COUNT_Y; rowIndex += APL_FFH_REDUCE_THREADS)
+        {
+            bool includeRow = true;
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+            int rowMeta = tex2Dfetch(SamplerAPLRowMeta, int2(0, rowIndex));
+            int rowCount = rowMeta & APL_FFH_ROW_META_COUNT_MASK;
+            int rowSignature = rowMeta >> APL_FFH_ROW_META_COUNT_BITS;
+            int expectedSignature = APL_GetRollingHistogramSignature(needsMaxHistogram);
+            includeRow = (rowCount == APL_GetExpectedRowPixelCount(rowIndex)) && (rowSignature == expectedSignature);
+#endif
+            if (includeRow)
+            {
+                int2 sourceCoord = APL_RowHistogramCoord(rowIndex, binIndex);
+                countSum += tex2Dfetch(SamplerAPLRowHistCount, sourceCoord);
+                offsetSum10 += float(tex2Dfetch(SamplerAPLRowHistOffset10, sourceCoord));
+                if (needsMaxHistogram)
+                    maxSumNits += float(tex2Dfetch(SamplerAPLRowHistMaxNits, sourceCoord));
+            }
+        }
     }
 
     APL_ReduceCount[localIndex] = countSum;
     APL_ReduceOffset10[localIndex] = offsetSum10;
     APL_ReduceMaxNits[localIndex] = maxSumNits;
-    APL_ReduceLoad[localIndex] = loadSumNits;
-    APL_ReduceOffsetSq[localIndex] = offsetSqSum;
-    GroupMemoryBarrierWithGroupSync();
+    barrier();
 
     APL_REDUCE_ROW_STAGE(32)
     APL_REDUCE_ROW_STAGE(16)
@@ -692,487 +1319,443 @@ void CS_Reduce(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
     APL_REDUCE_ROW_STAGE(2)
     APL_REDUCE_ROW_STAGE(1)
 
-    if (localIndex == 0)
+    if (aplActive && validBin && localIndex == 0)
     {
-        Reduce_GlobalCount[localBinCoord] = APL_ReduceCount[0];
-        Reduce_GlobalOffset[localBinCoord] = APL_ReduceOffset10[0];
-        Reduce_GlobalMaxNits[localBinCoord] = APL_ReduceMaxNits[0];
-        Reduce_GlobalLoad[localBinCoord] = APL_ReduceLoad[0];
-        Reduce_GlobalOffsetSq[localBinCoord] = APL_ReduceOffsetSq[0];
+        tex2Dstore(StorageAPLGlobalHistCount, localBinCoord, APL_ReduceCount[0]);
+        tex2Dstore(StorageAPLGlobalHistOffset10, localBinCoord, APL_ReduceOffset10[0]);
+        if (needsMaxHistogram)
+            tex2Dstore(StorageAPLGlobalHistMaxNits, localBinCoord, APL_ReduceMaxNits[0]);
+
+
+        if (binIndex == 0)
+        {
+            int exactMaxLumaQ4 = 0;
+            if (trackExactMax)
+            {
+                [loop]
+                for (int rowIndex = 0; rowIndex < APL_FFH_TILE_COUNT_Y; ++rowIndex)
+                {
+                    bool includeRow = true;
+#if APL_FULLFRAME_ROLLING_PHASES > 0
+                    int rowMeta = tex2Dfetch(SamplerAPLRowMeta, int2(0, rowIndex));
+                    int rowCount = rowMeta & APL_FFH_ROW_META_COUNT_MASK;
+                    int rowSignature = rowMeta >> APL_FFH_ROW_META_COUNT_BITS;
+                    int expectedSignature = APL_GetRollingHistogramSignature(needsMaxHistogram);
+                    includeRow = (rowCount == APL_GetExpectedRowPixelCount(rowIndex)) && (rowSignature == expectedSignature);
+#endif
+                    if (includeRow)
+                        exactMaxLumaQ4 = max(exactMaxLumaQ4, tex2Dfetch(SamplerAPLRowHistCount, APL_RowExactMaxLumaCoord(rowIndex)));
+                }
+            }
+            tex2Dstore(StorageAPLGlobalHistCount, APL_GlobalExactMaxLumaCoord(), exactMaxLumaQ4);
+        }
     }
 }
 
 #undef APL_REDUCE_ROW_STAGE
 
+groupshared float4 APL_EvalWeightedMetrics[APL_FFH_MAX_BINS];
+groupshared float APL_EvalPixelCount[APL_FFH_MAX_BINS];
 
-// =====================================================================================
-// Pass 4: measure the raw APL, pick the gain, fit the boost curve to the frame, and measure the APL it shows.
-// SRV  t0 = GlobalHistCount t1 = GlobalHistOffset10 t2 = GlobalHistMaxNits t3 = GlobalHistLoad t4 = APLPrev
-//      t5 = GlobalHistOffsetSq t6 = FrameTop
-// UAV  u0 = APLInstant u1 = BoostParams u2 = BoostCurve
-// =====================================================================================
-Texture2D<int>      Solve_GlobalCount    : register(t0);
-Texture2D<float>    Solve_GlobalOffset   : register(t1);
-Texture2D<float>    Solve_GlobalMaxNits  : register(t2);
-Texture2D<float>    Solve_GlobalLoad     : register(t3);
-Texture2D<float4>   Solve_APLPrev        : register(t4);
-Texture2D<float>    Solve_GlobalOffsetSq : register(t5);
-Texture2D<int>      Solve_FrameTop       : register(t6);
-RWTexture2D<float4> Solve_APLInstant  : register(u0);
-RWTexture2D<float4> Solve_BoostParams : register(u1);
-RWTexture2D<float>  Solve_BoostCurve  : register(u2);
+#define APL_REDUCE_EVAL_STAGE(S) \
+    if (localIndex < S) { \
+        APL_EvalWeightedMetrics[localIndex] += APL_EvalWeightedMetrics[localIndex + S]; \
+        APL_EvalPixelCount[localIndex] += APL_EvalPixelCount[localIndex + S]; \
+    } \
+    barrier();
 
-// Each thread's APL metric times its pixel count and the pixel count, or its part of a curve sum.
-groupshared float2 APL_EvalSums[APL_EVAL_THREADS];
-groupshared float4 APL_EvalBoostParams[2];
-
-// Full-gain PQ span and screen share of each bin that reaches above the knee.
-groupshared float3 APL_CurveBinSpans[APL_FFH_MAX_BINS];
-
-// Each curve cell's screen share, smoothed share per PQ width, share above its middle and slope, and the output PQ
-// codes at the cell edges.
-groupshared float APL_CurveShare[BOOST_CURVE_CELLS];
-groupshared float APL_CurveDensity[BOOST_CURVE_CELLS];
-groupshared float APL_CurveAbove[BOOST_CURVE_CELLS];
-groupshared float APL_CurveSlope[BOOST_CURVE_CELLS];
-groupshared float APL_CurveNodes[BOOST_CURVE_CELLS + 1];
-
-// Sums every thread's APL_EvalSums entry and hands the total to every thread.
-float2 APL_SumEvalSums(int localIndex)
+[numthreads(256, 1, 1)]
+// Pass 4: evaluate response, solve APL, smooth state, and write boost parameters.
+void CS_EvaluateSolveAndSmoothAPLFullFrameHistogram(uint3 threadID : SV_GroupThreadID)
 {
-    GroupMemoryBarrierWithGroupSync();
-
-    [unroll]
-    for (int stride = APL_EVAL_THREADS / 2; stride > 0; stride /= 2)
-    {
-        if (localIndex < stride)
-            APL_EvalSums[localIndex] += APL_EvalSums[localIndex + stride];
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    float2 total = APL_EvalSums[0];
-    GroupMemoryBarrierWithGroupSync();
-    return total;
-}
-
-float2 APL_MaxEvalSums(int localIndex)
-{
-    GroupMemoryBarrierWithGroupSync();
-
-    [unroll]
-    for (int stride = APL_EVAL_THREADS / 2; stride > 0; stride /= 2)
-    {
-        if (localIndex < stride)
-            APL_EvalSums[localIndex] = max(APL_EvalSums[localIndex], APL_EvalSums[localIndex + stride]);
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    float2 total = APL_EvalSums[0];
-    GroupMemoryBarrierWithGroupSync();
-    return total;
-}
-
-// Black bars add zero light but count as panel area.
-float APL_AverageFromSums(float2 sums)
-{
-    return (sums.y > 0.0) ? saturate(sums.x * clamp(LitFraction, 0.01, 1.0) / sums.y) : 0.0;
-}
-
-// Brightest-channel span of a bin in nits, uniform with the bin's mean and spread and inside its luma bounds.
-float2 APL_BinMaxChannelSpan(int binIndex, float pixelCount, float offsetSum10, float offsetSqSum10, float lumaNits, float maxChannelNits)
-{
-    int lowerQ4 = 0;
-    int upperQ4 = 0;
-    APL_HistogramLumaBinBoundsQ4(binIndex / APL_FFH_COLOR_RATIO_BINS, lowerQ4, upperQ4);
-
-    float offsetToNits = float(upperQ4 - lowerQ4) / APL_FFH_PACK_OFFSET_SCALE * 0.25;
-    float meanOffset10 = offsetSum10 / pixelCount;
-    float spreadNits = sqrt(max(offsetSqSum10 / pixelCount - meanOffset10 * meanOffset10, 0.0)) * offsetToNits;
-
-    float halfWidthNits = sqrt(3.0) * spreadNits;
-    float lowerNits = max(lumaNits - halfWidthNits, lowerQ4 * 0.25);
-    float upperNits = min(lumaNits + halfWidthNits, upperQ4 * 0.25);
-    return float2(lowerNits, upperNits) * (maxChannelNits / max(lumaNits, 1e-6));
-}
-
-float3 APL_BinCurveSpan(float2 maxChannelSpan, float screenShare, BoostCurve curve)
-{
-    float topU = FullGainPQ(maxChannelSpan.y, curve);
-
-    if (topU <= curve.kneeU)
-        return 0.0;
-
-    return float3(FullGainPQ(maxChannelSpan.x, curve), topU, screenShare);
-}
-
-// The frame's brightest channel, raised past the rounding.
-float APL_FrameTopNits()
-{
-    return min((float(Solve_FrameTop.Load(int3(0, 0, 0))) + 1.5) * 0.25, 10000.0);
-}
-
-float CurveCellCenterU(int cell, BoostCurve curve)
-{
-    return CurveNodeU(cell, curve) + 0.5 * CurveCellWidth(curve);
-}
-
-// Steepest slope a cell may keep. Content the panel can show may stay exact, and content above the panel peak
-// keeps at most the highlight contrast.
-float CurveCellCap(int cell, BoostCurve curve)
-{
-    float overPeak = saturate((CurveCellCenterU(cell, curve) - curve.peakPQ) / KNEE_TRANSITION_PQ);
-    return 1.0 - (1.0 - HIGHLIGHT_CONTRAST) * overPeak;
-}
-
-// Flattest slope a cell may take, the fixed shoulder's, so the curve never merges two levels.
-float CurveCellFloor(int cell, BoostCurve curve)
-{
-    float overKnee = saturate((CurveCellCenterU(cell, curve) - curve.kneeU) / KNEE_TRANSITION_PQ);
-    return 1.0 - (1.0 - HIGHLIGHT_CONTRAST) * overKnee;
-}
-
-// Length of a cell below the top of the content.
-float CurveCellLength(int cell, int top, float topU, BoostCurve curve)
-{
-    if (cell < top)
-        return CurveCellWidth(curve);
-
-    if (cell == top)
-        return topU - CurveNodeU(top, curve);
-
-    return 0.0;
-}
-
-// Screen share of the content inside a cell, each bin spread evenly in PQ over its span.
-float APL_GatherCellShare(int cell, BoostCurve curve)
-{
-    float lowerU = CurveNodeU(cell, curve);
-    float upperU = CurveNodeU(cell + 1, curve);
-    float share = 0.0;
-
-    [loop]
-    for (int bin = 0; bin < APL_FFH_MAX_BINS; ++bin)
-    {
-        float3 span = APL_CurveBinSpans[bin];
-
-        if (span.z <= 0.0)
-            continue;
-
-        if (span.y - span.x < 1e-6)
-        {
-            float fraction;
-            if (CurveCell(span.y, curve, fraction) == cell)
-                share += span.z;
-        }
-        else
-        {
-            share += span.z * max(min(upperU, span.y) - max(lowerU, span.x), 0.0) / (span.y - span.x);
-        }
-    }
-
-    return share;
-}
-
-// Screen share per PQ width, averaged over the cells within half the knee transition, empty ones included, so slopes
-// change smoothly and a level's weight grows from nothing with its share.
-float APL_SmoothedCellDensity(int cell, BoostCurve curve)
-{
-    float width = CurveCellWidth(curve);
-    int reach = int(min(0.5 * KNEE_TRANSITION_PQ / width, BOOST_CURVE_CELLS));
-    int first = max(cell - reach, 0);
-    int last = min(cell + reach, BOOST_CURVE_CELLS - 1);
-    float shareSum = 0.0;
-
-    [loop]
-    for (int i = first; i <= last; ++i)
-        shareSum += APL_CurveShare[i];
-
-    return shareSum / float(last - first + 1) / width;
-}
-
-// Screen share above the middle of each cell, the pixels a flatter cell shifts down.
-void APL_SumShareAbove()
-{
-    float shareAbove = 0.0;
-
-    [loop]
-    for (int cell = BOOST_CURVE_CELLS - 1; cell >= 0; --cell)
-    {
-        APL_CurveAbove[cell] = shareAbove + 0.5 * APL_CurveShare[cell];
-        shareAbove += APL_CurveShare[cell];
-    }
-}
-
-// Slope that costs the frame the least, with mu the shifted share each PQ step of room is worth. Flattening a cell
-// costs its pixels DETAIL_PQ times the log of the contrast they lose, and keeping it shifts every pixel above it.
-float APL_CellSlope(int cell, float mu, BoostCurve curve)
-{
-    float slope = CurveCellCap(cell, curve);
-    float above = APL_CurveAbove[cell];
-
-    if (mu > above)
-        slope = clamp(DETAIL_PQ * APL_CurveDensity[cell] / (mu - above), CurveCellFloor(cell, curve), slope);
-
-    return slope;
-}
-
-// Levels with no share nearby whose price ties mu give up the rest of the room from the top down, which moves only
-// what sits above them.
-void APL_CollapseFreeLevels(float excess, float muLo, float muHi, int top, float topU, BoostCurve curve)
-{
-    [loop]
-    for (int cell = top; cell >= 0; --cell)
-    {
-        float length = CurveCellLength(cell, top, topU, curve);
-        float above = APL_CurveAbove[cell];
-
-        if (APL_CurveDensity[cell] > 0.0 || above < muLo || above >= muHi || length <= 0.0)
-            continue;
-
-        float given = clamp(excess, 0.0, length * (APL_CurveSlope[cell] - CurveCellFloor(cell, curve)));
-        APL_CurveSlope[cell] -= given / length;
-        excess -= given;
-    }
-}
-
-// Output PQ codes at the cell edges, never under the fixed shoulder. The top cell keeps its slope across the whole
-// cell, so the top of the content lands on the panel peak. Returns where the curve leaves the full gain.
-float APL_IntegrateCurveNodes(int top, BoostCurve curve)
-{
-    float width = CurveCellWidth(curve);
-    float cut = 0.0;
-    float departureU = curve.peakPQ;
-    APL_CurveNodes[0] = curve.kneeU;
-
-    [loop]
-    for (int cell = 0; cell < BOOST_CURVE_CELLS; ++cell)
-    {
-        float slope = (cell <= top) ? APL_CurveSlope[cell] : 0.0;
-
-        if (cut <= 0.0 && slope < 1.0)
-            departureU = CurveNodeU(cell, curve);
-
-        cut += (1.0 - slope) * width;
-        float u = CurveNodeU(cell + 1, curve);
-        APL_CurveNodes[cell + 1] = max(u - cut, u - ShoulderCompressionPQ(u, curve.kneeU));
-    }
-
-    return departureU;
-}
-
-// Fits the curve to the frame with one thread per cell, landing the brightest pixel at topU on the panel peak.
-// Leaves the output PQ codes in APL_CurveNodes and where the curve leaves the full gain in APL_EvalBoostParams.
-void APL_FitBoostCurve(int cell, float topU, BoostCurve curve)
-{
-    APL_CurveShare[cell] = APL_GatherCellShare(cell, curve);
-    GroupMemoryBarrierWithGroupSync();
-
-    APL_CurveDensity[cell] = APL_SmoothedCellDensity(cell, curve);
-    if (cell == 0)
-        APL_SumShareAbove();
-    GroupMemoryBarrierWithGroupSync();
-
-    // Nothing needs the room above the panel peak, so every level stays exact.
-    bool fits = topU <= curve.peakPQ;
-
-    int top = BOOST_CURVE_CELLS - 1;
-    if (!fits)
-    {
-        float fraction;
-        top = CurveCell(topU, curve, fraction);
-    }
-
-    float length = fits ? 0.0 : CurveCellLength(cell, top, topU, curve);
-
-    // At the top price every cell sits on the fixed shoulder.
-    APL_EvalSums[cell] = float2(DETAIL_PQ * APL_CurveDensity[cell] / CurveCellFloor(cell, curve), 0.0);
-    float muLo = 0.0;
-    float muHi = 1.0 + APL_MaxEvalSums(cell).x;
-
-    // The solve runs every frame, since barriers cannot sit inside a branch on the frame's content.
-    [loop]
-    for (int step = 0; step < BOOST_CURVE_SOLVE_STEPS; ++step)
-    {
-        float mu = 0.5 * (muLo + muHi);
-        APL_EvalSums[cell] = float2(APL_CellSlope(cell, mu, curve) * length, 0.0);
-        float rise = APL_SumEvalSums(cell).x;
-
-        if (curve.kneeU + rise > curve.peakPQ)
-            muLo = mu;
-        else
-            muHi = mu;
-    }
-
-    float slope = fits ? 1.0 : APL_CellSlope(cell, muLo, curve);
-    APL_CurveSlope[cell] = slope;
-    APL_EvalSums[cell] = float2(slope * length, 0.0);
-    float excess = curve.kneeU + APL_SumEvalSums(cell).x - curve.peakPQ;
-
-    if (cell == 0)
-    {
-        if (!fits)
-            APL_CollapseFreeLevels(excess, muLo, muHi, top, topU, curve);
-
-        APL_EvalBoostParams[1].y = APL_IntegrateCurveNodes(top, curve);
-    }
-    GroupMemoryBarrierWithGroupSync();
-}
-
-float APL_CurvePQ(float u, BoostCurve curve)
-{
-    if (u <= curve.kneeU)
-        return u;
-
-    float fraction;
-    int cell = CurveCell(u, curve, fraction);
-    return min(lerp(APL_CurveNodes[cell], APL_CurveNodes[cell + 1], fraction), curve.peakPQ);
-}
-
-float APL_BinBoostScale(float lumaNits, float maxChannelNits, BoostCurve curve)
-{
-    float lumaY = APL_CurvePQ(FullGainPQ(lumaNits, curve), curve);
-    float maxChannelY = APL_CurvePQ(FullGainPQ(maxChannelNits, curve), curve);
-    return CurveBoostScale(lumaNits, lumaY, maxChannelNits, maxChannelY, curve);
-}
-
-[numthreads(APL_EVAL_THREADS, 1, 1)]
-void CS_Solve(uint3 threadID : SV_GroupThreadID)
-{
+    bool aplActive = NeedsAPLProcessing();
     int localIndex = int(threadID.x);
+    bool colorHistogram = EnableEOTFBoost && EnableColorPreservingBoostMode;
+    int activeBins = colorHistogram ? APL_FFH_MAX_BINS : APL_FFH_LUMA_BINS;
 
+    float4 weighted = 0.0.xxxx;
     float pixelCount = 0.0;
-    float sceneNits = 0.0;
-    float maxChannelNits = 0.0;
-    float loadNits = 0.0;
-    float2 maxChannelSpan = 0.0;
 
-    if (localIndex < APL_FFH_MAX_BINS)
+    if (aplActive && localIndex < activeBins)
     {
         int2 binCoord = APL_HistogramBlockCoord(localIndex);
-        int pixelCountI = Solve_GlobalCount.Load(int3(binCoord, 0));
+        int pixelCountI = tex2Dfetch(SamplerAPLGlobalHistCount, binCoord);
         if (pixelCountI > 0)
         {
             pixelCount = float(pixelCountI);
-            float offsetSum10 = Solve_GlobalOffset.Load(int3(binCoord, 0));
-            float meanLumaQ4 = APL_ReconstructMeanLumaQ4(localIndex, pixelCount, offsetSum10);
-            sceneNits = max(meanLumaQ4 * 0.25, 0.0);
-            float maxSumNits = Solve_GlobalMaxNits.Load(int3(binCoord, 0));
-            maxChannelNits = max((maxSumNits / pixelCount) * 2.0, sceneNits);
-            loadNits = Solve_GlobalLoad.Load(int3(binCoord, 0)) / pixelCount;
+            float offsetSum10 = tex2Dfetch(SamplerAPLGlobalHistOffset10, binCoord);
+            float meanLumaQ4 = APL_ReconstructMeanLumaQ4(localIndex, colorHistogram, pixelCount, offsetSum10);
+            float sceneNits = max(meanLumaQ4 * 0.25, 0.0);
+            float rawMetric = saturate(sceneNits / max(APLReferenceWhiteNits, 1.0));
+            float3 candidateMetrics = rawMetric.xxx;
 
-            float offsetSqSum10 = Solve_GlobalOffsetSq.Load(int3(binCoord, 0)) * APL_FFH_ROW_OFFSET_SQ_UNIT;
-            maxChannelSpan = APL_BinMaxChannelSpan(localIndex, pixelCount, offsetSum10, offsetSqSum10, sceneNits, maxChannelNits);
+            if (EnableEOTFBoost)
+            {
+                float maxChannelNits = 0.0;
+                if (colorHistogram)
+                {
+                    float maxSumNits = tex2Dfetch(SamplerAPLGlobalHistMaxNits, binCoord);
+                    maxChannelNits = max((maxSumNits / pixelCount) * 2.0, sceneNits);
+                }
+                candidateMetrics.x = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(1));
+                candidateMetrics.y = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(2));
+                candidateMetrics.z = ComputePostBoostMetricForSample(sceneNits, maxChannelNits, LoadCandidateBoostParams(3));
+            }
+
+            weighted = float4(rawMetric, candidateMetrics) * pixelCount;
         }
     }
 
-    APL_EvalSums[localIndex] = float2(saturate(loadNits / max(APLReferenceWhiteNits, 1.0)), 1.0) * pixelCount;
-    float2 rawSums = APL_SumEvalSums(localIndex);
+    APL_EvalWeightedMetrics[localIndex] = weighted;
+    APL_EvalPixelCount[localIndex] = pixelCount;
+    barrier();
+
+    APL_REDUCE_EVAL_STAGE(128)
+    APL_REDUCE_EVAL_STAGE(64)
+    APL_REDUCE_EVAL_STAGE(32)
+    APL_REDUCE_EVAL_STAGE(16)
+    APL_REDUCE_EVAL_STAGE(8)
+    APL_REDUCE_EVAL_STAGE(4)
+    APL_REDUCE_EVAL_STAGE(2)
+    APL_REDUCE_EVAL_STAGE(1)
 
     if (localIndex == 0)
     {
-        // The panel dims each frame for the load of the frame before it, the last one it has fully received,
-        // so the gain cancels the dimming that load calls for. While nothing new is composed the panel keeps
-        // showing that frame, so its load still holds. Without history the panel last showed the frame unboosted.
-        float4 lastFrame = Solve_APLPrev.Load(int3(0, 0, 0));
-        float lastDisplayAPL = (lastFrame.z > 0.0) ? lastFrame.y : APL_AverageFromSums(rawSums);
-        BoostCurve gainCurve = MakeBoostCurve(SceneGainFromLogGain(ComputeSceneLogGainFromAPL(lastDisplayAPL)));
-        APL_EvalBoostParams[0] = PackBoostCurve(gainCurve, 0);
-        APL_EvalBoostParams[1] = PackBoostCurve(gainCurve, 1);
+
+
+        if (!aplActive)
+        {
+            tex2Dstore(StorageAPLInstant, int2(0, 0), 0.0.xxxx);
+            tex2Dstore(StorageAPL, int2(0, 0), 0.0.xxxx);
+            tex2Dstore(StorageBoostParams, int2(0, 0), float4(1.0, 0.0, 1.0, 0.0));
+            return;
+        }
+
+        float rawAPL = 0.0;
+        float3 responseNodes = 0.0.xxx;
+        float exactRollingMaxNits = 0.0;
+        float totalPixelCount = APL_EvalPixelCount[0];
+
+        if (totalPixelCount > 0.0)
+        {
+            float4 averages = APL_EvalWeightedMetrics[0] / totalPixelCount;
+            rawAPL = saturate(averages.r);
+            responseNodes = saturate(averages.gba);
+            exactRollingMaxNits = ShowOSD
+                ? float(tex2Dfetch(SamplerAPLGlobalHistCount, APL_GlobalExactMaxLumaCoord())) * 0.25
+                : 0.0;
+        }
+
+        float4 prevData = tex2Dlod(SamplerAPLPrev, float4(0.5, 0.5, 0.0, 0.0));
+        float prevSmoothedAPL = saturate(prevData.r);
+        float hasPrev = (prevData.b > 0.0) ? 1.0 : 0.0;
+        float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
+        int currentRollingPhase = APL_DecodeStoredRollingPhase(prevData.g);
+        int nextRollingPhase = APL_GetNextRollingPhase(currentRollingPhase);
+
+
+        float gMax = ComputeCandidateMaxLogGain();
+        float currentDisplayAPL = SolveClosedLoopDisplayAPLFromResponseNodes(rawAPL, responseNodes, gMax);
+        float smoothedAPL = lerp(
+            currentDisplayAPL,
+            lerp(prevSmoothedAPL, currentDisplayAPL, alpha),
+            hasPrev
+        );
+
+        float sceneLogGain = ComputeSceneLogGainFromAPL(smoothedAPL);
+
+
+        tex2Dstore(
+            StorageAPLInstant,
+            int2(0, 0),
+            float4(rawAPL, exactRollingMaxNits, float(nextRollingPhase), (totalPixelCount > 0.0) ? 1.0 : 0.0)
+        );
+        tex2Dstore(StorageAPL, int2(0, 0), float4(smoothedAPL, smoothedAPL, 1.0, sceneLogGain));
+        tex2Dstore(StorageBoostParams, int2(0, 0), ComputeBoostRolloffParamsFromSceneLogGain(sceneLogGain));
     }
-    GroupMemoryBarrierWithGroupSync();
+}
 
-    BoostCurve curve = UnpackBoostCurve(APL_EvalBoostParams[0], APL_EvalBoostParams[1]);
+#undef APL_REDUCE_EVAL_STAGE
+float DrawOSDDigitAt(float2 texcoord, float2 topRight, float scale, float aspect, int digit)
+{
+    float2 uv = texcoord;
+    uv.x *= aspect;
 
-    if (localIndex < APL_FFH_MAX_BINS)
-        APL_CurveBinSpans[localIndex] = APL_BinCurveSpan(maxChannelSpan, pixelCount / rawSums.y, curve);
-    GroupMemoryBarrierWithGroupSync();
+    float2 anchor = topRight;
+    anchor.x *= aspect;
 
-    APL_FitBoostCurve(localIndex, FullGainPQ(APL_FrameTopNits(), curve), curve);
+    uv -= anchor;
+    uv.x = -uv.x;
 
-    // The gain is known before this frame shows, so its load is measured through this frame's curve.
-    float boostScale = 1.0;
-    if (sceneNits > 1e-6)
-        boostScale = APL_BinBoostScale(sceneNits, maxChannelNits, curve);
+    return GetDigit(digit, uv / scale);
+}
 
-    APL_EvalSums[localIndex] = float2(saturate(loadNits * boostScale / max(APLReferenceWhiteNits, 1.0)), 1.0) * pixelCount;
-    float2 displaySums = APL_SumEvalSums(localIndex);
+float DrawOSDPercentAt(float2 texcoord, float2 topRight, float scale, float aspect)
+{
+    float2 uv = texcoord;
+    uv.x *= aspect;
 
-    Solve_BoostCurve[int2(localIndex + 1, 0)] = APL_CurveNodes[localIndex + 1];
+    float2 anchor = topRight;
+    anchor.x -= scale / max(aspect, 1e-6);
+    anchor.x *= aspect;
 
-    if (localIndex == 0)
+    uv -= anchor;
+
+    return GetPercent(uv / scale);
+}
+
+float DrawOSDDotAt(float2 texcoord, float2 topRight, float scale, float aspect)
+{
+    float2 uv = texcoord;
+    uv.x *= aspect;
+
+    float2 anchor = topRight;
+    anchor.x *= aspect;
+
+    uv -= anchor;
+    uv.x = -uv.x;
+
+    return GetDot(uv / scale);
+}
+
+float DrawOSDAPLPercent2(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, float currentAPL)
+{
+    int aplPctX100 = clamp(int(floor(saturate(currentAPL) * 10000.0 + 0.5)), 0, 10000);
+    int integerPart = aplPctX100 / 100;
+    int fractionalPart = aplPctX100 % 100;
+
+    float mask = 0.0;
+
+
+    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, fractionalPart % 10);
+    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (fractionalPart / 10) % 10);
+    mask += DrawOSDDotAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect);
+    mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, integerPart % 10);
+
+    if (integerPart >= 10)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (integerPart / 10) % 10);
+
+    if (integerPart >= 100)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 5.0, 0.0), scale, aspect, (integerPart / 100) % 10);
+
+    return saturate(mask);
+}
+
+float DrawOSDRow5(float2 texcoord, float2 topRight, float scale, float stepX, float aspect, int value)
+{
+    uint v = (uint)clamp(value, 0, 99999);
+    float mask = 0.0;
+
+    mask += DrawOSDDigitAt(texcoord, topRight, scale, aspect, (int)(v % 10));
+
+    if (v >= 10)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX, 0.0), scale, aspect, (int)((v / 10) % 10));
+
+    if (v >= 100)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 2.0, 0.0), scale, aspect, (int)((v / 100) % 10));
+
+    if (v >= 1000)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 3.0, 0.0), scale, aspect, (int)((v / 1000) % 10));
+
+    if (v >= 10000)
+        mask += DrawOSDDigitAt(texcoord, topRight - float2(stepX * 4.0, 0.0), scale, aspect, (int)((v / 10000) % 10));
+
+    return saturate(mask);
+}
+
+
+#define OSD_CHAR_SPACE -1
+#define OSD_CHAR_A 0
+#define OSD_CHAR_I 8
+#define OSD_CHAR_L 11
+#define OSD_CHAR_M 12
+#define OSD_CHAR_N 13
+#define OSD_CHAR_O 14
+#define OSD_CHAR_P 15
+#define OSD_CHAR_R 17
+#define OSD_CHAR_S 18
+#define OSD_CHAR_T 19
+#define OSD_CHAR_U 20
+#define OSD_CHAR_W 22
+#define OSD_CHAR_X 23
+
+float GetOSDLetter(int letter, float2 uv)
+{
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+        return 0.0;
+
+    int pattern = 0;
+
+
+    if (letter == OSD_CHAR_A) pattern = 11245;
+    else if (letter == OSD_CHAR_I) pattern = 29847;
+    else if (letter == OSD_CHAR_L) pattern = 4687;
+    else if (letter == OSD_CHAR_M) pattern = 24557;
+    else if (letter == OSD_CHAR_N) pattern = 24573;
+    else if (letter == OSD_CHAR_O) pattern = 31599;
+    else if (letter == OSD_CHAR_P) pattern = 15049;
+    else if (letter == OSD_CHAR_R) pattern = 15085;
+    else if (letter == OSD_CHAR_S) pattern = 29671;
+    else if (letter == OSD_CHAR_T) pattern = 29842;
+    else if (letter == OSD_CHAR_U) pattern = 23407;
+    else if (letter == OSD_CHAR_W) pattern = 23421;
+    else if (letter == OSD_CHAR_X) pattern = 23213;
+
+    int x = int(uv.x * 3.0);
+    int y = int((1.0 - uv.y) * 5.0);
+
+    return (pattern >> (x + y * 3)) & 1;
+}
+
+float DrawOSDLetterAt(float2 texcoord, float2 topLeft, float scale, float aspect, int letter)
+{
+    float2 uv = texcoord;
+    uv.x *= aspect;
+
+    float2 anchor = topLeft;
+    anchor.x *= aspect;
+
+    uv -= anchor;
+
+    return GetOSDLetter(letter, uv / scale);
+}
+
+float DrawOSDLabel8(float2 texcoord, float2 topLeft, float scale, float stepX, float aspect, int c0, int c1, int c2, int c3, int c4, int c5, int c6, int c7)
+{
+    float mask = 0.0;
+    if (c0 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft, scale, aspect, c0);
+    if (c1 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX, 0.0), scale, aspect, c1);
+    if (c2 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 2.0, 0.0), scale, aspect, c2);
+    if (c3 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 3.0, 0.0), scale, aspect, c3);
+    if (c4 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 4.0, 0.0), scale, aspect, c4);
+    if (c5 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 5.0, 0.0), scale, aspect, c5);
+    if (c6 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 6.0, 0.0), scale, aspect, c6);
+    if (c7 >= 0) mask += DrawOSDLetterAt(texcoord, topLeft + float2(stepX * 7.0, 0.0), scale, aspect, c7);
+    return saturate(mask);
+}
+
+
+float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, float outputAPL, float maxSceneNits)
+{
+    float aspect = ScreenSize.x / ScreenSize.y;
+    float invAspect = 1.0 / max(aspect, 1e-6);
+
+
+    float scale = 0.022;
+    float glyphWidth = scale * invAspect;
+    float stepX = glyphWidth * 1.06;
+    float lineSpacing = scale * 1.18;
+    float percentGap = glyphWidth * 0.20;
+
+    float labelScale = scale * 0.92;
+    float labelGlyphWidth = labelScale * invAspect;
+    float labelStepX = labelGlyphWidth * 1.18;
+    float labelTotalWidth = labelStepX * 7.0 + labelGlyphWidth;
+    float labelGap = glyphWidth * 0.82;
+
+
+    float rightMargin = 0.016;
+    float2 inputPercentRight = float2(1.0 - rightMargin, 0.034);
+    float2 inputRowRight = inputPercentRight - float2(glyphWidth + percentGap, 0.0);
+    float2 outputPercentRight = inputPercentRight + float2(0.0, lineSpacing);
+    float2 outputRowRight = inputRowRight + float2(0.0, lineSpacing);
+    float2 nitsRowRight = inputRowRight + float2(0.0, lineSpacing * 2.0);
+
+    float valueLeft = inputRowRight.x - stepX * 5.0 - glyphWidth;
+    float2 inputLabelTopLeft = float2(valueLeft - labelGap - labelTotalWidth, inputRowRight.y);
+    float2 outputLabelTopLeft = inputLabelTopLeft + float2(0.0, lineSpacing);
+    float2 nitsLabelTopLeft = inputLabelTopLeft + float2(0.0, lineSpacing * 2.0);
+
+    float left = inputLabelTopLeft.x;
+    float right = inputPercentRight.x;
+    float top = inputRowRight.y;
+    float bottom = nitsRowRight.y + scale;
+
+    float padX = glyphWidth * 0.48;
+    float padY = scale * 0.20;
+
+    if (texcoord.x < left - padX || texcoord.x > right + padX || texcoord.y < top - padY || texcoord.y > bottom + padY)
+        return sceneColor;
+
+    int nitDisplay = clamp(int(floor(max(maxSceneNits, 0.0) + 0.5)), 0, 99999);
+
+    float bgMask = (texcoord.x >= left - padX && texcoord.x <= right + padX && texcoord.y >= top - padY && texcoord.y <= bottom + padY) ? 1.0 : 0.0;
+
+    float rawLabelMask = DrawOSDLabel8(texcoord, inputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
+    float outputLabelMask = DrawOSDLabel8(texcoord, outputLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_O, OSD_CHAR_U, OSD_CHAR_T, OSD_CHAR_SPACE, OSD_CHAR_A, OSD_CHAR_P, OSD_CHAR_L, OSD_CHAR_SPACE);
+    float nitsLabelMask = DrawOSDLabel8(texcoord, nitsLabelTopLeft, labelScale, labelStepX, aspect, OSD_CHAR_R, OSD_CHAR_A, OSD_CHAR_W, OSD_CHAR_SPACE, OSD_CHAR_N, OSD_CHAR_I, OSD_CHAR_T, OSD_CHAR_S);
+
+    float inputMask = 0.0;
+    inputMask += DrawOSDAPLPercent2(texcoord, inputRowRight, scale, stepX, aspect, rawInputAPL);
+    inputMask += DrawOSDPercentAt(texcoord, inputPercentRight, scale, aspect);
+    inputMask = saturate(inputMask);
+
+    float outputMask = 0.0;
+    outputMask += DrawOSDAPLPercent2(texcoord, outputRowRight, scale, stepX, aspect, outputAPL);
+    outputMask += DrawOSDPercentAt(texcoord, outputPercentRight, scale, aspect);
+    outputMask = saturate(outputMask);
+
+    float nitsMask = DrawOSDRow5(texcoord, nitsRowRight, scale, stepX, aspect, nitDisplay);
+
+    float bgAlpha = 0.18 * OSDBrightness * bgMask;
+    float3 shadedScene = sceneColor * (1.0 - bgAlpha);
+
+    float3 inputColor = float3(0.30, 1.00, 0.30) * OSDBrightness;
+    float3 outputColor = float3(1.00, 0.90, 0.18) * OSDBrightness;
+    float3 nitsColor = float3(0.60, 0.85, 1.00) * OSDBrightness;
+
+    float3 result = shadedScene;
+    result = lerp(result, inputColor, saturate(rawLabelMask + inputMask));
+    result = lerp(result, outputColor, saturate(outputLabelMask + outputMask));
+    result = lerp(result, nitsColor, saturate(nitsLabelMask + nitsMask));
+
+    return result;
+}
+
+
+// Pass 5: apply scene-uniform boost, optional LUT, OSD, and graph.
+float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
+{
+    float3 color = tex2D(BackBuffer, texcoord).rgb;
+    bool boostEnabled = EnableEOTFBoost;
+
+
+    if (!boostEnabled)
     {
-        Solve_BoostCurve[int2(0, 0)] = APL_CurveNodes[0];
-        Solve_BoostParams[int2(0, 0)] = APL_EvalBoostParams[0];
-        Solve_BoostParams[int2(1, 0)] = APL_EvalBoostParams[1];
-        Solve_APLInstant[int2(0, 0)] = float4(APL_AverageFromSums(rawSums), APL_AverageFromSums(displaySums), 1.0, 0.0);
+        // LUT-only or passthrough path.
+        return float4(color, 1.0);
     }
-}
+
+    float4 aplData = tex2Dlod(SamplerAPL, float4(0.5, 0.5, 0.0, 0.0));
+    float sceneLogGain = aplData.a;
+
+    if ((sceneLogGain <= 0.0) && (ShowOSD == false))
+    {
+        return float4(color, 1.0);
+    }
+
+    float3 finalColor = color;
 
 
-// =====================================================================================
-// Pass 5: fullscreen boost. Clean copy -> back buffer.
-// SRV  t0 = CleanCopy t1 = BoostParams t2 = BoostCurve
-// =====================================================================================
-Texture2D<float4> Boost_CleanCopy   : register(t0);
-Texture2D<float4> Boost_BoostParams : register(t1);
-Texture2D<float>  Boost_BoostCurve  : register(t2);
-SamplerState      Boost_PointSamp   : register(s0);
+    if (sceneLogGain > 1e-6)
+    {
+        float4 boostParams = tex2Dlod(SamplerBoostParams, float4(0.5, 0.5, 0.0, 0.0));
+        finalColor = ApplyBoostPreserveColorFromPrecomputedParams(color, boostParams);
+    }
 
-struct VSOut
-{
-    float4 pos : SV_Position;
-    float2 uv  : TEXCOORD0;
-};
+    if (ShowOSD)
+    {
+        float4 instantData = tex2Dlod(SamplerAPLInstant, float4(0.5, 0.5, 0.0, 0.0));
+        float rawInputAPL = saturate(instantData.r);
+        float currentMaxSceneNits = max(instantData.g, 0.0);
+        finalColor = DrawStatsOverlay(
+            texcoord,
+            finalColor,
+            rawInputAPL,
+            saturate(aplData.g),
+            currentMaxSceneNits
+        );
+    }
 
-VSOut VS_Boost(uint id : SV_VertexID)
-{
-    VSOut o;
-    o.uv = float2((id << 1) & 2, id & 2);
-    o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-    return o;
-}
-
-// Output PQ code of the fitted curve at the full-gain PQ code u.
-float CurvePQ(float u, BoostCurve curve)
-{
-    if (u <= curve.kneeU)
-        return u;
-
-    float fraction;
-    int cell = CurveCell(u, curve, fraction);
-    float y0 = Boost_BoostCurve.Load(int3(cell, 0, 0));
-    float y1 = Boost_BoostCurve.Load(int3(cell + 1, 0, 0));
-    return min(lerp(y0, y1, fraction), curve.peakPQ);
-}
-
-// Luma and brightest Rec.2020 channel of a signal in nits, the channel never under the luma.
-float2 GetSignalLumaAndMaxNits(float3 color)
-{
-    float2 levels = float2(GetLuma709(color), Max3(Rec709ToRec2020(color))) * SIGNAL_REFERENCE_NITS;
-    return float2(levels.x, max(levels.y, levels.x));
-}
-
-float3 ApplyBoostFromPrecomputedParams(float3 color, BoostCurve curve)
-{
-    float2 levels = GetSignalLumaAndMaxNits(color);
-    if (levels.x <= 1e-6)
-        return color;
-
-    if (levels.y <= curve.kneeNits)
-        return color * curve.gain;
-
-    float lumaY = CurvePQ(FullGainPQ(levels.x, curve), curve);
-    float maxChannelY = CurvePQ(FullGainPQ(levels.y, curve), curve);
-    return color * CurveBoostScale(levels.x, lumaY, levels.y, maxChannelY, curve);
-}
-
-float4 PS_Boost(VSOut i) : SV_Target
-{
-    int2 pixel = int2(i.pos.xy);
-    float3 color = Boost_CleanCopy.Load(int3(pixel, 0)).rgb;
-
-    BoostCurve curve = UnpackBoostCurve(Boost_BoostParams.Load(int3(0, 0, 0)), Boost_BoostParams.Load(int3(1, 0, 0)));
-    color = ApplyBoostFromPrecomputedParams(color, curve);
-
-    return float4(color, 1.0);
+    return float4(finalColor, 1.0);
 }

@@ -41,13 +41,11 @@ struct DwmBoostConfig
 {
     volatile uint32_t version;       // even = stable, odd = write in progress
     uint32_t enabled;                // 1 = boost on; 0 = pass through, patches reverted
-    uint32_t resetGeneration;        // host bumps to force a history reset (enable, mode change)
-    int32_t  monLeft;                // target monitor origin (desktop coords), for event names
+    int32_t  monLeft;               // target monitor origin (desktop coords), for event names
     int32_t  monTop;
     uint32_t monWidth;               // back-buffer size the hook matches (the HDR monitor's desktop mode)
     uint32_t monHeight;
     uint32_t monHdr;                 // 1 = target monitor is in HDR
-    float    monLitFraction;         // share of the native panel the desktop lights after aspect-ratio scaling
     uint32_t hostPid;                // tray host PID; the DLL self-reverts if it dies
 };
 #pragma pack(pop)

@@ -10,12 +10,12 @@ set TMP=%TEMP%\dwmboost_fxc
 if exist "%TMP%" rmdir /s /q "%TMP%"
 mkdir "%TMP%"
 
-call :one CS_Setup  cs_5_0 g_CS_Setup  || exit /b 1
-call :one CS_Build  cs_5_0 g_CS_Build  || exit /b 1
-call :one CS_Reduce cs_5_0 g_CS_Reduce || exit /b 1
-call :one CS_Solve  cs_5_0 g_CS_Solve  || exit /b 1
-call :one VS_Boost  vs_5_0 g_VS_Boost  || exit /b 1
-call :one PS_Boost  ps_5_0 g_PS_Boost  || exit /b 1
+call :one CS_SetupAndClearAPLFullFrameRowHistograms      cs_5_0 g_CS_Setup  || exit /b 1
+call :one CS_BuildAPLFullFrameRowHistogram               cs_5_0 g_CS_Build  || exit /b 1
+call :one CS_ReduceAPLFullFrameRowHistogram              cs_5_0 g_CS_Reduce || exit /b 1
+call :one CS_EvaluateSolveAndSmoothAPLFullFrameHistogram cs_5_0 g_CS_Solve  || exit /b 1
+call :one PostProcessVS                                  vs_5_0 g_VS_Boost  || exit /b 1
+call :one PS_MainPass                                    ps_5_0 g_PS_Boost  || exit /b 1
 
 > "%OUT%" echo // Generated from boost.hlsl by compile_shaders.cmd. Do not edit.
 >>"%OUT%" echo #pragma once

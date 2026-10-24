@@ -7,7 +7,6 @@
 #include <psapi.h>
 #include <string>
 #include <vector>
-#include <algorithm>
 #include <atomic>
 
 #include "../shared/ipc.h"
@@ -30,7 +29,7 @@ const UINT HOTKEY_ON = 1;
 const UINT HOTKEY_OFF = 2;
 enum { CMD_ENABLE = 100, CMD_DISABLE, CMD_AUTOSTART, CMD_QUIT };
 
-struct Target { int left = 0, top = 0; UINT width = 0, height = 0; bool hdr = false; double refreshMs = 1000.0 / 60.0; double litFraction = 1.0; bool found = false; };
+struct Target { int left = 0, top = 0; UINT width = 0, height = 0; bool hdr = false; double refreshMs = 1000.0 / 60.0; bool found = false; };
 
 HWND g_hwnd = nullptr;
 HANDLE g_configMap = nullptr;
@@ -108,22 +107,6 @@ bool ElevateToSystem()
 
 // -------- monitor discovery (QueryDisplayConfig) --------
 
-// A desktop mode below the panel's native one is shown aspect-ratio scaled; the black bars count
-// toward the APL the panel's ABL sees.
-double LitFraction(const DISPLAYCONFIG_PATH_INFO& p, UINT width, UINT height)
-{
-    DISPLAYCONFIG_TARGET_PREFERRED_MODE pm = {};
-    pm.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE;
-    pm.header.size = sizeof(pm);
-    pm.header.adapterId = p.targetInfo.adapterId;
-    pm.header.id = p.targetInfo.id;
-    if (DisplayConfigGetDeviceInfo(&pm.header) != ERROR_SUCCESS || !pm.width || !pm.height) return 1.0;
-
-    const double scale = (std::min)((double)pm.width / width, (double)pm.height / height);
-    const double lit = width * scale * height * scale / ((double)pm.width * pm.height);
-    return (std::min)(lit, 1.0);
-}
-
 Target FindHdrMonitor()
 {
     Target t;
@@ -154,7 +137,6 @@ Target FindHdrMonitor()
         t.width = sm.width; t.height = sm.height; t.hdr = true;
         if (p.targetInfo.refreshRate.Denominator && p.targetInfo.refreshRate.Numerator)
             t.refreshMs = 1000.0 * p.targetInfo.refreshRate.Denominator / p.targetInfo.refreshRate.Numerator;
-        t.litFraction = LitFraction(p, sm.width, sm.height);
         t.found = true;
         break;
     }
@@ -183,11 +165,9 @@ bool CreateConfig()
     DwmBoostConfig init = {};
     init.version = 2;
     init.enabled = 0;
-    init.resetGeneration = 1;
     init.monLeft = g_target.left; init.monTop = g_target.top;
     init.monWidth = g_target.width; init.monHeight = g_target.height;
     init.monHdr = g_target.hdr ? 1u : 0u;
-    init.monLitFraction = (float)g_target.litFraction;
     init.hostPid = GetCurrentProcessId();
     *g_config = init;
     return true;
@@ -199,12 +179,10 @@ void WriteEnabled(bool enabled)
     uint32_t v = g_config->version;
     g_config->version = v | 1u;              // begin write (odd)
     MemoryBarrier();
-    if (enabled && !g_config->enabled) g_config->resetGeneration++;   // fresh history on each enable
     g_config->enabled = enabled ? 1u : 0u;
     g_config->monLeft = g_target.left; g_config->monTop = g_target.top;
     g_config->monWidth = g_target.width; g_config->monHeight = g_target.height;
     g_config->monHdr = g_target.hdr ? 1u : 0u;
-    g_config->monLitFraction = (float)g_target.litFraction;
     g_config->hostPid = GetCurrentProcessId();
     MemoryBarrier();
     g_config->version = (v | 1u) + 1u;       // publish (even)

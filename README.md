@@ -18,9 +18,9 @@ The settings are baked in as constants:
 | Compensation Freeze APL % | 80.0 |
 | Global APL Boost Strength | 0.25 |
 | Enable Per-APL Boost Strength | On |
-| APL 3% / 5% / 7% / 10% Boost Strength | 0.25 / 0.25 / 0.26 / 0.26 |
-| APL 14% / 18% / 22% / 25% Boost Strength | 0.27 / 0.27 / 0.28 / 0.28 |
-| APL 35% / 50% Boost Strength | 0.30 / 0.55 |
+| APL 3% / 5% / 7% / 10% Boost Strength | 0.45 / 0.45 / 0.42 / 0.36 |
+| APL 14% / 18% / 22% / 25% Boost Strength | 0.31 / 0.29 / 0.28 / 0.28 |
+| APL 35% / 50% Boost Strength | 0.36 / 0.55 |
 | Boost Roll-Off Target (nits) | 800 |
 | Boost Roll-Off Shape | 1.20 |
 | APL Smoothing Time (s) | 0.50 |

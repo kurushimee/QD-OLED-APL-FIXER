@@ -70,7 +70,7 @@ struct MonitorState
 
     Tex clean;               // RGBA16F clean copy (SRV)
     Tex rowCount, rowOffset, rowMaxNits, rowLoad, rowOffsetSq;       // R32_SINT (SRV+UAV)
-    Tex globalCount;                                                 // R32_SINT (SRV+UAV)
+    Tex globalCount, frameTop;                                       // R32_SINT (SRV+UAV)
     Tex globalOffset, globalMaxNits, globalLoad, globalOffsetSq;     // R32_FLOAT (SRV+UAV)
     Tex aplInstant, aplPrev, boostParams;                            // RGBA32F (SRV+UAV)
     Tex boostCurve;                                                  // R32_FLOAT (SRV+UAV)
@@ -99,7 +99,7 @@ struct MonitorState
     {
         clean.Release();
         rowCount.Release(); rowOffset.Release(); rowMaxNits.Release(); rowLoad.Release(); rowOffsetSq.Release();
-        globalCount.Release(); globalOffset.Release(); globalMaxNits.Release(); globalLoad.Release(); globalOffsetSq.Release();
+        globalCount.Release(); frameTop.Release(); globalOffset.Release(); globalMaxNits.Release(); globalLoad.Release(); globalOffsetSq.Release();
         aplInstant.Release(); aplPrev.Release(); boostParams.Release();
         boostCurve.Release();
         if (csSetup) { csSetup->Release(); csSetup = nullptr; }
@@ -141,6 +141,7 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowLoad);
     ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowOffsetSq);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, s.globalCount);
+    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32_SINT, true, true, s.frameTop);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalOffset);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalMaxNits);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalLoad);
@@ -289,9 +290,9 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, bool resetThisR
     c->CSSetConstantBuffers(0, 1, &s.cb);
     {
         ID3D11ShaderResourceView* srv[1] = { s.aplInstant.srv };
-        ID3D11UnorderedAccessView* uav[6] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowLoad.uav, s.aplPrev.uav, s.rowOffsetSq.uav };
+        ID3D11UnorderedAccessView* uav[7] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowLoad.uav, s.aplPrev.uav, s.rowOffsetSq.uav, s.frameTop.uav };
         c->CSSetShaderResources(0, 1, srv);
-        c->CSSetUnorderedAccessViews(0, 6, uav, nullptr);
+        c->CSSetUnorderedAccessViews(0, 7, uav, nullptr);
         c->CSSetShader(s.csSetup, nullptr, 0);
         c->Dispatch(1, 1, 1);
     }
@@ -300,9 +301,9 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, bool resetThisR
     ClearCS(c);
     {
         ID3D11ShaderResourceView* srv[1] = { s.clean.srv };
-        ID3D11UnorderedAccessView* uav[5] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowLoad.uav, s.rowOffsetSq.uav };
+        ID3D11UnorderedAccessView* uav[6] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowLoad.uav, s.rowOffsetSq.uav, s.frameTop.uav };
         c->CSSetShaderResources(0, 1, srv);
-        c->CSSetUnorderedAccessViews(0, 5, uav, nullptr);
+        c->CSSetUnorderedAccessViews(0, 6, uav, nullptr);
         c->CSSetShader(s.csBuild, nullptr, 0);
         c->Dispatch(TileCount(s.width), TileCount(s.height), 1);
     }
@@ -321,9 +322,9 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, bool resetThisR
     // Pass 4: solve, boost parameters.
     ClearCS(c);
     {
-        ID3D11ShaderResourceView* srv[6] = { s.globalCount.srv, s.globalOffset.srv, s.globalMaxNits.srv, s.globalLoad.srv, s.aplPrev.srv, s.globalOffsetSq.srv };
+        ID3D11ShaderResourceView* srv[7] = { s.globalCount.srv, s.globalOffset.srv, s.globalMaxNits.srv, s.globalLoad.srv, s.aplPrev.srv, s.globalOffsetSq.srv, s.frameTop.srv };
         ID3D11UnorderedAccessView* uav[3] = { s.aplInstant.uav, s.boostParams.uav, s.boostCurve.uav };
-        c->CSSetShaderResources(0, 6, srv);
+        c->CSSetShaderResources(0, 7, srv);
         c->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
         c->CSSetShader(s.csSolve, nullptr, 0);
         c->Dispatch(1, 1, 1);

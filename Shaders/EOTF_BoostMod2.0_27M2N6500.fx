@@ -10,25 +10,22 @@
     Levels at full gain show as bright as they do at 3% APL. The panel cannot
     show more than its peak divided by the gain, the ceiling, so content above
     the ceiling needs room under the panel peak. Every frame the boost curve is
-    fitted to that frame's histogram. Content the panel can show keeps the full
-    gain, and content above the ceiling keeps at most a quarter of its PQ
-    contrast, with the panel peak signal landing on the panel peak. The room
-    comes first from levels nothing on screen uses, from the top down, and then
-    from the levels on screen by their share of the screen, so a small
-    highlight gives up only its own contrast and a large one also dims what
-    sits under it.
+    fitted to that frame's histogram and tonemaps the whole frame. The
+    brightest pixel lands on the panel peak, nothing goes above it, and no two
+    levels ever merge. Content the panel can show keeps the full gain, and
+    content above the ceiling keeps at most a quarter of its PQ contrast. The
+    room comes first from levels nothing on screen uses, from the top down, and
+    then from the levels on screen by their share of the screen.
 
     A fixed shoulder that depends only on the gain sets the knee and a floor.
-    Below the knee, nothing ever moves. Between the knee and the ceiling,
-    levels follow what is on screen. They are exact when nothing needs the
+    It lands a 10000 nit signal on the panel peak. Below the knee, nothing ever
+    moves. Above it no level gets darker or flatter than the fixed shoulder,
+    and levels follow what is on screen. They are exact when nothing needs the
     room, and they go down to the fixed shoulder's values, never further, when
-    big bright content fills it.
+    bright content fills it.
 
     Luma drives the curve and the RGB ratios are kept. The brightest channel
-    follows the same curve, which keeps it under the panel peak. Above the knee
-    each pixel keeps its own PQ contrast around the curve output of its
-    neighborhood, so compressed highlights keep their fine detail. The boost
-    never falls below the source.
+    follows the same curve, which keeps it under the panel peak.
 
     A full-frame histogram of every frame gives its raw APL and the
     display-side APL it shows with the boost applied. The panel dims each frame
@@ -128,7 +125,7 @@
 
 
 // The curve above the knee is a table of output PQ codes over equal cells of full-gain PQ. One pixel can change
-// one cell's slope, so the cells are narrow enough that this moves no level by half a 10-bit step.
+// one cell's slope, so the cells are narrow enough that this moves no level by a whole 10-bit step.
 #define BOOST_CURVE_CELLS            512
 #define BOOST_CURVE_SOLVE_STEPS       32
 
@@ -177,7 +174,7 @@ uniform float PanelPeakNits <
     ui_type = "slider";
     ui_min = 0.0; ui_max = 1500.0; ui_step = 1.0;
     ui_label = "Panel Peak (nits)";
-    UI_TOOLTIP("Peak signal the boost eases into. Boosted content never exceeds it, and content above it passes through untouched. 0 disables highlight protection.")
+    UI_TOOLTIP("Peak signal the boost tonemaps into. Nothing is shown above it, and brighter content is compressed under it instead of clipped. 0 disables highlight protection.")
 > = 1060.0;
 
 uniform float SIGNAL_REFERENCE_NITS <
@@ -571,6 +568,25 @@ storage2D<float> StorageAPLGlobalHistLoad
     Texture = TexAPLGlobalHistLoad;
 };
 
+// The frame's brightest channel in quarter nits, so the curve's top lands exactly on the brightest pixel.
+texture TexAPLFrameTop
+{
+    Width = 1;
+    Height = 1;
+    Format = R32I;
+};
+sampler2D<int> SamplerAPLFrameTop
+{
+    Texture = TexAPLFrameTop;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+storage2D<int> StorageAPLFrameTop
+{
+    Texture = TexAPLFrameTop;
+};
+
 
 #if ENABLE_APL_GRAPH
 #define GRAPH_CURVE_SAMPLES 64
@@ -825,7 +841,7 @@ float3 PQHDRLUT_Apply(float3 color)
 #endif
 
 
-// PQ contrast the fixed shoulder eases to, and the most that content above the panel peak keeps.
+// PQ contrast the fixed shoulder eases to. Content above the panel peak keeps at most this and no level keeps less.
 static const float HIGHLIGHT_CONTRAST = 0.25;
 
 // PQ width over which slopes ease between the full gain and the highlight contrast.
@@ -833,7 +849,7 @@ static const float KNEE_TRANSITION_PQ = 0.04;
 
 
 // Full gain up to the knee. Above it the output PQ codes come from a table fitted to the frame, up to maxU, the
-// full-gain PQ code of the panel peak signal. Levels named U are PQ codes after the full gain.
+// full-gain PQ code of a 10000 nit signal. Levels named U are PQ codes after the full gain.
 struct BoostCurve
 {
     float gain;
@@ -843,12 +859,6 @@ struct BoostCurve
     float maxU;
     float departureU;
 };
-
-// PQ code of a source PQ code after the full gain.
-float GainMapPQ(float pq, float gain)
-{
-    return NitsToPQUnclamped(PQToLinearBT2100(pq) * 10000.0 * gain);
-}
 
 // How far the shoulder sits below the full gain at u.
 float ShoulderCompressionPQ(float u, float kneeU)
@@ -861,8 +871,8 @@ float ShoulderCompressionPQ(float u, float kneeU)
     return (1.0 - HIGHLIGHT_CONTRAST) * eased;
 }
 
-// The fixed shoulder depends only on the gain. It eases from the knee to the highlight contrast and lands the
-// panel peak signal on the panel peak, and the fitted curve never goes under it.
+// The fixed shoulder depends only on the gain. It eases from the knee to the highlight contrast and lands a 10000
+// nit signal on the panel peak, and the fitted curve never goes under it or flatter than it.
 BoostCurve MakeBoostCurve(float gain)
 {
     BoostCurve curve;
@@ -873,11 +883,11 @@ BoostCurve MakeBoostCurve(float gain)
     curve.maxU = 1.0;
     curve.departureU = 1.0;
 
-    if (PanelPeakNits <= 0.0 || curve.gain <= 1.000001)
+    if (PanelPeakNits <= 0.0)
         return curve;
 
     curve.peakPQ = NitsToPQ(PanelPeakNits);
-    curve.maxU = GainMapPQ(curve.peakPQ, curve.gain);
+    curve.maxU = NitsToPQUnclamped(10000.0 * curve.gain);
 
     // The shoulder span that absorbs the overshoot, ending inside the slope ease or past it.
     float eased = (curve.maxU - curve.peakPQ) / (1.0 - HIGHLIGHT_CONTRAST);
@@ -932,18 +942,13 @@ int CurveCell(float u, BoostCurve curve, out float fraction)
     return cell;
 }
 
-// PQ code after the full gain, inside the curve's range. Signals at the panel peak pass through, so they sit at
-// its top.
+// PQ code after the full gain, inside the curve's range.
 float FullGainPQ(float nits, BoostCurve curve)
 {
-    if (nits >= PanelPeakNits)
-        return curve.maxU;
-
-    return min(NitsToPQUnclamped(nits * curve.gain), curve.maxU);
+    return NitsToPQUnclamped(clamp(nits, 0.0, 10000.0) * curve.gain);
 }
 
-// Signal nits of a level whose curve output is the PQ code y. The panel clips signals above its peak, so those
-// pass through.
+// Signal nits of a level whose curve output is the PQ code y.
 float CurveOutputNits(float nits, float y, BoostCurve curve)
 {
     float safeNits = max(nits, 0.0);
@@ -951,10 +956,7 @@ float CurveOutputNits(float nits, float y, BoostCurve curve)
     if (safeNits <= curve.kneeNits)
         return safeNits * curve.gain;
 
-    if (safeNits >= PanelPeakNits)
-        return safeNits;
-
-    return max(PQToLinearBT2100(min(y, curve.peakPQ)) * 10000.0, safeNits);
+    return PQToLinearBT2100(min(y, curve.peakPQ)) * 10000.0;
 }
 
 // One scale for all channels. Luma follows the curve, and the brightest channel follows it too, which keeps it
@@ -1154,81 +1156,47 @@ float2 GetSignalLumaAndMaxNits(float3 color)
     return float2(levels.x, max(levels.y, levels.x));
 }
 
-// Above the knee a pixel keeps its own PQ contrast around the curve output of its neighborhood, so compressed
-// highlights keep their fine detail. Only neighbors above the knee count, which keeps a highlight's edge against
-// darker content free of a rim.
-float DetailBoostScale(int2 pixel, float lumaNits, float maxChannelNits, BoostCurve curve)
-{
-    float weightSum = 0.0;
-    float baseLumaU = 0.0;
-    float baseMaxChannelU = 0.0;
-
-    [unroll]
-    for (int dy = -1; dy <= 1; ++dy)
-    {
-        [unroll]
-        for (int dx = -1; dx <= 1; ++dx)
-        {
-            int2 neighbor = clamp(pixel + int2(dx, dy), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
-            float2 levels = GetSignalLumaAndMaxNits(tex2Dfetch(ReShade::BackBuffer, neighbor).rgb);
-
-            if (levels.y > curve.kneeNits)
-            {
-                float weight = (2 - abs(dx)) * (2 - abs(dy));
-                weightSum += weight;
-                baseLumaU += weight * FullGainPQ(levels.x, curve);
-                baseMaxChannelU += weight * FullGainPQ(levels.y, curve);
-            }
-        }
-    }
-
-    baseLumaU /= weightSum;
-    baseMaxChannelU /= weightSum;
-
-    float lumaY = CurvePQ(baseLumaU, curve) + FullGainPQ(lumaNits, curve) - baseLumaU;
-    float maxChannelY = CurvePQ(baseMaxChannelU, curve) + FullGainPQ(maxChannelNits, curve) - baseMaxChannelU;
-    return CurveBoostScale(lumaNits, lumaY, maxChannelNits, maxChannelY, curve);
-}
-
-float ComputePixelBoostScale(int2 pixel, float2 levels, BoostCurve curve)
+float ComputeBoostScale(float2 levels, BoostCurve curve)
 {
     if (levels.y <= curve.kneeNits)
         return curve.gain;
 
-    return DetailBoostScale(pixel, levels.x, levels.y, curve);
+    float lumaY = CurvePQ(FullGainPQ(levels.x, curve), curve);
+    float maxChannelY = CurvePQ(FullGainPQ(levels.y, curve), curve);
+    return CurveBoostScale(levels.x, lumaY, levels.y, maxChannelY, curve);
 }
 
-float3 ApplyBoostFromPrecomputedParams(float3 color, int2 pixel, BoostCurve curve)
+float3 ApplyBoostFromPrecomputedParams(float3 color, BoostCurve curve)
 {
-    if (curve.gain <= 1.000001)
-        return color;
+    float3 boosted = color;
 
     if (IsPQInput())
     {
         float3 linearColorNits = PQToLinearBT2100(saturate(color)) * 10000.0;
         float lumaNits = GetLuma2020(linearColorNits);
 
-        if (lumaNits <= 1e-6)
-            return color;
+        if (lumaNits > 1e-6)
+        {
+            float2 levels = float2(lumaNits, max(Max3(linearColorNits), lumaNits));
+            boosted = LinearToPQBT2100(linearColorNits * (ComputeBoostScale(levels, curve) / 10000.0));
+        }
+    }
+    else
+    {
+        float2 levels = GetSignalLumaAndMaxNits(color);
 
-        float2 levels = float2(lumaNits, max(Max3(linearColorNits), lumaNits));
-        float colorScale = ComputePixelBoostScale(pixel, levels, curve);
-        return LinearToPQBT2100(linearColorNits * (colorScale / 10000.0));
+        if (levels.x > 1e-6)
+            boosted = color * ComputeBoostScale(levels, curve);
     }
 
-    float2 levels = GetSignalLumaAndMaxNits(color);
-
-    if (levels.x <= 1e-6)
-        return color;
-
-    return color * ComputePixelBoostScale(pixel, levels, curve);
+    return boosted;
 }
 
 // A cut under half a 10-bit step rounds to the same code.
 static const float HALF_10BIT_STEP_PQ = 0.5 / 1023.0;
 
 // Gray where a pixel shows its source level, and yellow to red as the curve cuts it deeper, red at the cut that
-// lands the panel peak signal on the panel peak.
+// lands a 10000 nit signal on the panel peak.
 float3 DrawCompressionHeatmap(float3 sourceColor, float3 boostedColor, BoostCurve curve)
 {
     float sourceLumaNits = GetSignalLumaAndMaxNits(sourceColor).x;
@@ -1255,9 +1223,6 @@ float ComputeGraphWindowNits(float nits, float gain)
 
     if (PanelPeakNits <= 0.0)
         return safeNits * gain;
-
-    if (safeNits >= PanelPeakNits)
-        return safeNits;
 
     return min(safeNits * gain, PanelPeakNits);
 }
@@ -2096,6 +2061,7 @@ void APL_DecodePackedFullFrameSample(
     out int maxNits2,
     out int loadQ4,
     out int offsetSq10,
+    out int maxQ4,
     out int valid)
 {
     binIndex = 0;
@@ -2103,6 +2069,7 @@ void APL_DecodePackedFullFrameSample(
     maxNits2 = 0;
     loadQ4 = 0;
     offsetSq10 = 0;
+    maxQ4 = 0;
     valid = 0;
 
     if (pixel.x < 0 || pixel.y < 0 || pixel.x >= BUFFER_WIDTH || pixel.y >= BUFFER_HEIGHT)
@@ -2127,7 +2094,7 @@ void APL_DecodePackedFullFrameSample(
     loadQ4 = APL_QuantizeNitsQ4(GetPanelLoadNits(channelNits));
 
     int lumaQ4 = APL_QuantizeNitsQ4(sceneNits);
-    int maxQ4 = APL_QuantizeNitsQ4(maxChannelNits);
+    maxQ4 = APL_QuantizeNitsQ4(maxChannelNits);
     int lumaBin = APL_HistogramLumaBin64(lumaQ4);
     binIndex = lumaBin * APL_FFH_COLOR_RATIO_BINS + APL_HistogramColorRatioBin(lumaQ4, maxQ4);
 
@@ -2148,6 +2115,7 @@ groupshared int APL_TilePackedCountLuma[APL_FFH_MAX_BINS];
 groupshared int APL_TileMaxNits[APL_FFH_MAX_BINS];
 groupshared int APL_TileLoad[APL_FFH_MAX_BINS];
 groupshared int APL_TileOffsetSq[APL_FFH_MAX_BINS];
+groupshared int APL_TileTop;
 
 void APL_AtomicAddMergedTileSample(int binIndex, int packedContribution, int maxNits2, int loadQ4, int offsetSq10, int valid)
 {
@@ -2186,6 +2154,7 @@ void CS_SetupAndClearAPLFullFrameRowHistograms(uint3 threadID : SV_GroupThreadID
             instantData.z = 0.0;
 
         tex2Dstore(StorageAPLPrev, int2(0, 0), instantData);
+        tex2Dstore(StorageAPLFrameTop, int2(0, 0), 0);
     }
 
     [loop]
@@ -2218,19 +2187,22 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
         APL_TileLoad[localIndex] = 0;
         APL_TileOffsetSq[localIndex] = 0;
     }
+    if (localIndex == 0)
+        APL_TileTop = 0;
     barrier();
 
     int row = int(groupID.y);
     int2 pixelBase = int2(int(groupID.x) * APL_FFH_TILE_SIZE, row * APL_FFH_TILE_SIZE) + int2(threadID.xy) * int2(APL_FFH_PIXELS_X, APL_FFH_PIXELS_Y);
 
-    int b0, p0, m0, w0, q0, v0;
-    int b1, p1, m1, w1, q1, v1;
-    int b2, p2, m2, w2, q2, v2;
-    int b3, p3, m3, w3, q3, v3;
-    APL_DecodePackedFullFrameSample(pixelBase + int2(0, 0), b0, p0, m0, w0, q0, v0);
-    APL_DecodePackedFullFrameSample(pixelBase + int2(1, 0), b1, p1, m1, w1, q1, v1);
-    APL_DecodePackedFullFrameSample(pixelBase + int2(0, 1), b2, p2, m2, w2, q2, v2);
-    APL_DecodePackedFullFrameSample(pixelBase + int2(1, 1), b3, p3, m3, w3, q3, v3);
+    int b0, p0, m0, w0, q0, t0, v0;
+    int b1, p1, m1, w1, q1, t1, v1;
+    int b2, p2, m2, w2, q2, t2, v2;
+    int b3, p3, m3, w3, q3, t3, v3;
+    APL_DecodePackedFullFrameSample(pixelBase + int2(0, 0), b0, p0, m0, w0, q0, t0, v0);
+    APL_DecodePackedFullFrameSample(pixelBase + int2(1, 0), b1, p1, m1, w1, q1, t1, v1);
+    APL_DecodePackedFullFrameSample(pixelBase + int2(0, 1), b2, p2, m2, w2, q2, t2, v2);
+    APL_DecodePackedFullFrameSample(pixelBase + int2(1, 1), b3, p3, m3, w3, q3, t3, v3);
+    atomicMax(APL_TileTop, max(max(t0, t1), max(t2, t3)));
 
     if (v1 != 0 && v0 != 0 && b1 == b0) { p0 += p1; m0 += m1; w0 += w1; q0 += q1; v1 = 0; }
     if (v2 != 0 && v0 != 0 && b2 == b0) { p0 += p2; m0 += m2; w0 += w2; q0 += q2; v2 = 0; }
@@ -2244,6 +2216,9 @@ void CS_BuildAPLFullFrameRowHistogram(uint3 groupID : SV_GroupID, uint3 threadID
     APL_AtomicAddMergedTileSample(b2, p2, m2, w2, q2, v2);
     APL_AtomicAddMergedTileSample(b3, p3, m3, w3, q3, v3);
     barrier();
+
+    if (localIndex == 0)
+        atomicMax(StorageAPLFrameTop, int2(0, 0), APL_TileTop);
 
     if (localIndex < APL_FFH_MAX_BINS)
     {
@@ -2415,6 +2390,12 @@ float3 APL_BinCurveSpan(float2 maxChannelSpan, float screenShare, BoostCurve cur
     return float3(FullGainPQ(maxChannelSpan.x, curve), topU, screenShare);
 }
 
+// The frame's brightest channel, raised past the rounding and the histogram's PQ decode table.
+float APL_FrameTopNits()
+{
+    return min((float(tex2Dfetch(SamplerAPLFrameTop, int2(0, 0))) + 1.5) * 0.25, 10000.0);
+}
+
 float CurveCellCenterU(int cell, BoostCurve curve)
 {
     return CurveNodeU(cell, curve) + 0.5 * CurveCellWidth(curve);
@@ -2426,6 +2407,13 @@ float CurveCellCap(int cell, BoostCurve curve)
 {
     float overPeak = saturate((CurveCellCenterU(cell, curve) - curve.peakPQ) / KNEE_TRANSITION_PQ);
     return 1.0 - (1.0 - HIGHLIGHT_CONTRAST) * overPeak;
+}
+
+// Flattest slope a cell may take, the fixed shoulder's, so the curve never merges two levels.
+float CurveCellFloor(int cell, BoostCurve curve)
+{
+    float overKnee = saturate((CurveCellCenterU(cell, curve) - curve.kneeU) / KNEE_TRANSITION_PQ);
+    return 1.0 - (1.0 - HIGHLIGHT_CONTRAST) * overKnee;
 }
 
 // Length of a cell below the top of the content.
@@ -2440,13 +2428,12 @@ float CurveCellLength(int cell, int top, float topU, BoostCurve curve)
     return 0.0;
 }
 
-// Screen share of the content inside a cell, each bin spread evenly in PQ over its span, and the top of all content.
-float APL_GatherCellShare(int cell, BoostCurve curve, out float topU)
+// Screen share of the content inside a cell, each bin spread evenly in PQ over its span.
+float APL_GatherCellShare(int cell, BoostCurve curve)
 {
     float lowerU = CurveNodeU(cell, curve);
     float upperU = CurveNodeU(cell + 1, curve);
     float share = 0.0;
-    topU = 0.0;
 
     [loop]
     for (int bin = 0; bin < APL_FFH_MAX_BINS; ++bin)
@@ -2455,8 +2442,6 @@ float APL_GatherCellShare(int cell, BoostCurve curve, out float topU)
 
         if (span.z <= 0.0)
             continue;
-
-        topU = max(topU, span.y);
 
         if (span.y - span.x < 1e-6)
         {
@@ -2473,40 +2458,36 @@ float APL_GatherCellShare(int cell, BoostCurve curve, out float topU)
     return share;
 }
 
-// Screen share per PQ width, averaged over the filled cells within half the knee transition, so slopes change
-// smoothly inside content.
+// Screen share per PQ width of a filled cell, averaged over the cells within half the knee transition weighted by
+// their own share, so slopes change smoothly inside content and empty cells don't thin it out.
 float APL_SmoothedCellDensity(int cell, BoostCurve curve)
 {
     float width = CurveCellWidth(curve);
     int reach = int(min(0.5 * KNEE_TRANSITION_PQ / width, BOOST_CURVE_CELLS));
     float shareSum = 0.0;
-    float filledCells = 0.0;
+    float shareSqSum = 0.0;
 
     [loop]
     for (int i = max(cell - reach, 0); i <= min(cell + reach, BOOST_CURVE_CELLS - 1); ++i)
     {
-        if (APL_CurveShare[i] > 0.0)
-        {
-            shareSum += APL_CurveShare[i];
-            filledCells += 1.0;
-        }
+        float share = APL_CurveShare[i];
+        shareSum += share;
+        shareSqSum += share * share;
     }
 
-    return shareSum / width / max(filledCells, 1.0);
+    return shareSqSum / shareSum / width;
 }
 
-// Filled cells take slopes in proportion to their screen share, eased from the full gain at the knee so the curve
-// has no kink there. Empty cells give up all their room.
+// Filled cells take slopes in proportion to their screen share. No cell gets flatter than the fixed shoulder.
 float APL_CellShareSlope(int cell, float lambda, BoostCurve curve)
 {
-    if (APL_CurveShare[cell] <= 0.0)
-        return 0.0;
-
-    float kneeEase = max(1.0 - (CurveCellCenterU(cell, curve) - curve.kneeU) / KNEE_TRANSITION_PQ, 0.0);
-    return max(kneeEase, min(CurveCellCap(cell, curve), lambda * APL_CurveDensity[cell]));
+    float floorSlope = CurveCellFloor(cell, curve);
+    float sharedSlope = min(CurveCellCap(cell, curve), max(floorSlope, lambda * APL_CurveDensity[cell]));
+    return (APL_CurveShare[cell] > 0.0) ? sharedSlope : floorSlope;
 }
 
-// Empty levels give up their room from the top down, which moves only what sits above them.
+// Levels with no share give up their room from the top down, as far as the fixed shoulder's slope, which moves only
+// what sits above them.
 void APL_CollapseGaps(float need, int top, float topU, BoostCurve curve)
 {
     float gapAbove = 0.0;
@@ -2519,8 +2500,9 @@ void APL_CollapseGaps(float need, int top, float topU, BoostCurve curve)
         if (APL_CurveShare[cell] > 0.0 || length <= 0.0)
             continue;
 
-        APL_CurveSlope[cell] = 1.0 - clamp(need - gapAbove, 0.0, length) / length;
-        gapAbove += length;
+        float room = length * (1.0 - CurveCellFloor(cell, curve));
+        APL_CurveSlope[cell] = 1.0 - clamp(need - gapAbove, 0.0, room) / length;
+        gapAbove += room;
     }
 }
 
@@ -2549,16 +2531,15 @@ float APL_IntegrateCurveNodes(int top, BoostCurve curve)
     return departureU;
 }
 
-// Fits the curve to the frame with one thread per cell. Leaves the output PQ codes in APL_CurveNodes and where the
-// curve leaves the full gain in APL_EvalBoostParams.
-void APL_FitBoostCurve(int cell, BoostCurve curve)
+// Fits the curve to the frame with one thread per cell, landing the brightest pixel at topU on the panel peak.
+// Leaves the output PQ codes in APL_CurveNodes and where the curve leaves the full gain in APL_EvalBoostParams.
+void APL_FitBoostCurve(int cell, float topU, BoostCurve curve)
 {
-    float topU;
-    float share = APL_GatherCellShare(cell, curve, topU);
+    float share = APL_GatherCellShare(cell, curve);
     bool filled = share > 0.0;
     APL_CurveShare[cell] = share;
 
-    // Nothing needs the room above the ceiling, so every level stays exact.
+    // Nothing needs the room above the panel peak, so every level stays exact.
     bool fits = topU <= curve.peakPQ;
 
     int top = BOOST_CURVE_CELLS - 1;
@@ -2572,8 +2553,8 @@ void APL_FitBoostCurve(int cell, BoostCurve curve)
     float fullSlope = (fits || !filled) ? 1.0 : CurveCellCap(cell, curve);
     APL_CurveSlope[cell] = fullSlope;
 
-    // The room the content needs above the panel peak, and the room the empty levels hold.
-    APL_EvalSums[cell] = float2(fullSlope * length, filled ? 0.0 : length);
+    // The room the content needs above the panel peak, and the room the levels with no share can give.
+    APL_EvalSums[cell] = float2(fullSlope * length, filled ? 0.0 : length * (1.0 - CurveCellFloor(cell, curve)));
     float2 room = APL_SumEvalSums(cell);
     float need = curve.kneeU + room.x - curve.peakPQ;
     bool gaps = !fits && need <= room.y;
@@ -2690,7 +2671,7 @@ void CS_EvaluateAndSolveAPLFullFrameHistogram(uint3 threadID : SV_GroupThreadID)
         APL_CurveBinSpans[localIndex] = APL_BinCurveSpan(maxChannelSpan, pixelCount / rawSums.y, curve);
     barrier();
 
-    APL_FitBoostCurve(localIndex, curve);
+    APL_FitBoostCurve(localIndex, FullGainPQ(APL_FrameTopNits(), curve), curve);
 
     // The gain is known before this frame shows, so its load is measured through this frame's curve.
     float boostScale = 1.0;
@@ -2903,15 +2884,14 @@ float3 DrawStatsOverlay(float2 texcoord, float3 sceneColor, float rawInputAPL, f
 // Pass 5: apply the boost, optional LUT, OSD, and graph.
 float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_Target
 {
-    int2 pixel = int2(vpos.xy);
-    float3 sourceColor = tex2Dfetch(ReShade::BackBuffer, pixel).rgb;
+    float3 sourceColor = tex2D(ReShade::BackBuffer, texcoord).rgb;
     float3 color = sourceColor;
 
     BoostCurve curve = LoadBoostCurve();
 
     if (EnableEOTFBoost)
     {
-        color = ApplyBoostFromPrecomputedParams(color, pixel, curve);
+        color = ApplyBoostFromPrecomputedParams(color, curve);
 
         if (ShowCompression)
             color = DrawCompressionHeatmap(sourceColor, color, curve);
@@ -2926,7 +2906,7 @@ float4 PS_MainPass(float4 vpos : SV_Position, float2 texcoord : TexCoord) : SV_T
     if (ShowOSD)
     {
         float4 instantData = tex2Dfetch(SamplerAPLInstant, int2(0, 0));
-        bool compressing = curve.gain > 1.000001 && curve.departureU < curve.peakPQ - 1e-4;
+        bool compressing = curve.departureU < curve.peakPQ - 1e-4;
         color = DrawStatsOverlay(
             texcoord,
             color,

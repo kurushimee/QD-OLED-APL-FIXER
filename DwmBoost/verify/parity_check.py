@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # Numeric parity check for boost.hlsl against the ReShade shader's values.
 #
-# A CPU mirror of the histogram, the curve solve, the boost and its detail step. It checks that the baked table
-# matches the measured peaks, that from an unboosted frame the gain reaches the closed-loop solve within the host's
-# settle runs, that the boost never darkens and rises with the level, that through cuts and flashes every frame is
+# A CPU mirror of the histogram, the curve solve and the boost. It checks that the baked table matches the
+# measured peaks, that from an unboosted frame the gain reaches the closed-loop solve within the host's settle
+# runs, that a flat field shows the full gain up to the panel peak, that through cuts and flashes every frame is
 # compensated for the dimming the panel applies to it, that the curve keeps the full gain up to the knee, stays
-# exact while nothing on screen needs the room above it, never falls below the fixed shoulder and moves no level
-# for one added pixel, that the detail step keeps its bounds, that the null test's curve checks carry the loads
+# exact while nothing on screen needs the room above it, never goes past the panel peak, under the fixed shoulder
+# or flatter than its slope where content sits, pins nothing but the top of the content on the panel peak and
+# moves no level by more than the room one added pixel takes, that the null test's curve checks carry the loads
 # the boost settles on, and that the settle runs in present_hook.cpp cover the slowest gain convergence the table
 # allows. Run: python parity_check.py
 
@@ -149,46 +150,57 @@ def quantize(nits, scale):
 
 def histogram(pixels):
     """pixels: (count, Rec.2020 nits) pairs. Returns each bin's count, mean luma, luma spread, mean brightest channel,
-    mean load and luma bounds in nits."""
+    top brightest channel, mean load and luma bounds in nits. The frame's top is the highest bin top."""
     sums = {}
     for count, rgb in pixels:
         luma_q4 = quantize(luma2020(rgb), 4.0)
         max_q4 = quantize(max(rgb), 4.0)
         lb = luma_bin(luma_q4)
         offset = within_bin_offset10(luma_q4, lb)
-        s = sums.setdefault(lb * 4 + ratio_bin(luma_q4, max_q4), [0, 0, 0, 0, 0.0])
+        s = sums.setdefault(lb * 4 + ratio_bin(luma_q4, max_q4), [0, 0, 0, 0, 0.0, max_q4])
         s[0] += count
         s[1] += offset * count
         s[2] += offset * offset * count
         s[3] += quantize(max(rgb), 0.5) * count
         s[4] += panel_load_nits(rgb) * count
+        s[5] = max(s[5], max_q4)
 
     bins = []
-    for index, (count, offset_sum, offset_sq_sum, max_sum, load_sum) in sums.items():
+    for index, (count, offset_sum, offset_sq_sum, max_sum, load_sum, top_q4) in sums.items():
         lower, upper = luma_bin_bounds_q4(index // 4)
         offset_to_nits = (upper - lower) / 1023.0 * 0.25
         mean_offset = offset_sum / count
         luma = lower * 0.25 + mean_offset * offset_to_nits
         spread = math.sqrt(max(offset_sq_sum / count - mean_offset * mean_offset, 0.0)) * offset_to_nits
         bins.append({"count": count, "luma": luma, "spread": spread, "max": max(max_sum / count * 2.0, luma),
-                     "load": load_sum / count, "lower": lower * 0.25, "upper": upper * 0.25})
+                     "top": brightest_top_nits(top_q4), "load": load_sum / count,
+                     "lower": lower * 0.25, "upper": upper * 0.25})
     return bins
 
 
-# Fixed shoulder: full gain up to the knee, then the slope eases to the highlight contrast and the panel peak
-# signal lands on the panel peak. It places the knee and is the floor the curve never goes under.
+def brightest_top_nits(top_q4):
+    """The brightest channel's top, raised past the rounding and the histogram's PQ decode table."""
+    return min((top_q4 + 1.5) * 0.25, 10000.0)
+
+
+# Fixed shoulder: full gain up to the knee, then the slope eases to the highlight contrast and the brightest signal
+# lands on the panel peak. It places the knee, and the curve never goes under it or under its slope.
 def shoulder_compression(u, knee_u):
     t = max(u - knee_u, 0.0)
     eased = t * t / (2.0 * KNEE_TRANSITION) if t < KNEE_TRANSITION else t - 0.5 * KNEE_TRANSITION
     return (1.0 - HIGHLIGHT_CONTRAST) * eased
 
 
+def shoulder_slope(u, knee_u):
+    return 1.0 - (1.0 - HIGHLIGHT_CONTRAST) * min(max((u - knee_u) / KNEE_TRANSITION, 0.0), 1.0)
+
+
 def make_curve(gain):
     c = {"gain": max(gain, 1.0), "peakPQ": 1.0, "kneeNits": 10000.0, "kneeU": 1.0, "maxU": 1.0}
-    if PANEL_PEAK <= 0 or c["gain"] <= 1.000001:
+    if PANEL_PEAK <= 0:
         return c
     c["peakPQ"] = nits_to_pq(PANEL_PEAK)
-    c["maxU"] = nits_to_pq_unclamped(PANEL_PEAK * c["gain"])
+    c["maxU"] = nits_to_pq_unclamped(10000.0 * c["gain"])
     eased = (c["maxU"] - c["peakPQ"]) / (1.0 - HIGHLIGHT_CONTRAST)
     if eased < 0.5 * KNEE_TRANSITION:
         span = math.sqrt(2.0 * KNEE_TRANSITION * eased)
@@ -199,22 +211,16 @@ def make_curve(gain):
     return c
 
 
+def full_gain_pq(nits, c):
+    return nits_to_pq_unclamped(min(max(nits, 0.0), 10000.0) * c["gain"])
+
+
 def fixed_shoulder_nits(level, fixed):
     n = max(level, 0.0)
     if n <= fixed["kneeNits"]:
         return n * fixed["gain"]
-    if n >= PANEL_PEAK:
-        return n
-    u = nits_to_pq_unclamped(n * fixed["gain"])
-    return max(pq_to_nits(min(u - shoulder_compression(u, fixed["kneeU"]), fixed["peakPQ"])), n)
-
-
-def full_gain_pq(nits, c):
-    """PQ code after the full gain, inside the curve's range. Signals at the panel peak pass through, so they sit at
-    its top."""
-    if nits >= PANEL_PEAK:
-        return c["maxU"]
-    return min(nits_to_pq_unclamped(nits * c["gain"]), c["maxU"])
+    u = full_gain_pq(n, fixed)
+    return pq_to_nits(min(u - shoulder_compression(u, fixed["kneeU"]), fixed["peakPQ"]))
 
 
 def bin_span(b):
@@ -237,13 +243,12 @@ def build_curve(gain, bins):
 
     total = sum(b["count"] for b in bins)
     share = [0.0] * cells
-    top_u = -1.0
+    top_u = full_gain_pq(max(b["top"] for b in bins), c)
     for b in bins:
         lo, hi = bin_span(b)
         ua, uz = full_gain_pq(lo, c), full_gain_pq(hi, c)
         if uz <= knee_u:
             continue
-        top_u = max(top_u, uz)
         s = b["count"] / total
         if uz - ua < 1e-6:
             share[min(int((uz - knee_u) / width), cells - 1)] += s
@@ -255,7 +260,7 @@ def build_curve(gain, bins):
     c["share"] = share
     c["topU"] = top_u
 
-    # Nothing needs the room above the ceiling, so every level stays exact.
+    # Nothing needs the room above the panel peak, so every level stays exact.
     if top_u <= peak:
         c["phase"] = "fits"
         c["nodes"] = nodes_u
@@ -263,41 +268,45 @@ def build_curve(gain, bins):
 
     top = min(int((top_u - knee_u) / width), cells - 1)
     length = [width if i < top else (top_u - nodes_u[top] if i == top else 0.0) for i in range(cells)]
-    filled = [s > 0.0 for s in share]
     centers = [knee_u + (i + 0.5) * width for i in range(cells)]
     cap = [1.0 - (1.0 - HIGHLIGHT_CONTRAST) * min(max((u - peak) / KNEE_TRANSITION, 0.0), 1.0) for u in centers]
+    floor = [shoulder_slope(u, knee_u) for u in centers]
+    c["floorSlope"] = floor
 
+    # No level goes flatter than the fixed shoulder, so levels with no share between two others never merge them.
+    filled = [s > 0.0 for s in share]
     slope = [cap[i] if filled[i] else 1.0 for i in range(cells)]
     need = knee_u + sum(s * n for s, n in zip(slope, length)) - peak
-    gap_total = sum(length[i] for i in range(cells) if not filled[i])
+    gap_total = sum(length[i] * (1.0 - floor[i]) for i in range(cells) if not filled[i])
 
     if need <= gap_total:
-        # Empty levels give up their room from the top down, which moves only what sits above them.
+        # Levels with no share give up their room from the top down, which moves only what sits above them.
         c["phase"] = "gaps"
         gap_above = 0.0
         for i in range(cells - 1, -1, -1):
             if not filled[i] and length[i] > 0.0:
-                slope[i] = 1.0 - min(max(need - gap_above, 0.0), length[i]) / length[i]
-                gap_above += length[i]
+                room = length[i] * (1.0 - floor[i])
+                slope[i] = 1.0 - min(max(need - gap_above, 0.0), room) / length[i]
+                gap_above += room
     else:
-        # Filled levels share the room by screen share, eased over the knee transition.
+        # Levels with share split the room by screen share, never flatter than the fixed shoulder. Each density is
+        # averaged over its neighbors weighted by their own density, so empty levels don't thin it out.
         c["phase"] = "share"
-        density = [share[i] / width if filled[i] else 0.0 for i in range(cells)]
+        density = [share[i] / width for i in range(cells)]
         reach = int(0.5 * KNEE_TRANSITION / width)
-        sum_density, sum_filled = [0.0], [0]
+        sum_density, sum_density_sq = [0.0], [0.0]
         for i in range(cells):
             sum_density.append(sum_density[-1] + density[i])
-            sum_filled.append(sum_filled[-1] + int(filled[i]))
+            sum_density_sq.append(sum_density_sq[-1] + density[i] * density[i])
         smooth = []
         for i in range(cells):
             a, z = max(i - reach, 0), min(i + reach + 1, cells)
-            smooth.append((sum_density[z] - sum_density[a]) / max(sum_filled[z] - sum_filled[a], 1))
-        knee_ease = [max(1.0 - (u - knee_u) / KNEE_TRANSITION, 0.0) for u in centers]
+            smooth.append((sum_density_sq[z] - sum_density_sq[a]) / max(sum_density[z] - sum_density[a], 1e-30))
 
         def slopes(lam):
-            return [max(knee_ease[i], min(cap[i], lam * smooth[i])) if filled[i] else 0.0 for i in range(cells)]
+            return [min(cap[i], max(floor[i], lam * smooth[i])) if filled[i] else floor[i] for i in range(cells)]
 
-        lam_lo, lam_hi = 0.0, max(cap[i] / smooth[i] for i in range(cells) if filled[i])
+        lam_lo, lam_hi = 0.0, max((cap[i] / smooth[i] for i in range(cells) if filled[i]), default=0.0)
         for _ in range(CURVE_SOLVE_STEPS):
             lam = 0.5 * (lam_lo + lam_hi)
             if knee_u + sum(s * n for s, n in zip(slopes(lam), length)) > peak:
@@ -328,9 +337,7 @@ def curve_output_nits(nits, y, c):
     n = max(nits, 0.0)
     if n <= c["kneeNits"]:
         return n * c["gain"]
-    if n >= PANEL_PEAK:
-        return n
-    return max(pq_to_nits(min(y, c["peakPQ"])), n)
+    return pq_to_nits(min(y, c["peakPQ"]))
 
 
 def boost_scale(luma, brightest, c):
@@ -356,39 +363,6 @@ def display_apl(bins, c):
 def raw_apl(bins):
     total = sum(b["count"] for b in bins)
     return min(sum(min(b["load"] / APL_REF_WHITE, 1.0) * b["count"] for b in bins) / total, 1.0)
-
-
-# Detail step: above the knee a pixel keeps its own PQ contrast around the curve output of its neighborhood, where
-# only neighbors above the knee count.
-DETAIL_WEIGHTS = ((1, 2, 1), (2, 4, 2), (1, 2, 1))
-
-
-def detail_boost_scale(image, x, y, c):
-    rgb = image[y][x]
-    luma, brightest = luma2020(rgb), max(rgb)
-    if luma <= 1e-6:
-        return 1.0
-    if brightest <= c["kneeNits"]:
-        return boost_scale(luma, brightest, c)
-
-    weight_sum = base_luma = base_max = 0.0
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            ny = min(max(y + dy, 0), len(image) - 1)
-            nx = min(max(x + dx, 0), len(image[0]) - 1)
-            n = image[ny][nx]
-            if max(n) <= c["kneeNits"]:
-                continue
-            w = DETAIL_WEIGHTS[dy + 1][dx + 1]
-            weight_sum += w
-            base_luma += w * full_gain_pq(luma2020(n), c)
-            base_max += w * full_gain_pq(max(n), c)
-    base_luma /= weight_sum
-    base_max /= weight_sum
-
-    y_luma = curve_pq(base_luma, c) + full_gain_pq(luma, c) - base_luma
-    y_max = curve_pq(base_max, c) + full_gain_pq(brightest, c) - base_max
-    return min(curve_output_nits(luma, y_luma, c) / luma, curve_output_nits(brightest, y_max, c) / brightest)
 
 
 # Scenes.
@@ -515,16 +489,16 @@ def main():
             print(f"FAIL settling at {level} nits: gain {settled:.4f} after {settle_runs} runs vs solve {gain:.4f}")
             fails += 1
 
-    # 3. On a flat field the boost never darkens and shows the full gain up to the panel's limit, to under half
-    # the smallest 10-bit step. The histogram keeps the brightest channel in 2 nit steps, which is what is left.
+    # 3. A flat field shows the full gain up to the panel peak and the panel peak above it, to under half the
+    # smallest 10-bit step.
     step_tolerance = 0.5 * smallest_10bit_step()
     worst = 0.0
-    for level in range(1, 1061, 10):
+    for level in list(range(1, 1061, 10)) + [1500, 4000, 10000]:
         _, _, gain, c = solve_settled(flat_bins(float(level)))
         out = boost_nits(float(level), c)
-        exact = min(level * gain, PANEL_PEAK) if level < PANEL_PEAK else float(level)
+        exact = min(level * gain, PANEL_PEAK)
         worst = max(worst, abs(out / exact - 1.0))
-        if out < float(level) - 1e-3 or abs(out / exact - 1.0) > step_tolerance:
+        if abs(out / exact - 1.0) > step_tolerance:
             print(f"FAIL flat field at {level} nits: out {out:.2f}, exact {exact:.2f}")
             fails += 1
     print(f"\nflat field check: worst miss of the full gain or the panel peak {worst * 100:.3f}%")
@@ -556,14 +530,17 @@ def main():
             print(f"FAIL {name}: worst frame error {worst:.4f}, settled gain off by {drift:.4f}")
             fails += 1
 
-    # 6. On scenes with content above the knee, every level up to the knee keeps the full gain, nothing goes below
-    # the source, past the panel peak or under the fixed shoulder, levels rise with the source, the mids stay exact
-    # while the room above them is free, one added pixel moves no level by more than half the smallest 10-bit step,
-    # and the frame loop settles from any gain within the host's settle runs.
+    # 6. On scenes with content above the knee, every level up to the knee keeps the full gain, nothing goes past
+    # the panel peak or under the fixed shoulder (beyond the gap a straight cell leaves under its bend), levels rise
+    # with the source, the mids stay exact while the room above them is free, no level gets flatter than the fixed
+    # shoulder, only the top of the content lands on the panel peak, one added pixel moves no level by more than the
+    # room it takes (the cells it gives share and the top it adds) and half a 10-bit code, and the frame loop settles
+    # from any gain within the host's settle runs.
+    half_code = 0.5 / 1023.0
     scenes = {
-        "speck over a gap": ([(0.8, 5, 350), (0.001, 900, 1000)], (5, 350)),
+        "speck over a gap": ([(0.8, 5, 350), (0.001, 600, 700)], (5, 350)),
         "big sky over a gap": ([(0.85, 20, 250), (0.15, 600, 900)], (20, 250)),
-        "band under a speck": ([(0.6, 5, 150), (0.2, 300, 360), (0.002, 900, 1000)], (5, 360)),
+        "band under a speck": ([(0.6, 5, 150), (0.2, 300, 360), (0.002, 900, 1000)], (5, 150)),
         "nothing above the ceiling": ([(1.0, 5, 400)], (5, 400)),
         "bloom past the ceiling": ([(0.9, 20, 420), (0.005, 420, 1000)], None),
         "glow on the mids": ([(0.8, 10, 350), (0.02, 300, 700)], None),
@@ -571,13 +548,17 @@ def main():
         "band, gap and highlights": ([(0.6, 5, 150), (0.2, 300, 360), (0.05, 700, 1000)], None),
         "sparse mids, dense sky": ([(0.7, 5, 100), (0.01, 150, 400), (0.25, 500, 1000)], None),
         "full screen above the ceiling": ([(1.0, 300, 1060)], None),
+        "sun over a sky": ([(0.6, 10, 300), (0.2, 300, 2000), (0.001, 4000, 4000)], None),
+        "dark room, lamps to 4000": ([(0.02, 5, 100), (0.005, 1060, 4000)], None),
     }
-    print("\n  scene                           gain   curve     knee   1-pixel move  settle frames from 1.0/2.0/max")
+    print("\n  scene                           gain   curve     knee   1-pixel move (codes, bound)  settle frames from 1.0/2.0/max")
     for name, (parts, exact_range) in scenes.items():
         pixels = scene(parts)
         bins = histogram(pixels)
         _, _, gain, c = solve_settled(bins)
         fixed = make_curve(gain)
+        bend = c["width"] ** 2 / 8.0 * (1.0 - HIGHLIGHT_CONTRAST) / KNEE_TRANSITION
+        top = max(hi for _, _, hi in parts)
         levels = sorted({lo * (hi / lo) ** (k / 60) for _, lo, hi in parts for k in range(61)})
         problems = []
 
@@ -586,24 +567,35 @@ def main():
             out = boost_nits(level, c)
             if level <= c["kneeNits"] and abs(out - level * gain) > 1e-6 * level * gain:
                 problems.append(f"{level:.1f} nits below the knee misses the full gain")
-            if out < level - 1e-3 or out > PANEL_PEAK + 1e-3 or out < prev - 1e-3:
+            if out > PANEL_PEAK + 1e-3 or out < prev - 1e-3:
                 problems.append(f"{level:.1f} nits shows at {out:.2f} after {prev:.2f}")
-            if out < fixed_shoulder_nits(level, fixed) * (1.0 - 1e-5):
+            if nits_to_pq(out) < nits_to_pq(fixed_shoulder_nits(level, fixed)) - bend - 1e-9:
                 problems.append(f"{level:.1f} nits shows under the fixed shoulder")
             if exact_range and exact_range[0] <= level <= exact_range[1] and abs(out / (level * gain) - 1) > 1e-4:
                 problems.append(f"{level:.1f} nits misses exact while the room above is free")
+            if nits_to_pq(out) >= c["peakPQ"] - half_code and full_gain_pq(level, c) < c["topU"] - half_code / HIGHLIGHT_CONTRAST:
+                problems.append(f"{level:.1f} nits lands on the panel peak below the top of the content")
             prev = out
 
+        if c["phase"] in ("gaps", "share"):
+            last = min(int((c["topU"] - c["kneeU"]) / c["width"]), CURVE_CELLS - 1)
+            for i in range(last):
+                if c["nodes"][i + 1] - c["nodes"][i] < c["floorSlope"][i] * c["width"] * (1.0 - 1e-6):
+                    problems.append(f"cell {i} is flatter than the fixed shoulder")
+
         knee_levels = [lv for lv in levels if lv > c["kneeNits"]]
-        base = [boost_nits(lv, c) for lv in knee_levels]
-        worst_move = 0.0
+        base = [nits_to_pq(boost_nits(lv, c)) for lv in knee_levels]
+        worst_move, worst_bound = 0.0, 0.0
         for k in range(41):
-            speck = c["kneeNits"] * (PANEL_PEAK / c["kneeNits"]) ** (k / 40)
+            speck = c["kneeNits"] * (top / c["kneeNits"]) ** (k / 40)
             moved = build_curve(gain, histogram(pixels + [(1, gray(speck))]))
-            for lv, out in zip(knee_levels, base):
-                worst_move = max(worst_move, abs(boost_nits(lv, moved) / out - 1.0))
-        if worst_move > step_tolerance:
-            problems.append(f"one pixel moves a level by {worst_move * 100:.3f}%")
+            move = max(abs(nits_to_pq(boost_nits(lv, moved)) - y) for lv, y in zip(knee_levels, base))
+            given = sum(1 for a, b in zip(c["share"], moved["share"]) if b > 0.0 and a <= 0.0)
+            bound = moved["width"] * given + max(moved["topU"] - c["topU"], 0.0) + half_code
+            if move > bound:
+                problems.append(f"a pixel at {speck:.1f} nits moves a level by {move * 1023:.2f} codes, it takes {bound * 1023:.2f}")
+            if move > worst_move:
+                worst_move, worst_bound = move, bound
 
         settles = []
         for start in (1.0, 2.0, 2.0 ** cand_max_log_gain()):
@@ -613,7 +605,8 @@ def main():
         if any(s is None or s > settle_runs for s in settles):
             problems.append(f"frame loop settles after {settles} frames")
 
-        print(f"  {name:30s}  {gain:5.3f}  {c['phase']:8s}  {c['kneeNits']:6.1f}  {worst_move * 100:9.3f}%    {settles}")
+        print(f"  {name:30s}  {gain:5.3f}  {c['phase']:8s}  {c['kneeNits']:6.1f}  {worst_move * 1023:8.2f} / {worst_bound * 1023:5.2f}"
+              f"              {settles}")
         for p in problems:
             print(f"FAIL {name}: {p}")
         fails += len(problems)
@@ -653,44 +646,6 @@ def main():
     if any(abs(shown / 150.0 - 1.0) > 1e-6 for _, shown in bright.values()):
         print("FAIL bright window check: the patch misses the full gain")
         fails += 1
-
-    # 9. The detail step leaves every pixel up to the knee at the full gain, keeps the brightest channel under the
-    # panel peak and every pixel at or over its source, adds no rim where a highlight meets dark pixels, and moves
-    # the panel load only slightly.
-    _, _, gain, c = solve_settled(histogram(scene([(0.6, 20, 200), (0.1, 500, 900)])))
-    size = 12
-    texture = [[gray(700.0 * (1.15 if (x + y) % 2 else 0.85)) if 3 <= x < 9 and 3 <= y < 9 else gray(60.0)
-                for x in range(size)] for y in range(size)]
-    flat_patch = [[gray(700.0) if 3 <= x < 9 and 3 <= y < 9 else gray(0.0) for x in range(size)] for y in range(size)]
-    edge = [[gray(450.0 if x < 6 else 900.0) for x in range(size)] for y in range(size)]
-    red = [[(900.0, 40.0, 40.0) if 3 <= x < 9 else gray(500.0) for x in range(size)] for y in range(size)]
-    problems = []
-    for image in (texture, flat_patch, edge, red):
-        for y in range(size):
-            for x in range(size):
-                rgb = image[y][x]
-                scale = detail_boost_scale(image, x, y, c)
-                if max(rgb) <= c["kneeNits"] and abs(scale - gain) > 1e-9 and luma2020(rgb) > 1e-6:
-                    problems.append(f"pixel {rgb} up to the knee misses the full gain")
-                if max(rgb) * scale > PANEL_PEAK * (1 + 1e-6) and max(rgb) < PANEL_PEAK:
-                    problems.append(f"pixel {rgb} passes the panel peak")
-                if scale < 1.0 - 1e-9:
-                    problems.append(f"pixel {rgb} falls under its source")
-    for y in range(size):
-        for x in range(size):
-            if flat_patch[y][x][0] > 0 and abs(detail_boost_scale(flat_patch, x, y, c) - boost_scale(700.0, 700.0, c)) > 1e-9:
-                problems.append(f"flat patch pixel ({x}, {y}) differs from the curve, a rim")
-    overshoot = max(abs(detail_boost_scale(edge, x, 6, c) / boost_scale(edge[6][x][0], edge[6][x][0], c) - 1.0)
-                    for x in range(size))
-    plain_load = sum(panel_load_nits(texture[y][x]) * boost_scale(luma2020(texture[y][x]), max(texture[y][x]), c)
-                     for y in range(size) for x in range(size))
-    detail_load = sum(panel_load_nits(texture[y][x]) * detail_boost_scale(texture, x, y, c)
-                      for y in range(size) for x in range(size))
-    print(f"\ndetail check: edge overshoot {overshoot * 100:.2f}%, load moves {(detail_load / plain_load - 1) * 100:+.3f}% "
-          f"on a textured highlight")
-    for p in sorted(set(problems)):
-        print(f"FAIL detail: {p}")
-    fails += len(set(problems))
 
     print("\nALL CHECKS PASSED" if fails == 0 else f"\n{fails} CHECK(S) FAILED")
     return 1 if fails else 0

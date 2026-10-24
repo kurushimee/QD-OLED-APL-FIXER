@@ -87,6 +87,7 @@ struct MonitorState
     ID3D11PixelShader* psBoost = nullptr;
     ID3D11SamplerState* pointClamp = nullptr;
     ID3D11SamplerState* linearClamp = nullptr;
+    ID3D11RasterizerState* noCull = nullptr;
     ID3D11Buffer* cb = nullptr;
 
     TileCover cover;
@@ -117,6 +118,7 @@ struct MonitorState
         if (psBoost) { psBoost->Release(); psBoost = nullptr; }
         if (pointClamp) { pointClamp->Release(); pointClamp = nullptr; }
         if (linearClamp) { linearClamp->Release(); linearClamp = nullptr; }
+        if (noCull) { noCull->Release(); noCull = nullptr; }
         if (cb) { cb->Release(); cb = nullptr; }
         if (settleEvt) { CloseHandle(settleEvt); settleEvt = nullptr; }
         if (contentEvt) { CloseHandle(contentEvt); contentEvt = nullptr; }
@@ -179,6 +181,13 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     ok &= SUCCEEDED(s.dev->CreateSamplerState(&sd, &s.pointClamp));
     sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     ok &= SUCCEEDED(s.dev->CreateSamplerState(&sd, &s.linearClamp));
+
+    // ReShade draws with culling off, and its fullscreen triangle winds counter-clockwise.
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    ok &= SUCCEEDED(s.dev->CreateRasterizerState(&rd, &s.noCull));
 
     if (!ok) { s.Release(); return false; }
 
@@ -382,8 +391,8 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float frameTime
     c->GSSetShader(nullptr, nullptr, 0);
     c->PSSetShader(s.psBoost, nullptr, 0);
 
-    // Default states: no scissor, no blend, no depth, so the whole frame is replaced whatever DWM left bound.
-    c->RSSetState(nullptr);
+    // No scissor, no culling, no blend, no depth, so the whole frame is replaced whatever DWM left bound.
+    c->RSSetState(s.noCull);
     c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     c->OMSetDepthStencilState(nullptr, 0);
     {

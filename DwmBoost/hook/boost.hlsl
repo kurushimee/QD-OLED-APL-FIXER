@@ -152,6 +152,10 @@ static const float HIGHLIGHT_CONTRAST = 0.25;
 // PQ width over which slopes ease between the full gain and the highlight contrast.
 static const float KNEE_TRANSITION_PQ = 0.04;
 
+// PQ size of the fine detail a pixel carries, the 0.2 average local RMS contrast of natural images (Frazor and
+// Geisler 2006) at highlight levels, where a unit of natural log luminance spans about 0.108 PQ.
+static const float DETAIL_PQ = 0.022;
+
 // Full gain up to the knee. Above it the output PQ codes come from a table fitted to the frame, up to maxU, the
 // full-gain PQ code of a 10000 nit signal. Levels named U are PQ codes after the full gain.
 struct BoostCurve
@@ -290,28 +294,28 @@ static const float2 APL_ANCHORS[APL_ANCHOR_COUNT] =
 {
     float2(1.584963, 0.000000), // 3%   (1060.0 nits)
     float2(2.000000, 0.198724), // 4%   (923.6 nits)
-    float2(2.321928, 0.381141), // 5%   (813.9 nits)
-    float2(2.584963, 0.553194), // 6%   (722.4 nits)
-    float2(2.807355, 0.712673), // 7%   (646.8 nits)
-    float2(3.000000, 0.851895), // 8%   (587.3 nits)
-    float2(3.169925, 0.978654), // 9%   (537.9 nits)
-    float2(3.321928, 1.093618), // 10%  (496.7 nits)
-    float2(3.459432, 1.133372), // 11%  (483.2 nits)
-    float2(3.584963, 1.161714), // 12%  (473.8 nits)
-    float2(3.700440, 1.192490), // 13%  (463.8 nits)
-    float2(3.807355, 1.216959), // 14%  (456.0 nits)
-    float2(3.906891, 1.248625), // 15%  (446.1 nits)
-    float2(4.087463, 1.285640), // 17%  (434.8 nits)
-    float2(4.321928, 1.348022), // 20%  (416.4 nits)
-    float2(4.459432, 1.375656), // 22%  (408.5 nits)
-    float2(4.643856, 1.429629), // 25%  (393.5 nits)
-    float2(4.754888, 1.457765), // 27%  (385.9 nits)
-    float2(4.906891, 1.489516), // 30%  (377.5 nits)
-    float2(5.129283, 1.533755), // 35%  (366.1 nits)
-    float2(5.321928, 1.585916), // 40%  (353.1 nits)
-    float2(5.643856, 1.668306), // 50%  (333.5 nits)
-    float2(6.228819, 1.797656), // 75%  (304.9 nits)
-    float2(6.643856, 1.882430)  // 100% (287.5 nits)
+    float2(2.321928, 0.384513), // 5%   (812.0 nits)
+    float2(2.584963, 0.559800), // 6%   (719.1 nits)
+    float2(2.807355, 0.720276), // 7%   (643.4 nits)
+    float2(3.000000, 0.860765), // 8%   (583.7 nits)
+    float2(3.169925, 0.988072), // 9%   (534.4 nits)
+    float2(3.321928, 1.104405), // 10%  (493.0 nits)
+    float2(3.459432, 1.146569), // 11%  (478.8 nits)
+    float2(3.584963, 1.173946), // 12%  (469.8 nits)
+    float2(3.700440, 1.204986), // 13%  (459.8 nits)
+    float2(3.807355, 1.230627), // 14%  (451.7 nits)
+    float2(3.906891, 1.260641), // 15%  (442.4 nits)
+    float2(4.087463, 1.299644), // 17%  (430.6 nits)
+    float2(4.321928, 1.362298), // 20%  (412.3 nits)
+    float2(4.459432, 1.391637), // 22%  (404.0 nits)
+    float2(4.643856, 1.443258), // 25%  (389.8 nits)
+    float2(4.754888, 1.474309), // 27%  (381.5 nits)
+    float2(4.906891, 1.506043), // 30%  (373.2 nits)
+    float2(5.129283, 1.551199), // 35%  (361.7 nits)
+    float2(5.321928, 1.606491), // 40%  (348.1 nits)
+    float2(5.643856, 1.689660), // 50%  (328.6 nits)
+    float2(6.228819, 1.824882), // 75%  (299.2 nits)
+    float2(6.643856, 1.914396)  // 100% (281.2 nits)
 };
 
 int FindAPLAnchorIndex(float logAPL)
@@ -725,9 +729,11 @@ groupshared float4 APL_EvalBoostParams[2];
 // Full-gain PQ span and screen share of each bin that reaches above the knee.
 groupshared float3 APL_CurveBinSpans[APL_FFH_MAX_BINS];
 
-// Each curve cell's screen share, smoothed share per PQ width and slope, and the output PQ codes at the cell edges.
+// Each curve cell's screen share, smoothed share per PQ width, share above its middle and slope, and the output PQ
+// codes at the cell edges.
 groupshared float APL_CurveShare[BOOST_CURVE_CELLS];
 groupshared float APL_CurveDensity[BOOST_CURVE_CELLS];
+groupshared float APL_CurveAbove[BOOST_CURVE_CELLS];
 groupshared float APL_CurveSlope[BOOST_CURVE_CELLS];
 groupshared float APL_CurveNodes[BOOST_CURVE_CELLS + 1];
 
@@ -867,51 +873,65 @@ float APL_GatherCellShare(int cell, BoostCurve curve)
     return share;
 }
 
-// Screen share per PQ width of a filled cell, averaged over the cells within half the knee transition weighted by
-// their own share, so slopes change smoothly inside content and empty cells don't thin it out.
+// Screen share per PQ width, averaged over the cells within half the knee transition, empty ones included, so slopes
+// change smoothly and a level's weight grows from nothing with its share.
 float APL_SmoothedCellDensity(int cell, BoostCurve curve)
 {
     float width = CurveCellWidth(curve);
     int reach = int(min(0.5 * KNEE_TRANSITION_PQ / width, BOOST_CURVE_CELLS));
+    int first = max(cell - reach, 0);
+    int last = min(cell + reach, BOOST_CURVE_CELLS - 1);
     float shareSum = 0.0;
-    float shareSqSum = 0.0;
 
     [loop]
-    for (int i = max(cell - reach, 0); i <= min(cell + reach, BOOST_CURVE_CELLS - 1); ++i)
+    for (int i = first; i <= last; ++i)
+        shareSum += APL_CurveShare[i];
+
+    return shareSum / float(last - first + 1) / width;
+}
+
+// Screen share above the middle of each cell, the pixels a flatter cell shifts down.
+void APL_SumShareAbove()
+{
+    float shareAbove = 0.0;
+
+    [loop]
+    for (int cell = BOOST_CURVE_CELLS - 1; cell >= 0; --cell)
     {
-        float share = APL_CurveShare[i];
-        shareSum += share;
-        shareSqSum += share * share;
+        APL_CurveAbove[cell] = shareAbove + 0.5 * APL_CurveShare[cell];
+        shareAbove += APL_CurveShare[cell];
     }
-
-    return shareSqSum / shareSum / width;
 }
 
-// Filled cells take slopes in proportion to their screen share. No cell gets flatter than the fixed shoulder.
-float APL_CellShareSlope(int cell, float lambda, BoostCurve curve)
+// Slope that costs the frame the least, with mu the shifted share each PQ step of room is worth. Flattening a cell
+// costs its pixels DETAIL_PQ times the log of the contrast they lose, and keeping it shifts every pixel above it.
+float APL_CellSlope(int cell, float mu, BoostCurve curve)
 {
-    float floorSlope = CurveCellFloor(cell, curve);
-    float sharedSlope = min(CurveCellCap(cell, curve), max(floorSlope, lambda * APL_CurveDensity[cell]));
-    return (APL_CurveShare[cell] > 0.0) ? sharedSlope : floorSlope;
+    float slope = CurveCellCap(cell, curve);
+    float above = APL_CurveAbove[cell];
+
+    if (mu > above)
+        slope = clamp(DETAIL_PQ * APL_CurveDensity[cell] / (mu - above), CurveCellFloor(cell, curve), slope);
+
+    return slope;
 }
 
-// Levels with no share give up their room from the top down, as far as the fixed shoulder's slope, which moves only
+// Levels with no share nearby whose price ties mu give up the rest of the room from the top down, which moves only
 // what sits above them.
-void APL_CollapseGaps(float need, int top, float topU, BoostCurve curve)
+void APL_CollapseFreeLevels(float excess, float muLo, float muHi, int top, float topU, BoostCurve curve)
 {
-    float gapAbove = 0.0;
-
     [loop]
     for (int cell = top; cell >= 0; --cell)
     {
         float length = CurveCellLength(cell, top, topU, curve);
+        float above = APL_CurveAbove[cell];
 
-        if (APL_CurveShare[cell] > 0.0 || length <= 0.0)
+        if (APL_CurveDensity[cell] > 0.0 || above < muLo || above >= muHi || length <= 0.0)
             continue;
 
-        float room = length * (1.0 - CurveCellFloor(cell, curve));
-        APL_CurveSlope[cell] = 1.0 - clamp(need - gapAbove, 0.0, room) / length;
-        gapAbove += room;
+        float given = clamp(excess, 0.0, length * (APL_CurveSlope[cell] - CurveCellFloor(cell, curve)));
+        APL_CurveSlope[cell] -= given / length;
+        excess -= given;
     }
 }
 
@@ -944,9 +964,13 @@ float APL_IntegrateCurveNodes(int top, BoostCurve curve)
 // Leaves the output PQ codes in APL_CurveNodes and where the curve leaves the full gain in APL_EvalBoostParams.
 void APL_FitBoostCurve(int cell, float topU, BoostCurve curve)
 {
-    float share = APL_GatherCellShare(cell, curve);
-    bool filled = share > 0.0;
-    APL_CurveShare[cell] = share;
+    APL_CurveShare[cell] = APL_GatherCellShare(cell, curve);
+    GroupMemoryBarrierWithGroupSync();
+
+    APL_CurveDensity[cell] = APL_SmoothedCellDensity(cell, curve);
+    if (cell == 0)
+        APL_SumShareAbove();
+    GroupMemoryBarrierWithGroupSync();
 
     // Nothing needs the room above the panel peak, so every level stays exact.
     bool fits = topU <= curve.peakPQ;
@@ -959,48 +983,35 @@ void APL_FitBoostCurve(int cell, float topU, BoostCurve curve)
     }
 
     float length = fits ? 0.0 : CurveCellLength(cell, top, topU, curve);
-    float fullSlope = (fits || !filled) ? 1.0 : CurveCellCap(cell, curve);
-    APL_CurveSlope[cell] = fullSlope;
 
-    // The room the content needs above the panel peak, and the room the levels with no share can give.
-    APL_EvalSums[cell] = float2(fullSlope * length, filled ? 0.0 : length * (1.0 - CurveCellFloor(cell, curve)));
-    float2 room = APL_SumEvalSums(cell);
-    float need = curve.kneeU + room.x - curve.peakPQ;
-    bool gaps = !fits && need <= room.y;
-    bool shares = !fits && !gaps;
+    // At the top price every cell sits on the fixed shoulder.
+    APL_EvalSums[cell] = float2(DETAIL_PQ * APL_CurveDensity[cell] / CurveCellFloor(cell, curve), 0.0);
+    float muLo = 0.0;
+    float muHi = 1.0 + APL_MaxEvalSums(cell).x;
 
-    float density = 0.0;
-    [branch]
-    if (shares && filled)
-        density = APL_SmoothedCellDensity(cell, curve);
-    APL_CurveDensity[cell] = density;
-
-    // The share solve runs every frame, since barriers cannot sit inside a branch on the frame's content.
-    APL_EvalSums[cell] = float2((density > 0.0) ? CurveCellCap(cell, curve) / density : 0.0, 0.0);
-    float lambdaLo = 0.0;
-    float lambdaHi = APL_MaxEvalSums(cell).x;
-
+    // The solve runs every frame, since barriers cannot sit inside a branch on the frame's content.
     [loop]
     for (int step = 0; step < BOOST_CURVE_SOLVE_STEPS; ++step)
     {
-        float lambda = 0.5 * (lambdaLo + lambdaHi);
-        APL_EvalSums[cell] = float2(APL_CellShareSlope(cell, lambda, curve) * length, 0.0);
+        float mu = 0.5 * (muLo + muHi);
+        APL_EvalSums[cell] = float2(APL_CellSlope(cell, mu, curve) * length, 0.0);
         float rise = APL_SumEvalSums(cell).x;
 
         if (curve.kneeU + rise > curve.peakPQ)
-            lambdaHi = lambda;
+            muLo = mu;
         else
-            lambdaLo = lambda;
+            muHi = mu;
     }
 
-    if (shares)
-        APL_CurveSlope[cell] = APL_CellShareSlope(cell, lambdaLo, curve);
-    GroupMemoryBarrierWithGroupSync();
+    float slope = fits ? 1.0 : APL_CellSlope(cell, muLo, curve);
+    APL_CurveSlope[cell] = slope;
+    APL_EvalSums[cell] = float2(slope * length, 0.0);
+    float excess = curve.kneeU + APL_SumEvalSums(cell).x - curve.peakPQ;
 
     if (cell == 0)
     {
-        if (gaps)
-            APL_CollapseGaps(need, top, topU, curve);
+        if (!fits)
+            APL_CollapseFreeLevels(excess, muLo, muHi, top, topU, curve);
 
         APL_EvalBoostParams[1].y = APL_IntegrateCurveNodes(top, curve);
     }

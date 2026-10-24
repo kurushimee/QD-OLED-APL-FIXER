@@ -19,10 +19,10 @@ const UINT BOOST_CURVE_CELLS = 512;
 
 UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
 
-// Runs after a content change that keep DWM composing while the gain settles. Each solve leaves at most 0.756
-// of the gain error, the steepest slope of the compensation table, so 21 take the largest possible jump under
+// Runs after a content change that keep DWM composing while the gain settles. Each solve leaves at most 0.765
+// of the gain error, the steepest slope of the compensation table, so 22 take the largest possible jump under
 // half a 10-bit PQ code.
-const int SETTLE_RUNS = 21;
+const int SETTLE_RUNS = 22;
 const double PRIME_MIN_GAP_MS = 1000.0;
 
 // Host config mirror (written by the watcher thread, read in the present path).

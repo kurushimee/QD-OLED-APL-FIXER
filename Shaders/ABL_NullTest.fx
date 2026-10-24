@@ -105,24 +105,24 @@ static const float2 COMP_ANCHORS[COMP_ANCHOR_COUNT] =
 {
     float2(1.584963, 0.000000),
     float2(2.000000, 0.198724),
-    float2(2.321928, 0.381141),
-    float2(2.584963, 0.553194),
-    float2(2.807355, 0.712673),
-    float2(3.000000, 0.851895),
-    float2(3.169925, 0.978654),
-    float2(3.321928, 1.093618)
+    float2(2.321928, 0.384513),
+    float2(2.584963, 0.559800),
+    float2(2.807355, 0.720276),
+    float2(3.000000, 0.860765),
+    float2(3.169925, 0.988072),
+    float2(3.321928, 1.104405)
 };
 
 // Raw APL of each curve check's two states, which the boost settles on out APL 3/6, 6/10, 8/12, 10/25, 25/50
 // and 50/80%. Every fill sits below the ceiling, so each is the out APL over its compensation.
 static const float2 CURVE_CHECK_RAW_APL[6] =
 {
-    float2(0.0300000, 0.0408906),
-    float2(0.0408906, 0.0468585),
-    float2(0.0443245, 0.0536377),
-    float2(0.0468585, 0.0928066),
-    float2(0.0928066, 0.1573113),
-    float2(0.1573113, 0.2270997)
+    float2(0.0300000, 0.0407038),
+    float2(0.0407038, 0.0465094),
+    float2(0.0440528, 0.0531849),
+    float2(0.0465094, 0.0919340),
+    float2(0.0919340, 0.1550000),
+    float2(0.1550000, 0.2226900)
 };
 
 

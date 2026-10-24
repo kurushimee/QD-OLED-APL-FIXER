@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # Numeric parity check for boost.hlsl against the ReShade shader's values.
 #
-# A CPU mirror of the histogram, the gain search, the curve solve and the boost. It checks that the baked table
-# matches the measured peaks, that from an unboosted frame the gain reaches the closed-loop solve within the host's
-# settle runs, that a flat field shows its source level up to the panel peak, that through cuts and flashes every
-# frame is compensated for the dimming the panel applies to it, that the curve keeps the full gain up to the knee,
+# A CPU mirror of the histogram, the gain search, the curve solve, the smoothing and the boost. It checks that the
+# baked table matches the measured peaks, that from an unboosted frame the gain reaches the closed-loop solve within
+# the host's settle runs, that a flat field shows its source level up to the panel peak, that through cuts and flashes
+# without smoothing every frame is compensated for the dimming the panel applies to it, that the curve keeps the full
+# gain up to the knee,
 # stays exact while nothing on screen needs the room above it, never goes past the panel peak, under the fixed
 # shoulder or flatter than its slope where content sits, pins nothing but the top of the content on the panel peak,
 # moves no level, through the gain and the curve, by more than the room one added pixel takes or by half a 10-bit
 # code for ten pixels spread over part of the range, that the null test's curve checks carry the loads the boost
-# settles on, and that the settle runs in present_hook.cpp cover the slowest gain convergence the table allows.
+# settles on, and that the settle runs and seconds in pipeline.h cover the slowest gain convergence the table allows
+# and the slowest ease the smoothing time allows.
 # Run: python parity_check.py
 
 import math
@@ -26,11 +28,12 @@ CURVE_CELLS = 512
 CURVE_SOLVE_STEPS = 21
 GAIN_SEARCH_STEPS = 12
 SINGLE_PRIMARY_LOAD = 0.75
+SMOOTHING_SECONDS = 0.5
 
 SCREEN_PIXELS = 2560 * 1440
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-HOOK_SOURCE = ROOT / "DwmBoost" / "hook" / "present_hook.cpp"
+PIPELINE_SOURCE = ROOT / "DwmBoost" / "hook" / "pipeline.h"
 NULL_TEST_SOURCE = ROOT / "Shaders" / "ABL_NullTest.fx"
 
 # (log2 APL percent, log2 compensation) per anchor.
@@ -489,23 +492,33 @@ def null_test_pattern(raw, patch_nits, window=False):
     return pixels + [(side * side, gray(900.0)), (load_pixels - side * side, gray(rest))]
 
 
-def run_frames(bins_per_frame, last_disp=None, start_comp=None):
-    """Mirror CS_Solve over consecutive frames. Each frame's compensation is for the display APL of the frame before
-    it, its gain the one under that costing the frame the least, and its own display APL is measured through the curve
-    it gets."""
+def run_frames(bins_per_frame, last_disp=None, start_comp=None, smoothing=0.0, frame_seconds=0.0):
+    """Mirror CS_Solve over consecutive frames. The track compensates each frame for the display APL it measured on
+    the frame before, through the curve that compensation gives. The shown compensation is for the APL that eases
+    toward the track's over the smoothing time, and each gain is the one under its compensation costing the frame the
+    least."""
     if start_comp is not None:
         last_disp = None
     elif last_disp is None:
         last_disp = solve_settled(bins_per_frame[0])[1]
+    alpha = 1.0 if smoothing <= 1e-6 else 1.0 - math.exp(-frame_seconds / smoothing)
+    track = eased = last_disp
     gains, curves, searched = [], [], {}
     for bins in bins_per_frame:
-        comp = start_comp if last_disp is None else 2.0 ** scene_log_gain(last_disp)
+        if track is None:
+            comp = track_comp = start_comp
+        else:
+            eased += alpha * (track - eased)
+            comp, track_comp = 2.0 ** scene_log_gain(eased), 2.0 ** scene_log_gain(track)
         if id(bins) not in searched:
             searched[id(bins)] = search_gain(bins)
         c = build_curve(choose_gain(searched[id(bins)], comp), bins)
+        track_c = c if track_comp == comp else build_curve(choose_gain(searched[id(bins)], track_comp), bins)
         gains.append(c["gain"])
         curves.append(c)
-        last_disp = display_apl(bins, c)
+        track = display_apl(bins, track_c)
+        if eased is None:
+            eased = track
     return gains, curves
 
 
@@ -537,8 +550,27 @@ def smallest_10bit_step():
     return min(pq_to_lin((code + 1) / 1023) / pq_to_lin(code / 1023) - 1.0 for code in range(1, peak_code))
 
 
-def host_settle_runs():
-    return int(re.search(r"SETTLE_RUNS = (\d+);", HOOK_SOURCE.read_text()).group(1))
+def host_settle():
+    text = PIPELINE_SOURCE.read_text()
+    runs = int(re.search(r"SETTLE_RUNS = (\d+);", text).group(1))
+    seconds = float(re.search(r"SETTLE_SECONDS = ([\d.]+);", text).group(1))
+    return runs, seconds
+
+
+def ease_seconds(target, start, tolerance):
+    """Seconds the eased APL takes from start to bring the compensation within tolerance of the target's, once the
+    track holds still on the target. Its gap shrinks as exp(-t / smoothing time) whatever the frame rate."""
+    goal = scene_log_gain(target)
+    if abs(scene_log_gain(start) - goal) <= tolerance:
+        return 0.0
+    near, far = target, start
+    for _ in range(60):
+        mid = 0.5 * (near + far)
+        if abs(scene_log_gain(mid) - goal) <= tolerance:
+            near = mid
+        else:
+            far = mid
+    return SMOOTHING_SECONDS * math.log(abs(start - target) / abs(near - target))
 
 
 def null_test_curve_loads():
@@ -571,9 +603,9 @@ def main():
             fails += 1
     print("table check: baked APL_ANCHORS matches the measured peaks")
 
-    # 2. From an unboosted frame, the frame loop reaches the closed-loop solve within the host's settle runs, to
-    # under half the smallest 10-bit PQ step.
-    settle_runs = host_settle_runs()
+    # 2. From an unboosted frame, the frame loop the track runs reaches the closed-loop solve within the host's settle
+    # runs, to under half the smallest 10-bit PQ step.
+    settle_runs, settle_seconds = host_settle()
     tolerance = math.log2(1.0 + 0.5 * smallest_10bit_step())
     print(f"\n  level(nits)  rawAPL%  solvedAPL%   gain   gain error after {settle_runs} runs")
     for level in (20, 60, 150, 230, 300, 530, 795, 1060):
@@ -608,8 +640,8 @@ def main():
         fails += 1
     print(f"midtone check: 20-nit sample boosted by the compensation {comp:.3f} -> {mid_out:.2f} nits")
 
-    # 5. Through cuts and a two-frame flash, every frame shows its source level on a panel one frame behind, and
-    # the gain settles on the closed-loop solve.
+    # 5. Through cuts and a two-frame flash without smoothing, every frame shows its source level on a panel one
+    # frame behind, and the gain settles on the closed-loop solve.
     print("\n  sequence                worst frame error   settled gain vs solve")
     sequences = {
         "6% -> 10% out APL": [43.34] * 5 + [49.67] * 40,
@@ -733,8 +765,32 @@ def main():
     print(f"\nsettle check: steepest slope {steepest:.4f}, smallest step {smallest_10bit_step() * 100:.2f}%, "
           f"{needed} solves needed, host keeps {settle_runs}")
     if settle_runs != needed:
-        print(f"FAIL settle runs: present_hook.cpp keeps {settle_runs}, the table needs {needed}")
+        print(f"FAIL settle runs: pipeline.h keeps {settle_runs}, the table needs {needed}")
         fails += 1
+
+    # After those runs the host keeps composing for SETTLE_SECONDS while the ease closes on the track. From the
+    # farthest APL the ease can start at, 0 or 1, it must bring the compensation under the same tolerance for every
+    # APL a frame can settle on. Cuts between the flat fields that settle on 100% and 3% out APL, the slowest pair,
+    # then land within it at 60 and 240 Hz.
+    ease = max(ease_seconds(k / 4000, start, tolerance) for k in range(1, 4000) for start in (0.0, 1.0))
+    needed_seconds = math.ceil(ease * 100) / 100
+    print(f"ease check: slowest ease {ease:.4f} s at {SMOOTHING_SECONDS} s smoothing, host keeps {settle_seconds} s")
+    if settle_seconds != needed_seconds:
+        print(f"FAIL settle seconds: pipeline.h keeps {settle_seconds}, the ease needs {needed_seconds}")
+        fails += 1
+    for hz in (60, 240):
+        frames = settle_runs + math.ceil(settle_seconds * hz)
+        for a, b in ((1060.0, 31.8), (31.8, 1060.0)):
+            gains = run_frames([flat_bins(b)] * frames, last_disp=solve_settled(flat_bins(a))[1],
+                               smoothing=SMOOTHING_SECONDS, frame_seconds=1.0 / hz)[0]
+            settled = solve_settled(flat_bins(b))[2]
+            off = [abs(math.log2(g / settled)) for g in gains]
+            if off[-1] > tolerance:
+                print(f"FAIL ease {a} -> {b} nits at {hz} Hz: gain off by {off[-1]:.5f} when the host stops")
+                fails += 1
+                continue
+            took = next(i for i in range(len(off)) if max(off[i:]) <= tolerance) + 1
+            print(f"  {a:6.1f} -> {b:6.1f} nits at {hz} Hz: within tolerance after {took / hz:.3f} s of {frames / hz:.3f} s")
 
     # 8. Each null test curve check's raw loads are the ones the boost settles on the named out APL for, which with
     # every fill below the ceiling is the out APL over its compensation. The bright window check's patches show their

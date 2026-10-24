@@ -12,10 +12,6 @@
 
 namespace {
 
-// Runs after a content change that keep DWM composing while the gain settles. Each solve leaves at most 0.765
-// of the gain error, the steepest slope of the compensation table, so 22 take the largest possible jump under
-// half a 10-bit PQ code.
-const int SETTLE_RUNS = 22;
 const double PRIME_MIN_GAP_MS = 1000.0;
 
 // Host config mirror (written by the watcher thread, read in the present path).
@@ -45,6 +41,8 @@ struct MonitorState
 
     LARGE_INTEGER freq = {};
     LONGLONG lastPrimeQpc = 0;
+    LONGLONG lastRunQpc = 0;
+    LONGLONG runsSettledQpc = 0;
     int runsSinceContent = 0;
     uint32_t lastResetGeneration = 0;
     bool initialized = false;
@@ -79,6 +77,8 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     s.primed = false;
     QueryPerformanceFrequency(&s.freq);
     s.lastPrimeQpc = 0;
+    s.lastRunQpc = 0;
+    s.runsSettledQpc = 0;
     s.runsSinceContent = 0;
     s.lastResetGeneration = g_resetGeneration.load();
     s.initialized = true;
@@ -306,13 +306,17 @@ __int64 __fastcall PresentDetour(void* self, void* overlaySwapChain, unsigned in
                             rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
                             if (SUCCEEDED(s.dev->CreateRenderTargetView(bb, &rd, &bbRTV)))
                             {
-                                if (s.runsSinceContent < SETTLE_RUNS) ++s.runsSinceContent;
+                                if (s.runsSinceContent < SETTLE_RUNS && ++s.runsSinceContent == SETTLE_RUNS)
+                                    s.runsSettledQpc = now.QuadPart;
+
+                                float frameMs = (float)MsSince(s, s.lastRunQpc);
+                                s.lastRunQpc = now.QuadPart;
 
                                 StateBlock sb;
                                 __try
                                 {
                                     SaveState(s.ctx, sb);
-                                    s.pipe.Run(s.ctx, bbRTV, resetThisRun, g_monLitFraction.load());
+                                    s.pipe.Run(s.ctx, bbRTV, resetThisRun, g_monLitFraction.load(), frameMs);
                                     RestoreState(s.ctx, sb);
                                 }
                                 __except (EXCEPTION_EXECUTE_HANDLER)
@@ -344,7 +348,8 @@ __int64 __fastcall PresentDetour(void* self, void* overlaySwapChain, unsigned in
                         // Settle/content signalling: keep DWM composing this monitor while the clean copy is
                         // not primed or the gain is still settling on the latest content.
                         if (newContent) s.runsSinceContent = 0;
-                        bool settlePending = (!s.primed) || (s.runsSinceContent < SETTLE_RUNS);
+                        bool settlePending = (!s.primed) || (s.runsSinceContent < SETTLE_RUNS) ||
+                                             (MsSince(s, s.runsSettledQpc) < SETTLE_SECONDS * 1000.0);
                         if (settlePending || newContent)
                         {
                             OpenEventsLazily(s);

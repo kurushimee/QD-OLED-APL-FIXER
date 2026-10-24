@@ -3,7 +3,8 @@
 // The algorithm and output match the ReShade shader at its current defaults. Only the scRGB input
 // path is kept (DWM composes into FP16 scRGB); the PQ-input branch, the fast-PQ decode table, the
 // OSD, the compression heatmap, the debug graph, the calibration LUT, and every runtime uniform are
-// removed, their values baked below. ReShade intrinsics are replaced with plain HLSL: tex2Dstore ->
+// removed, their values baked below. ReShade's frame time comes from the host in the constant buffer.
+// ReShade intrinsics are replaced with plain HLSL: tex2Dstore ->
 // RWTexture store, tex2Dfetch -> Load, atomicAdd -> InterlockedAdd, atomicMax -> InterlockedMax,
 // barrier -> GroupMemoryBarrierWithGroupSync.
 //
@@ -22,6 +23,7 @@
 static const float APLReferenceWhiteNits = 1060.0;
 static const float PanelPeakNits         = 1060.0;
 static const float SIGNAL_REFERENCE_NITS = 80.0;   // scRGB 1.0
+static const float APLSmoothingSeconds   = 0.5;
 
 // Full-frame histogram layout. Each 16x16 group processes one 32x32 pixel tile.
 #define APL_FFH_TILE_SIZE        32
@@ -69,6 +71,7 @@ cbuffer BoostCB : register(b0)
     uint  BufferWidthPx;   // target back-buffer size; sets the histogram geometry
     uint  BufferHeightPx;
     float LitFraction;     // share of the native panel the buffer covers; the rest is black bars
+    float FrameTime;       // milliseconds since the last run, as ReShade's frametime
 };
 
 #define BUFFER_WIDTH  int(BufferWidthPx)
@@ -360,6 +363,15 @@ float SceneGainFromLogGain(float sceneLogGain)
     return exp2(max(sceneLogGain, 0.0));
 }
 
+float ComputeTemporalBlendFactor(float smoothingSeconds)
+{
+    if (smoothingSeconds <= 1e-6)
+        return 1.0;
+
+    float dtSeconds = max(FrameTime, 0.0) * 0.001;
+    return saturate(1.0 - exp(-dtSeconds / max(smoothingSeconds, 1e-6)));
+}
+
 
 // -------- histogram quantization and binning --------
 
@@ -459,7 +471,7 @@ int2 APL_RowHistogramCoord(int rowIndex, int binIndex)
 
 // =====================================================================================
 // Pass 1: copy the last run's solve and clear the row histograms and the frame top. APLInstant holds the last
-// run's raw APL, solved display APL, and a written flag.
+// run's raw APL, solved display APL, and a written flag, and in its second texel the track's load and the eased APL.
 // SRV  t0 = APLInstant
 // UAV  u0 = RowHistCount u1 = RowHistOffset10 u2 = RowHistMaxNits u3 = RowHistLoad u4 = APLPrev
 //      u5 = RowHistOffsetSq u6 = FrameTop
@@ -487,6 +499,7 @@ void CS_Setup(uint3 threadID : SV_GroupThreadID)
             instantData.z = 0.0;
 
         Setup_APLPrev[int2(0, 0)] = instantData;
+        Setup_APLPrev[int2(1, 0)] = Setup_APLInstant.Load(int3(1, 0, 0));
         Setup_FrameTop[int2(0, 0)] = 0;
     }
 
@@ -1188,6 +1201,20 @@ float APL_FitAndCost(int localIndex, float gain, float comp, float costWidth, So
     return APL_SumEvalSums(localIndex).x;
 }
 
+// The APL a frame shows through the curve the last fit left. The gain is known before the frame shows, so its load is
+// measured through its own curve.
+float APL_ShownAPL(int localIndex, float pixelCount, float sceneNits, float maxChannelNits, float loadNits)
+{
+    BoostCurve curve = UnpackBoostCurve(APL_EvalBoostParams[0], APL_EvalBoostParams[1]);
+
+    float boostScale = 1.0;
+    if (sceneNits > 1e-6)
+        boostScale = APL_BinBoostScale(sceneNits, maxChannelNits, curve);
+
+    APL_EvalSums[localIndex] = float2(saturate(loadNits * boostScale / max(APLReferenceWhiteNits, 1.0)), 1.0) * pixelCount;
+    return APL_AverageFromSums(APL_SumEvalSums(localIndex));
+}
+
 [numthreads(APL_EVAL_THREADS, 1, 1)]
 void CS_Solve(uint3 threadID : SV_GroupThreadID)
 {
@@ -1226,20 +1253,27 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
     bin.maxChannelSpan = maxChannelSpan;
     bin.slot = APL_LitBinSlot(localIndex, pixelCount);
 
-    // The panel dims each frame for the load of the frame before it, the last one it has fully received, so the
-    // compensation cancels the dimming that load calls for. While nothing new is composed the panel keeps showing
-    // that frame, so its load still holds. Without history the panel last showed the frame unboosted.
+    // The panel dims each frame for the load of the frame before it, the last one it has fully received. The track
+    // follows that without smoothing. Each frame it takes the compensation for its last load and measures the load
+    // the frame shows through the curve that gives, so it lands where the compensation stops moving. The shown
+    // compensation eases toward the track's load over the smoothing time. While nothing new is composed the panel keeps
+    // showing that frame, so its load still holds. Without history the panel last showed the frame unboosted.
     float4 lastFrame = Solve_APLPrev.Load(int3(0, 0, 0));
-    float lastDisplayAPL = (lastFrame.z > 0.0) ? lastFrame.y : APL_AverageFromSums(rawSums);
-    float comp = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(lastDisplayAPL));
+    float2 lastTrack = Solve_APLPrev.Load(int3(1, 0, 0)).xy;
+    bool hasHistory = lastFrame.z > 0.0;
+    float trackAPL = hasHistory ? lastTrack.x : APL_AverageFromSums(rawSums);
+    float easedAPL = hasHistory ? lerp(lastTrack.y, trackAPL, ComputeTemporalBlendFactor(APLSmoothingSeconds)) : trackAPL;
+    float trackComp = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(trackAPL));
+    float comp = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(easedAPL));
     float costWidth = APL_BuildCostGrid(localIndex, bin);
 
     // The gain that costs the frame the least, by golden section on its log up to the table's top compensation, held
-    // under this frame's compensation. While the bracket's top never comes down the cost falls all the way to the top,
-    // so the compensation wins and a frame that fits stays exact. The search runs every frame, since barriers cannot
-    // sit inside a branch on the frame's content.
+    // under the compensation. While the bracket's top never comes down the cost falls all the way to the top, so the
+    // compensation wins and a frame that fits stays exact. The search runs every frame, since barriers cannot sit
+    // inside a branch on the frame's content.
     const float golden = 0.5 * (sqrt(5.0) - 1.0);
-    const int finalFit = BOOST_GAIN_SEARCH_STEPS + 2;
+    const int trackFit = BOOST_GAIN_SEARCH_STEPS + 2;
+    const int finalFit = trackFit + 1;
     float lo = 0.0;
     float hi = APL_ANCHORS[APL_ANCHOR_COUNT - 1].y * log(2.0);
     float a = hi - golden * hi;
@@ -1248,15 +1282,24 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
     float costB = 0.0;
     bool fillA = true;
     bool lowered = false;
+    float trackLoad = 0.0;
 
     // Every fit runs from this one call site, so the shader holds one copy of the fit, which runs faster than four. The
-    // first two fits cost both inner points, each step after costs the point its shift adds, the last fits the gain.
+    // first two fits cost both inner points and each step after costs the point its shift adds. The track's fit then
+    // measures the load the track's compensation gives, and the last fit leaves the shown curve.
     [loop]
     for (int fit = 0; fit <= finalFit; ++fit)
     {
         float best = (costA < costB) ? a : b;
-        float gain = (fit < finalFit) ? exp(fillA ? a : b) : (lowered ? min(exp(best), comp) : comp);
-        float cost = APL_FitAndCost(localIndex, gain, comp, costWidth, bin);
+        float fitComp = (fit == trackFit) ? trackComp : comp;
+        float gain = (fit < trackFit) ? exp(fillA ? a : b) : (lowered ? min(exp(best), fitComp) : fitComp);
+        float cost = APL_FitAndCost(localIndex, gain, fitComp, costWidth, bin);
+
+        if (fit == trackFit)
+            trackLoad = APL_ShownAPL(localIndex, pixelCount, sceneNits, maxChannelNits, loadNits);
+
+        if (fit >= trackFit)
+            continue;
 
         if (fillA)
             costA = cost;
@@ -1284,15 +1327,7 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
         }
     }
 
-    BoostCurve curve = UnpackBoostCurve(APL_EvalBoostParams[0], APL_EvalBoostParams[1]);
-
-    // The gain is known before this frame shows, so its load is measured through this frame's curve.
-    float boostScale = 1.0;
-    if (sceneNits > 1e-6)
-        boostScale = APL_BinBoostScale(sceneNits, maxChannelNits, curve);
-
-    APL_EvalSums[localIndex] = float2(saturate(loadNits * boostScale / max(APLReferenceWhiteNits, 1.0)), 1.0) * pixelCount;
-    float2 displaySums = APL_SumEvalSums(localIndex);
+    float shownAPL = APL_ShownAPL(localIndex, pixelCount, sceneNits, maxChannelNits, loadNits);
 
     Solve_BoostCurve[int2(localIndex + 1, 0)] = APL_CurveNodes[localIndex + 1];
 
@@ -1301,7 +1336,8 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
         Solve_BoostCurve[int2(0, 0)] = APL_CurveNodes[0];
         Solve_BoostParams[int2(0, 0)] = APL_EvalBoostParams[0];
         Solve_BoostParams[int2(1, 0)] = APL_EvalBoostParams[1];
-        Solve_APLInstant[int2(0, 0)] = float4(APL_AverageFromSums(rawSums), APL_AverageFromSums(displaySums), 1.0, 0.0);
+        Solve_APLInstant[int2(0, 0)] = float4(APL_AverageFromSums(rawSums), shownAPL, 1.0, 0.0);
+        Solve_APLInstant[int2(1, 0)] = float4(trackLoad, easedAPL, 0.0, 0.0);
     }
 }
 

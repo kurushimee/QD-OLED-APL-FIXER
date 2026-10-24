@@ -56,8 +56,8 @@ bool BoostPipeline::Create(ID3D11Device* dev, UINT w, UINT h)
     ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, globalMaxNits);
     ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, globalLoad);
     ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, globalOffsetSq);
-    ok &= CreateTex(dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplInstant);
-    ok &= CreateTex(dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplPrev);
+    ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplInstant);
+    ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplPrev);
     ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, boostParams);
     ok &= CreateTex(dev, BOOST_CURVE_CELLS + 1, 1, DXGI_FORMAT_R32_FLOAT, true, true, boostCurve);
 
@@ -69,7 +69,7 @@ bool BoostPipeline::Create(ID3D11Device* dev, UINT w, UINT h)
     ok &= SUCCEEDED(dev->CreatePixelShader(g_PS_Boost, sizeof(g_PS_Boost), nullptr, &psBoost));
 
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = 16; cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.ByteWidth = 32; cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     ok &= SUCCEEDED(dev->CreateBuffer(&cbd, nullptr, &cb));
 
@@ -77,15 +77,16 @@ bool BoostPipeline::Create(ID3D11Device* dev, UINT w, UINT h)
     return ok;
 }
 
-void BoostPipeline::Run(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv, bool reset, float litFraction)
+void BoostPipeline::Run(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv, bool reset, float litFraction, float frameMs)
 {
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(c->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)))
     {
-        struct CB { uint32_t reset; uint32_t width, height; float litFraction; } data = {};
+        struct CB { uint32_t reset; uint32_t width, height; float litFraction; float frameMs; float pad[3]; } data = {};
         data.reset = reset ? 1u : 0u;
         data.width = width; data.height = height;
         data.litFraction = litFraction;
+        data.frameMs = frameMs;
         memcpy(map.pData, &data, sizeof(data));
         c->Unmap(cb, 0);
     }

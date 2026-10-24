@@ -30,7 +30,6 @@ using DirectX::PackedVector::XMConvertHalfToFloat;
 namespace {
 
 const double SCRGB_NITS = 80.0;
-const int FRAMES = 200;
 const int WOBBLE_FRAMES = 20;
 const int TIMED_FRAMES = 100;
 const int TIMED_BATCHES = 8;
@@ -279,6 +278,15 @@ double Wobble(const std::vector<float>& gains)
     return wobble;
 }
 
+// The time between runs on the desktop, one refresh of the primary display.
+float RefreshMs()
+{
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode);
+    return 1000.0f / float(mode.dmDisplayFrequency);
+}
+
 // GPU milliseconds of one run of work, over a batch of runs that repeat the settled frame.
 template <typename Work>
 double TimeBatch(ID3D11Device* dev, ID3D11DeviceContext* ctx, Work work)
@@ -359,17 +367,20 @@ int Run(const wchar_t* sourcePath, const wchar_t* outputPath)
     if (FAILED(dev->CreateTexture2D(&targetDesc, nullptr, &target)) || FAILED(dev->CreateRenderTargetView(target.Get(), nullptr, &rtv)))
         return 1;
 
-    // The first frame has no history, as when the hook starts on fresh content.
+    // The first frame has no history, as when the hook starts on fresh content. The frames run as long as the host
+    // keeps DWM composing, and some more to see how far the gain still moves.
+    const float frameMs = RefreshMs();
+    const int frames = SETTLE_RUNS + int(std::ceil(SETTLE_SECONDS * 1000.0 / frameMs)) + WOBBLE_FRAMES;
     std::vector<float> gains;
-    for (int frame = 0; frame < FRAMES; ++frame)
+    for (int frame = 0; frame < frames; ++frame)
     {
-        pipe.Run(ctx.Get(), rtv.Get(), frame == 0, 1.0f);
+        pipe.Run(ctx.Get(), rtv.Get(), frame == 0, 1.0f, frameMs);
         gains.push_back(ReadBack<float>(dev.Get(), ctx.Get(), pipe.boostParams.t, 4)[0]);
     }
 
     std::vector<float> apl = ReadBack<float>(dev.Get(), ctx.Get(), pipe.aplInstant.t, 4);
     std::vector<float> params = ReadBack<float>(dev.Get(), ctx.Get(), pipe.boostParams.t, 4);
-    double gpuMs = TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Run(ctx.Get(), rtv.Get(), false, 1.0f); });
+    double gpuMs = TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Run(ctx.Get(), rtv.Get(), false, 1.0f, frameMs); });
     double solveMs = TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Solve(ctx.Get()); });
 
     Image boosted = FromScRGB(ReadBack<HALF>(dev.Get(), ctx.Get(), target.Get(), 4), source.width, source.height);
@@ -379,8 +390,8 @@ int Run(const wchar_t* sourcePath, const wchar_t* outputPath)
         return 1;
     }
 
-    wprintf(L"raw_apl %.6f out_apl %.6f gain %.6f comp %.6f knee_nits %.3f departure_nits %.3f settle_frames %d wobble %.1e gpu_ms %.4f solve_ms %.4f\n",
-            apl[0], apl[1], params[0], params[6], params[2], PQToNits(params[5]), SettleFrames(gains), Wobble(gains), gpuMs, solveMs);
+    wprintf(L"raw_apl %.6f out_apl %.6f gain %.6f comp %.6f knee_nits %.3f departure_nits %.3f settle_s %.3f wobble %.1e gpu_ms %.4f solve_ms %.4f\n",
+            apl[0], apl[1], params[0], params[6], params[2], PQToNits(params[5]), SettleFrames(gains) * frameMs / 1000.0, Wobble(gains), gpuMs, solveMs);
     return 0;
 }
 

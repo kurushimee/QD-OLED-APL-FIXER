@@ -34,9 +34,18 @@
     Both states carry the same raw load, 8% APL. In state B half of that light
     gathers into a 900 nit window left of the gap, as when a bright highlight
     comes into view. The patch holds still when the highlight leaves the lower
-    levels alone. The shoulder holds the window down, so state B shows about
-    14% out APL against about 21% in state A, and the 10% vs 25% curve check
-    has to hold first.
+    levels alone. The curve lands the window on the panel peak, so state B
+    shows about 14% out APL against about 21% in state A, and the 10% vs 25%
+    curve check has to hold first.
+
+    The shadow check runs with the boost on, with a 1 nit patch over the loads
+    of out APL 3% and 50%. The boost lifts dark levels by the same gain as the
+    rest, so the patch holds still when the panel dims near-black as much as
+    brighter levels.
+
+    The low end check runs with the boost off over 1% and 3% APL. The measured
+    table starts at 3% and treats lower loads as undimmed, so the patch holds
+    still when the panel does not dim between them.
 
     Goes above the boost in the effect list. Writes scRGB when ReShade reports
     an scRGB back buffer and PQ otherwise, as the boost's automatic input does.
@@ -51,7 +60,7 @@
 
 uniform int Test <
     ui_type = "combo";
-    ui_items = "Gray vs white window (boost off)\0Gray vs red (boost off)\0Gray vs green (boost off)\0Gray vs blue (boost off)\0Gray vs pastel red (boost off)\0Panel latency (boost off)\0Out APL 3% vs 6% (boost on)\0Out APL 6% vs 10% (boost on)\0Out APL 8% vs 12% (boost on)\0Out APL 10% vs 25% (boost on)\0Out APL 25% vs 50% (boost on)\0Out APL 50% vs 80% (boost on)\0Bright window, 150 nit patch (boost on)\0";
+    ui_items = "Gray vs white window (boost off)\0Gray vs red (boost off)\0Gray vs green (boost off)\0Gray vs blue (boost off)\0Gray vs pastel red (boost off)\0Panel latency (boost off)\0Out APL 3% vs 6% (boost on)\0Out APL 6% vs 10% (boost on)\0Out APL 8% vs 12% (boost on)\0Out APL 10% vs 25% (boost on)\0Out APL 25% vs 50% (boost on)\0Out APL 50% vs 80% (boost on)\0Bright window, 150 nit patch (boost on)\0Shadow, 1 nit patch, out APL 3% vs 50% (boost on)\0Low end, APL 1% vs 3% (boost off)\0";
     ui_label = "Test";
 > = 0;
 
@@ -73,10 +82,15 @@ static const float MODEL_CHECK_APL   = 0.05;
 static const int   LATENCY_CHECK     = 5;
 static const int   FIRST_CURVE_CHECK = 6;
 static const int   BRIGHT_WINDOW_CHECK = 12;
+static const int   SHADOW_CHECK      = 13;
+static const int   LOW_END_CHECK     = 14;
 
 static const float BRIGHT_CHECK_APL   = 0.08;
 static const float BRIGHT_PATCH_NITS  = 150.0;
 static const float BRIGHT_WINDOW_NITS = 900.0;
+
+static const float  SHADOW_PATCH_NITS     = 1.0;
+static const float2 LOW_END_CHECK_RAW_APL = float2(0.01, 0.03);
 
 // The boost's load model, a pure panel primary loading the panel this share of white at the same channel level.
 static const float SINGLE_PRIMARY_LOAD = 0.75;
@@ -100,7 +114,7 @@ static const float2 COMP_ANCHORS[COMP_ANCHOR_COUNT] =
 };
 
 // Raw APL of each curve check's two states, which the boost settles on out APL 3/6, 6/10, 8/12, 10/25, 25/50
-// and 50/80%. Reaching 80% takes a fill deep in the shoulder.
+// and 50/80%. Every fill sits below the ceiling, so each is the out APL over its compensation.
 static const float2 CURVE_CHECK_RAW_APL[6] =
 {
     float2(0.0300000, 0.0408906),
@@ -108,7 +122,7 @@ static const float2 CURVE_CHECK_RAW_APL[6] =
     float2(0.0443245, 0.0536377),
     float2(0.0468585, 0.0928066),
     float2(0.0928066, 0.1573113),
-    float2(0.1573113, 0.6140976)
+    float2(0.1573113, 0.2270997)
 };
 
 
@@ -205,7 +219,10 @@ float ScreenLight(float rawAPL)
 
 float PatchNits()
 {
-    return (Test == BRIGHT_WINDOW_CHECK) ? BRIGHT_PATCH_NITS : REFERENCE_PATCH_NITS;
+    if (Test == BRIGHT_WINDOW_CHECK)
+        return BRIGHT_PATCH_NITS;
+
+    return (Test == SHADOW_CHECK) ? SHADOW_PATCH_NITS : REFERENCE_PATCH_NITS;
 }
 
 // Light the load area carries for a raw APL, with the patch's share taken out.
@@ -246,9 +263,22 @@ float3 ColorCheckNits(bool stateB)
     return stateB ? color * (grayNits / ModelLoad(color)) : grayNits.xxx;
 }
 
-float3 CurveCheckNits(bool stateB)
+// Raw APL of the two states of a check that fills the load area with gray.
+float2 FillCheckRawAPL()
 {
-    float2 rawAPL = CURVE_CHECK_RAW_APL[Test - FIRST_CURVE_CHECK];
+    float2 rawAPL = LOW_END_CHECK_RAW_APL;
+
+    if (Test == SHADOW_CHECK)
+        rawAPL = float2(CURVE_CHECK_RAW_APL[0].x, CURVE_CHECK_RAW_APL[4].y);
+    else if (Test < BRIGHT_WINDOW_CHECK)
+        rawAPL = CURVE_CHECK_RAW_APL[Test - FIRST_CURVE_CHECK];
+
+    return rawAPL;
+}
+
+float3 FillCheckNits(bool stateB)
+{
+    float2 rawAPL = FillCheckRawAPL();
     return FillNits(stateB ? rawAPL.y : rawAPL.x).xxx;
 }
 
@@ -288,7 +318,7 @@ float3 PatchCheckNits(int2 pixel, bool stateB)
     else if (Test == BRIGHT_WINDOW_CHECK)
         nits = BrightWindowCheckNits(pixel, stateB);
     else
-        nits = CurveCheckNits(stateB);
+        nits = FillCheckNits(stateB);
 
     return nits;
 }

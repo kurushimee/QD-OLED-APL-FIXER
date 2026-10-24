@@ -40,9 +40,9 @@ The default settings match the calibration target, so most setups need no change
 2. **Look up the compensation.** A measured table tells how much the panel dims at each APL. For example, at 25% APL the panel reaches only about 37% of its peak, so the scene needs about 2.69 times more signal.
 3. **Account for its own boost.** Boosting the image raises the APL, and a higher APL makes the panel dim even more. The shader measures each frame's APL with the boost applied, which is the APL the panel actually sees.
 4. **Cancel the dimming the panel applies.** The panel dims each frame for the APL of the frame before it, the last one it has fully received. The gain for each frame is the compensation for that APL, so every frame is compensated for exactly the dimming it gets, including the first frame after a cut. When the boost changes the APL, the gain settles over the next few frames while each of those frames still gets the right brightness.
-5. **Apply the boost.** Every level up to a knee gets the full gain. The panel cannot show more than its peak divided by the gain, so above the knee a smooth curve in PQ space eases the slope down to a quarter of the PQ contrast and lands the panel peak signal on the panel peak. The knee depends only on the gain, from 692 nits at a gain of 1.2 down to 155 nits at the highest gain of 3.69. Nothing else in the scene moves it, so a level keeps its brightness when a bright sky or lamp comes into view. Levels between the knee and the panel's limit lose a little brightness even with nothing brighter in the frame, and levels above the limit keep a quarter of their PQ contrast.
+5. **Apply the boost.** Levels at full gain show as bright as they do at 3% APL. The panel cannot show more than its peak divided by the gain, the ceiling, so content above the ceiling needs room under the panel peak. Every frame the boost curve is fitted to that frame's histogram, which is ready before the boost runs, so the fit adds no delay. Content the panel can show keeps the full gain, and content above the ceiling keeps at most a quarter of its PQ contrast, with the panel peak signal landing on the panel peak. The room comes first from levels nothing on screen uses, from the top down, and then from the levels on screen by their share of the screen, so a small highlight gives up only its own contrast and a large one also dims what sits under it. A fixed shoulder that depends only on the gain sets a knee, from 692 nits at a gain of 1.2 down to 155 nits at the highest gain of 3.69, and a floor. Below the knee, nothing ever moves. Between the knee and the ceiling, levels follow what is on screen. They are exact when nothing needs the room, and they go down to the fixed shoulder's values, never further, when big bright content fills it.
 
-Luma drives the boost, and all three color channels scale by the same amount, so colors keep their hue. The brightest color channel follows the same curve, which keeps it under the panel peak. The shader never makes any part of the image darker than the source.
+Luma drives the boost, and all three color channels scale by the same amount, so colors keep their hue. The brightest color channel follows the same curve, which keeps it under the panel peak. Above the knee each pixel keeps its own PQ contrast around the curve output of its 3 by 3 neighborhood, so compressed highlights keep their fine detail. Only neighbors above the knee count, so a highlight next to darker content gets no bright rim, but a sharp edge between two compressed levels gets a one-pixel overshoot that is not in the source. The shader never makes any part of the image darker than the source.
 
 The analysis runs only while the boost or the stats display is on.
 
@@ -89,6 +89,7 @@ The shader gives no boost below 3% APL. Between the points, it interpolates the 
 | Panel Peak (nits) | 1060 | Sets the peak signal that the boost eases into. Boosted content never goes past it, and content already above it passes through unchanged. 0 turns highlight protection off. |
 | scRGB Signal Reference (nits) | 80 | Sets the brightness of scRGB value 1.0. It only matters for scRGB games. |
 | Show APL Stats | Off | Shows live numbers in the top right corner. |
+| Show Compression | Off | While the boost is on, shows the image in gray and tints each pixel that shows dimmer than its source level, from yellow for a slight cut to red for the deepest. |
 | OSD Brightness | 0.5 | Sets the brightness of the stats display and the debug graph. It does not change the image. |
 
 The stats display has three rows:
@@ -97,7 +98,7 @@ The stats display has three rows:
 |---|---|
 | RAW APL | APL of the game's image before the boost. |
 | OUT APL | APL that the panel sees after the boost. |
-| KNEE NIT | Output level where the highlight shoulder starts, in nits. It turns orange whenever the boost raises the signal, and shows the panel peak at 3% APL and below, where there is no boost. |
+| KNEE NIT | Output level where the curve first leaves the full gain, in nits. It turns orange while that level sits under the panel peak, so some levels the panel could show lose part of the gain. Otherwise it shows the panel peak in gray, as it does at 3% APL and below, where there is no boost. |
 
 ## Preprocessor definitions
 
@@ -134,10 +135,16 @@ The pattern is a 60-nit gray reference patch inside a wide black gap. The rest o
 | Panel latency | Off | How many frames the panel's dimming lags behind a load change. |
 | Out APL 3% vs 6% through 50% vs 80% | On | Whether the compensation table holds between the two loads. |
 | Bright window, 150 nit patch | On | Whether a bright highlight coming into view leaves lower levels alone. |
+| Shadow, 1 nit patch, out APL 3% vs 50% | On | Whether the panel dims near-black as much as brighter levels, so shadows get the right gain. |
+| Low end, APL 1% vs 3% | Off | Whether the panel holds its peak below 3% APL, where the measured table starts. |
 
 In the model checks with the boost off, both states carry a 5% APL load as the boost counts it, and the RAW APL row of the stats display reads the same in both. The KNEE NIT row there shows what the boost would do if it were on, so it can be ignored. In the curve checks, the OUT APL row lands on the named loads, and the patch sits below the knee at every gain, so it always gets the full gain.
 
-The bright window check uses a 150-nit patch, and both states carry the same 8% raw APL. In state B half of that light gathers into a 900-nit window left of the gap, as when a bright sky or lamp comes into view. The shoulder holds the window down, so state B shows about 14% out APL against about 21% in state A, and the 10% vs 25% curve check has to hold before this one means anything.
+The bright window check uses a 150-nit patch, and both states carry the same 8% raw APL. In state B half of that light gathers into a 900-nit window left of the gap, as when a bright sky or lamp comes into view. The curve lands the window on the panel peak, so state B shows about 14% out APL against about 21% in state A, and the 10% vs 25% curve check has to hold before this one means anything. The patch sits below the knee in both states, so the curve never moves it.
+
+The shadow check uses a 1-nit patch over the loads of the 3% and 50% out APL curve checks. The boost lifts near-black by the same gain as everything else, up to 3.69 times, while the measured table comes from bright windows. A patch that gets brighter in state B means the panel dims near-black less than bright content, so shadows get too much gain.
+
+The low end check runs with the boost off and switches between 1% and 3% APL. The measured table starts at 3%, and the boost treats every lower load as undimmed. A patch that gets dimmer in state B means the panel already dims between 1% and 3%.
 
 A steady patch means the model holds for that test. A patch that is brighter or darker in B means the model is off between the two states. In a model check the panel treats one content as a heavier load than the boost counts, and in a curve check the table's compensation at one load is off relative to the other. A blink at each switch points to timing instead, with the boost's gain and the panel's dimming changing on different frames.
 
@@ -183,7 +190,7 @@ This produces `DwmBoost.exe` and `DwmBoostHook.dll` in `build/bin`. Keep the two
 
 ### Verification
 
-[`DwmBoost/verify/parity_check.py`](DwmBoost/verify/parity_check.py) checks the ported boost math against the shader's values: it confirms the baked compensation table matches the measured panel peaks, the boost never darkens, and midtones get the full gain. It also plays cuts and short flashes frame by frame and confirms every frame gets exactly the dimming the panel applies to it, and that the gain settles on the fixed point `gain = compensation(APL after boost)` within the app's 21 settle frames, the count the table's steepest step calls for. Per gain, it confirms the shoulder keeps the full gain up to the knee and puts the panel peak signal on the panel peak. For a flat full-field frame the GPU histogram collapses to one APL, so this CPU mirror reproduces exactly what the compute passes compute for that frame. Run `python parity_check.py`.
+[`DwmBoost/verify/parity_check.py`](DwmBoost/verify/parity_check.py) mirrors the histogram, the curve fit, the boost and its detail step on the CPU and checks them against the shader's values. It confirms the baked compensation table matches the measured panel peaks, the boost never darkens and rises with the level, and midtones get the full gain. It plays cuts and short flashes frame by frame and confirms every frame gets exactly the dimming the panel applies to it, and that the gain settles on the fixed point `gain = compensation(APL after boost)` within the app's 21 settle frames, the count the table's steepest step calls for. On synthetic scenes, from a lone speck over empty levels to a large bright sky, it confirms the curve keeps the full gain up to the knee, stays exact while nothing on screen needs the room above the ceiling, never falls below the fixed shoulder, moves no level for one added pixel, and settles from any starting gain. It also checks that the detail step keeps its bounds and that the null test's curve checks carry the loads the boost settles on. Run `python parity_check.py`.
 
 ## Credits
 

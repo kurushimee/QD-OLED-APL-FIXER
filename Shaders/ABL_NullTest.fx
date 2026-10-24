@@ -2,19 +2,22 @@
     ABL Null Test
 
     Replaces the frame with a pattern for checking the ABL compensation by eye.
-    A 60 nit gray reference patch sits in the middle of a wide black gap, and
-    the rest of the screen switches between two loads every 720 frames, 3
-    seconds at 240 fps, with a small dim mark under the patch while state B is
-    on. The patch holds still when the panel dims both loads the same, or when
-    the boost cancels the change exactly. The frame rate has to stay at or
-    under the refresh rate, as with G-Sync and a frame cap, so each frame is
-    one refresh.
+    A grid of nine gray patches sits in the middle of a wide black gap, and the
+    rest of the screen switches between two loads once a second. The middle
+    patch keeps its level in both states. In state B the others change by 2%
+    steps in reading order, from four steps dimmer at the top left to four
+    steps brighter at the bottom right, starting one frame after the switch as
+    the panel's own dimming does. The panel dims every patch alike, so the one
+    that holds still reads off how much more the panel dims state B than the
+    model expects, and the middle one holds still when the model is right. The
+    frame rate has to stay at or under the refresh rate, as with G-Sync and a
+    frame cap, so each frame is one refresh.
 
     Model checks run with the boost off. Both states carry the same load, 5%
-    APL, so a pulse means the panel weighs that content differently. The color
-    checks show the panel's own primaries from its EDID and a pastel red
-    halfway between its red and white, each at the level the boost's load
-    model says loads the panel like the gray.
+    APL, so a still patch other than the middle one means the panel weighs
+    that content differently. The color checks show the panel's own primaries
+    from its EDID and a pastel red halfway between its red and white, each at
+    the level the boost's load model says loads the panel like the gray.
 
     The panel latency check also runs with the boost off. The rest of the
     screen switches between 3% and 10% APL, and a black band across the middle
@@ -26,26 +29,27 @@
     patch blinks for as many frames as its delay is off.
 
     Curve checks run with the boost on. Each state's raw load is the one the
-    boost settles on the named out APL for. The patch sits below the shoulder
-    at every gain, so it gets the full gain, and a check holds still when the
-    boost cancels the panel's dimming at both loads and through each switch.
+    boost settles on the named out APL for. The patches sit below the shoulder
+    at every gain, so they get the full gain, and the still patch reads off
+    how far the compensation at state B's load is off from state A's.
 
-    The bright window check also runs with the boost on, with a 150 nit patch.
+    The bright window check also runs with the boost on, with 150 nit patches.
     Both states carry the same raw load, 8% APL. In state B half of that light
     gathers into a 900 nit window left of the gap, as when a bright highlight
-    comes into view. The patch holds still when the highlight leaves the lower
-    levels alone. The curve lands the window on the panel peak, so state B
-    shows about 14% out APL against about 21% in state A, and the 10% vs 25%
-    curve check has to hold first.
+    comes into view. The curve lands the window on the panel peak, so state B
+    shows about 14% out APL against about 21% in state A. Its twin runs the
+    same pattern with the boost off, where both states load the panel the same
+    by the boost's load model, so it tells a window that loads the panel more
+    than its light apart from a table error between those out APLs.
 
-    The shadow check runs with the boost on, with a 1 nit patch over the loads
+    The shadow check runs with the boost on, with 1 nit patches over the loads
     of out APL 3% and 50%. The boost lifts dark levels by the same gain as the
-    rest, so the patch holds still when the panel dims near-black as much as
-    brighter levels.
+    rest, so the middle patch holds still when the panel dims near-black as
+    much as brighter levels.
 
     The low end check runs with the boost off over 1% and 3% APL. The measured
-    table starts at 3% and treats lower loads as undimmed, so the patch holds
-    still when the panel does not dim between them.
+    table starts at 3% and treats lower loads as undimmed, so the middle patch
+    holds still when the panel does not dim between them.
 
     Goes above the boost in the effect list. Writes scRGB when ReShade reports
     an scRGB back buffer and PQ otherwise, as the boost's automatic input does.
@@ -60,30 +64,35 @@
 
 uniform int Test <
     ui_type = "combo";
-    ui_items = "Gray vs white window (boost off)\0Gray vs red (boost off)\0Gray vs green (boost off)\0Gray vs blue (boost off)\0Gray vs pastel red (boost off)\0Panel latency (boost off)\0Out APL 3% vs 6% (boost on)\0Out APL 6% vs 10% (boost on)\0Out APL 8% vs 12% (boost on)\0Out APL 10% vs 25% (boost on)\0Out APL 25% vs 50% (boost on)\0Out APL 50% vs 80% (boost on)\0Bright window, 150 nit patch (boost on)\0Shadow, 1 nit patch, out APL 3% vs 50% (boost on)\0Low end, APL 1% vs 3% (boost off)\0";
+    ui_items = "Gray vs white window (boost off)\0Gray vs red (boost off)\0Gray vs green (boost off)\0Gray vs blue (boost off)\0Gray vs pastel red (boost off)\0Panel latency (boost off)\0Out APL 3% vs 6% (boost on)\0Out APL 6% vs 10% (boost on)\0Out APL 8% vs 12% (boost on)\0Out APL 10% vs 25% (boost on)\0Out APL 25% vs 50% (boost on)\0Out APL 50% vs 80% (boost on)\0Bright window, 150 nit patches (boost on)\0Bright window, 150 nit patches (boost off)\0Shadow, 1 nit patches, out APL 3% vs 50% (boost on)\0Low end, APL 1% vs 3% (boost off)\0";
     ui_label = "Test";
 > = 0;
 
 uniform int FrameCount < source = "framecount"; >;
+uniform float Timer < source = "timer"; >;
 
 
 static const float REFERENCE_PATCH_NITS = 60.0;
 static const float REFERENCE_WHITE_NITS = 1060.0;   // the boost's APL reference white
 static const float SCRGB_REFERENCE_NITS = 80.0;
-static const float MARKER_NITS          = 10.0;
-static const float PATCH_HALF_HEIGHT    = 0.07;     // fractions of the screen height
+static const float PATCH_HALF_HEIGHT    = 0.035;    // fractions of the screen height
 static const float GAP_HALF_HEIGHT      = 0.24;
-static const float MARKER_HALF_HEIGHT   = 0.006;
-static const int   FRAMES_PER_STATE     = 720;
+static const float STATE_MS             = 1000.0;
 
-static const int   MODEL_CHECK_COUNT = 5;
-static const int   PASTEL_CHECK      = 4;
-static const float MODEL_CHECK_APL   = 0.05;
-static const int   LATENCY_CHECK     = 5;
-static const int   FIRST_CURVE_CHECK = 6;
+// Brightness step between neighbouring grid patches, about the smallest change the eye catches at a switch.
+static const float GRID_STEP    = 1.02;
+static const int   GRID_SIDE    = 3;
+static const int   GRID_PATCHES = GRID_SIDE * GRID_SIDE;
+
+static const int   MODEL_CHECK_COUNT   = 5;
+static const int   PASTEL_CHECK        = 4;
+static const float MODEL_CHECK_APL     = 0.05;
+static const int   LATENCY_CHECK       = 5;
+static const int   FIRST_CURVE_CHECK   = 6;
 static const int   BRIGHT_WINDOW_CHECK = 12;
-static const int   SHADOW_CHECK      = 13;
-static const int   LOW_END_CHECK     = 14;
+static const int   BRIGHT_LOAD_CHECK   = 13;    // the bright window pattern with the boost off
+static const int   SHADOW_CHECK        = 14;
+static const int   LOW_END_CHECK       = 15;
 
 static const float BRIGHT_CHECK_APL   = 0.08;
 static const float BRIGHT_PATCH_NITS  = 150.0;
@@ -95,9 +104,8 @@ static const float2 LOW_END_CHECK_RAW_APL = float2(0.01, 0.03);
 // The boost's load model, a pure panel primary loading the panel this share of white at the same channel level.
 static const float SINGLE_PRIMARY_LOAD = 0.75;
 
-static const float2 LATENCY_CHECK_RAW_APL     = float2(0.03, 0.10);
-static const float  LATENCY_PATCH_HALF_HEIGHT = 0.035;
-static const int    LATENCY_PATCH_COUNT       = 5;
+static const float2 LATENCY_CHECK_RAW_APL = float2(0.03, 0.10);
+static const int    LATENCY_PATCH_COUNT   = 5;
 
 // The boost's measured compensation from 3% to 10% APL, as log2 APL in percent and log2 gain.
 static const int    COMP_ANCHOR_COUNT = 8;
@@ -123,6 +131,27 @@ static const float2 CURVE_CHECK_RAW_APL[6] =
     float2(0.0465094, 0.0919340),
     float2(0.0919340, 0.1550000),
     float2(0.1550000, 0.2226900)
+};
+
+
+// The frame of the last switch times two, plus the state it switched to, so the states of the frames before it are
+// known too.
+texture TexSwitch
+{
+    Width = 1;
+    Height = 1;
+    Format = R32I;
+};
+sampler2D<int> SamplerSwitch
+{
+    Texture = TexSwitch;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+};
+storage2D<int> StorageSwitch
+{
+    Texture = TexSwitch;
 };
 
 
@@ -190,15 +219,33 @@ float LookupLogComp(float apl)
     return logComp;
 }
 
+
+[shader("compute")]
+void CS_RecordSwitch()
+{
+    int state = int(Timer / STATE_MS) & 1;
+
+    if ((tex2Dfetch(StorageSwitch, int2(0, 0)) & 1) != state)
+        tex2Dstore(StorageSwitch, int2(0, 0), FrameCount * 2 + state);
+}
+
+// Right for every frame since the switch before the last one, which a one second state covers.
 bool IsStateB(int frame)
 {
-    return ((max(frame, 0) / FRAMES_PER_STATE) & 1) != 0;
+    int record = tex2Dfetch(SamplerSwitch, int2(0, 0));
+    bool stateB = (record & 1) != 0;
+    return (frame >= record / 2) ? stateB : !stateB;
 }
 
 
 int HalfSidePixels(float halfHeight)
 {
     return int(round(halfHeight * BUFFER_HEIGHT));
+}
+
+int PatchHalfSide()
+{
+    return HalfSidePixels(PATCH_HALF_HEIGHT);
 }
 
 bool InsideSquare(int2 pixel, int2 center, int halfSide)
@@ -217,18 +264,68 @@ float ScreenLight(float rawAPL)
     return rawAPL * REFERENCE_WHITE_NITS * BUFFER_WIDTH * BUFFER_HEIGHT;
 }
 
+bool IsBrightWindowTest()
+{
+    return Test == BRIGHT_WINDOW_CHECK || Test == BRIGHT_LOAD_CHECK;
+}
+
 float PatchNits()
 {
-    if (Test == BRIGHT_WINDOW_CHECK)
+    if (IsBrightWindowTest())
         return BRIGHT_PATCH_NITS;
 
     return (Test == SHADOW_CHECK) ? SHADOW_PATCH_NITS : REFERENCE_PATCH_NITS;
 }
 
-// Light the load area carries for a raw APL, with the patch's share taken out.
+// The panel dims a frame for the load of the frame before it, so the patches change a frame after the load does.
+bool GridInStateB()
+{
+    return IsStateB(FrameCount - 1);
+}
+
+// GRID_STEP per patch in reading order, away from the middle patch.
+float GridFactor(int patch, bool stateB)
+{
+    return stateB ? pow(GRID_STEP, patch - GRID_PATCHES / 2) : 1.0;
+}
+
+int2 GridPatchCenter(int patch)
+{
+    int2 cell = int2(patch % GRID_SIDE, patch / GRID_SIDE) - GRID_SIDE / 2;
+    return int2(BUFFER_WIDTH, BUFFER_HEIGHT) / 2 + cell * 3 * PatchHalfSide();
+}
+
+float GridLight()
+{
+    bool stateB = GridInStateB();
+    float light = 0.0;
+
+    [unroll]
+    for (int patch = 0; patch < GRID_PATCHES; ++patch)
+        light += SquareLight(PatchNits() * GridFactor(patch, stateB), PatchHalfSide());
+
+    return light;
+}
+
+float3 GridNits(int2 pixel)
+{
+    bool stateB = GridInStateB();
+    float nits = 0.0;
+
+    [unroll]
+    for (int patch = 0; patch < GRID_PATCHES; ++patch)
+    {
+        if (InsideSquare(pixel, GridPatchCenter(patch), PatchHalfSide()))
+            nits = PatchNits() * GridFactor(patch, stateB);
+    }
+
+    return nits.xxx;
+}
+
+// Light the load area carries for a raw APL, with the grid's share taken out.
 float LoadLight(float rawAPL)
 {
-    return ScreenLight(rawAPL) - SquareLight(PatchNits(), HalfSidePixels(PATCH_HALF_HEIGHT));
+    return ScreenLight(rawAPL) - GridLight();
 }
 
 float LoadPixels()
@@ -299,23 +396,15 @@ float3 BrightWindowCheckNits(int2 pixel, bool stateB)
 
 float3 PatchCheckNits(int2 pixel, bool stateB)
 {
-    int2 center = int2(BUFFER_WIDTH, BUFFER_HEIGHT) / 2;
-    int patchHalf = HalfSidePixels(PATCH_HALF_HEIGHT);
-    int gapHalf = HalfSidePixels(GAP_HALF_HEIGHT);
-    int2 markerCenter = center + int2(0, (patchHalf + gapHalf) / 2);
-
     float3 nits = 0.0.xxx;
-    if (InsideSquare(pixel, center, patchHalf))
-        nits = PatchNits().xxx;
-    else if (stateB && InsideSquare(pixel, markerCenter, HalfSidePixels(MARKER_HALF_HEIGHT)))
-        nits = MARKER_NITS.xxx;
-    else if (InsideSquare(pixel, center, gapHalf))
-        nits = 0.0.xxx;
+
+    if (InsideSquare(pixel, int2(BUFFER_WIDTH, BUFFER_HEIGHT) / 2, HalfSidePixels(GAP_HALF_HEIGHT)))
+        nits = GridNits(pixel);
     else if (Test == 0)
         nits = WindowCheckNits(pixel, stateB);
     else if (Test < MODEL_CHECK_COUNT)
         nits = ColorCheckNits(stateB);
-    else if (Test == BRIGHT_WINDOW_CHECK)
+    else if (IsBrightWindowTest())
         nits = BrightWindowCheckNits(pixel, stateB);
     else
         nits = FillCheckNits(stateB);
@@ -327,9 +416,8 @@ float3 LatencyCheckNits(int2 pixel)
 {
     bool stateB = IsStateB(FrameCount);
     int2 center = int2(BUFFER_WIDTH, BUFFER_HEIGHT) / 2;
-    int patchHalf = HalfSidePixels(LATENCY_PATCH_HALF_HEIGHT);
+    int patchHalf = PatchHalfSide();
     int bandHalf = HalfSidePixels(GAP_HALF_HEIGHT);
-    int2 markerCenter = center + int2(0, (patchHalf + bandHalf) / 2);
 
     float patchLight = 0.0;
     float patchNits = -1.0;
@@ -353,8 +441,6 @@ float3 LatencyCheckNits(int2 pixel)
     float nits = (ScreenLight(rawAPL) - patchLight) / fillPixels;
     if (patchNits >= 0.0)
         nits = patchNits;
-    else if (stateB && InsideSquare(pixel, markerCenter, HalfSidePixels(MARKER_HALF_HEIGHT)))
-        nits = MARKER_NITS;
     else if (bandOffset >= -bandHalf && bandOffset < bandHalf)
         nits = 0.0;
 
@@ -374,6 +460,14 @@ technique ABL_NullTest <
     ui_tooltip = "Replaces the frame with an ABL test pattern. Goes above the boost in the effect list.";
 >
 {
+    pass
+    {
+        ComputeShader = CS_RecordSwitch<1, 1, 1>;
+        DispatchSizeX = 1;
+        DispatchSizeY = 1;
+        DispatchSizeZ = 1;
+    }
+
     pass
     {
         VertexShader = PostProcessVS;

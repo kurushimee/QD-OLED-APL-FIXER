@@ -41,10 +41,19 @@ add_library(DwmBoostHook SHARED
     hook/dllmain.cpp
     hook/locate.cpp
     hook/flip_disable.cpp
-    hook/present_hook.cpp)
+    hook/present_hook.cpp
+    hook/pipeline.cpp)
 add_dependencies(DwmBoostHook boost_bytecode)
 target_link_libraries(DwmBoostHook PRIVATE minhook d3d11 dxgi d3dcompiler)
 set_target_properties(DwmBoostHook PROPERTIES OUTPUT_NAME "DwmBoostHook")
+
+# --- Verify renderer: the hook's pipeline on a saved HDR frame ---
+add_executable(RenderFrame
+    verify/render_frame.cpp
+    hook/pipeline.cpp)
+add_dependencies(RenderFrame boost_bytecode)
+target_include_directories(RenderFrame PRIVATE hook)
+target_link_libraries(RenderFrame PRIVATE d3d11 windowscodecs ole32)
 
 # --- Tray host ---
 add_executable(DwmBoost WIN32
@@ -57,6 +66,6 @@ target_link_options(DwmBoost PRIVATE "/MANIFESTUAC:NO")
 set_target_properties(DwmBoost PROPERTIES OUTPUT_NAME "DwmBoost")
 
 # Put both next to each other so the host finds the DLL beside itself.
-set_target_properties(DwmBoostHook DwmBoost PROPERTIES
+set_target_properties(DwmBoostHook DwmBoost RenderFrame PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

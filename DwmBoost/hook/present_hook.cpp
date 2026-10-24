@@ -1,6 +1,6 @@
 #include "present_hook.h"
 #include "tile_cover.h"
-#include "boost_bytecode.h"
+#include "pipeline.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -11,13 +11,6 @@
 #pragma comment(lib, "d3d11.lib")
 
 namespace {
-
-// Histogram and curve geometry — must match boost.hlsl.
-const UINT TILE_SIZE = 32;
-const UINT BLOCK_W = 16, BLOCK_H = 16;
-const UINT BOOST_CURVE_CELLS = 512;
-
-UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
 
 // Runs after a content change that keep DWM composing while the gain settles. Each solve leaves at most 0.765
 // of the gain error, the steepest slope of the compensation table, so 22 take the largest possible jump under
@@ -36,31 +29,6 @@ std::atomic<float>    g_monLitFraction{1.0f};
 std::atomic<long>     g_inFlight{0};
 Present_t             g_orig = nullptr;
 
-struct Tex
-{
-    ID3D11Texture2D* t = nullptr;
-    ID3D11ShaderResourceView* srv = nullptr;
-    ID3D11UnorderedAccessView* uav = nullptr;
-    void Release()
-    {
-        if (uav) { uav->Release(); uav = nullptr; }
-        if (srv) { srv->Release(); srv = nullptr; }
-        if (t) { t->Release(); t = nullptr; }
-    }
-};
-
-bool CreateTex(ID3D11Device* dev, UINT w, UINT h, DXGI_FORMAT fmt, bool wantSRV, bool wantUAV, Tex& out)
-{
-    D3D11_TEXTURE2D_DESC d = {};
-    d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
-    d.Format = fmt; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
-    d.BindFlags = (wantSRV ? D3D11_BIND_SHADER_RESOURCE : 0) | (wantUAV ? D3D11_BIND_UNORDERED_ACCESS : 0);
-    if (FAILED(dev->CreateTexture2D(&d, nullptr, &out.t))) return false;
-    if (wantSRV && FAILED(dev->CreateShaderResourceView(out.t, nullptr, &out.srv))) return false;
-    if (wantUAV && FAILED(dev->CreateUnorderedAccessView(out.t, nullptr, &out.uav))) return false;
-    return true;
-}
-
 struct MonitorState
 {
     ID3D11Device* dev = nullptr;
@@ -68,21 +36,7 @@ struct MonitorState
     void* owner = nullptr;
     UINT width = 0, height = 0;
 
-    Tex clean;               // RGBA16F clean copy (SRV)
-    Tex rowCount, rowOffset, rowMaxNits, rowLoad, rowOffsetSq;       // R32_SINT (SRV+UAV)
-    Tex globalCount, frameTop;                                       // R32_SINT (SRV+UAV)
-    Tex globalOffset, globalMaxNits, globalLoad, globalOffsetSq;     // R32_FLOAT (SRV+UAV)
-    Tex aplInstant, aplPrev, boostParams;                            // RGBA32F (SRV+UAV)
-    Tex boostCurve;                                                  // R32_FLOAT (SRV+UAV)
-
-    ID3D11ComputeShader* csSetup = nullptr;
-    ID3D11ComputeShader* csBuild = nullptr;
-    ID3D11ComputeShader* csReduce = nullptr;
-    ID3D11ComputeShader* csSolve = nullptr;
-    ID3D11VertexShader* vsBoost = nullptr;
-    ID3D11PixelShader* psBoost = nullptr;
-    ID3D11Buffer* cb = nullptr;
-
+    BoostPipeline pipe;      // its clean copy is fed from the dirty rects
     TileCover cover;
     bool primed = false;
 
@@ -97,18 +51,7 @@ struct MonitorState
 
     void Release()
     {
-        clean.Release();
-        rowCount.Release(); rowOffset.Release(); rowMaxNits.Release(); rowLoad.Release(); rowOffsetSq.Release();
-        globalCount.Release(); frameTop.Release(); globalOffset.Release(); globalMaxNits.Release(); globalLoad.Release(); globalOffsetSq.Release();
-        aplInstant.Release(); aplPrev.Release(); boostParams.Release();
-        boostCurve.Release();
-        if (csSetup) { csSetup->Release(); csSetup = nullptr; }
-        if (csBuild) { csBuild->Release(); csBuild = nullptr; }
-        if (csReduce) { csReduce->Release(); csReduce = nullptr; }
-        if (csSolve) { csSolve->Release(); csSolve = nullptr; }
-        if (vsBoost) { vsBoost->Release(); vsBoost = nullptr; }
-        if (psBoost) { psBoost->Release(); psBoost = nullptr; }
-        if (cb) { cb->Release(); cb = nullptr; }
+        pipe.Release();
         if (settleEvt) { CloseHandle(settleEvt); settleEvt = nullptr; }
         if (contentEvt) { CloseHandle(contentEvt); contentEvt = nullptr; }
         if (primeEvt) { CloseHandle(primeEvt); primeEvt = nullptr; }
@@ -130,40 +73,7 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     if (!s.ctx) { s.Release(); return false; }
     s.owner = owner; s.width = w; s.height = h;
 
-    const UINT tileCountY = TileCount(h);
-    const UINT rowTexH = tileCountY * BLOCK_H;
-
-    bool ok = true;
-    ok &= CreateTex(s.dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, s.clean);
-    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowCount);
-    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowOffset);
-    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowMaxNits);
-    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowLoad);
-    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowOffsetSq);
-    ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, s.globalCount);
-    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32_SINT, true, true, s.frameTop);
-    ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalOffset);
-    ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalMaxNits);
-    ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalLoad);
-    ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalOffsetSq);
-    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplInstant);
-    ok &= CreateTex(s.dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.aplPrev);
-    ok &= CreateTex(s.dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, s.boostParams);
-    ok &= CreateTex(s.dev, BOOST_CURVE_CELLS + 1, 1, DXGI_FORMAT_R32_FLOAT, true, true, s.boostCurve);
-
-    ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Setup, sizeof(g_CS_Setup), nullptr, &s.csSetup));
-    ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Build, sizeof(g_CS_Build), nullptr, &s.csBuild));
-    ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Reduce, sizeof(g_CS_Reduce), nullptr, &s.csReduce));
-    ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Solve, sizeof(g_CS_Solve), nullptr, &s.csSolve));
-    ok &= SUCCEEDED(s.dev->CreateVertexShader(g_VS_Boost, sizeof(g_VS_Boost), nullptr, &s.vsBoost));
-    ok &= SUCCEEDED(s.dev->CreatePixelShader(g_PS_Boost, sizeof(g_PS_Boost), nullptr, &s.psBoost));
-
-    D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = 16; cbd.Usage = D3D11_USAGE_DYNAMIC;
-    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    ok &= SUCCEEDED(s.dev->CreateBuffer(&cbd, nullptr, &s.cb));
-
-    if (!ok) { s.Release(); return false; }
+    if (!s.pipe.Create(s.dev, w, h)) { s.Release(); return false; }
 
     s.cover.Init(w, h, TILE_SIZE);
     s.primed = false;
@@ -262,96 +172,6 @@ void RestoreState(ID3D11DeviceContext* c, StateBlock& b)
     if (b.ib) b.ib->Release();
 }
 
-void ClearCS(ID3D11DeviceContext* c)
-{
-    ID3D11ShaderResourceView* nSrv[8] = {};
-    ID3D11UnorderedAccessView* nUav[8] = {};
-    c->CSSetShaderResources(0, 8, nSrv);
-    c->CSSetUnorderedAccessViews(0, 8, nUav, nullptr);
-}
-
-void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, bool resetThisRun)
-{
-    ID3D11DeviceContext* c = s.ctx;
-
-    D3D11_MAPPED_SUBRESOURCE map;
-    if (SUCCEEDED(c->Map(s.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)))
-    {
-        struct CB { uint32_t reset; uint32_t width, height; float litFraction; } cb = {};
-        cb.reset = resetThisRun ? 1u : 0u;
-        cb.width = s.width; cb.height = s.height;
-        cb.litFraction = g_monLitFraction.load();
-        memcpy(map.pData, &cb, sizeof(cb));
-        c->Unmap(s.cb, 0);
-    }
-
-    // Pass 1: setup / row clear.
-    ClearCS(c);
-    c->CSSetConstantBuffers(0, 1, &s.cb);
-    {
-        ID3D11ShaderResourceView* srv[1] = { s.aplInstant.srv };
-        ID3D11UnorderedAccessView* uav[7] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowLoad.uav, s.aplPrev.uav, s.rowOffsetSq.uav, s.frameTop.uav };
-        c->CSSetShaderResources(0, 1, srv);
-        c->CSSetUnorderedAccessViews(0, 7, uav, nullptr);
-        c->CSSetShader(s.csSetup, nullptr, 0);
-        c->Dispatch(1, 1, 1);
-    }
-
-    // Pass 2: row histogram build from the clean copy.
-    ClearCS(c);
-    {
-        ID3D11ShaderResourceView* srv[1] = { s.clean.srv };
-        ID3D11UnorderedAccessView* uav[6] = { s.rowCount.uav, s.rowOffset.uav, s.rowMaxNits.uav, s.rowLoad.uav, s.rowOffsetSq.uav, s.frameTop.uav };
-        c->CSSetShaderResources(0, 1, srv);
-        c->CSSetUnorderedAccessViews(0, 6, uav, nullptr);
-        c->CSSetShader(s.csBuild, nullptr, 0);
-        c->Dispatch(TileCount(s.width), TileCount(s.height), 1);
-    }
-
-    // Pass 3: reduce to the global histogram.
-    ClearCS(c);
-    {
-        ID3D11ShaderResourceView* srv[5] = { s.rowCount.srv, s.rowOffset.srv, s.rowMaxNits.srv, s.rowLoad.srv, s.rowOffsetSq.srv };
-        ID3D11UnorderedAccessView* uav[5] = { s.globalCount.uav, s.globalOffset.uav, s.globalMaxNits.uav, s.globalLoad.uav, s.globalOffsetSq.uav };
-        c->CSSetShaderResources(0, 5, srv);
-        c->CSSetUnorderedAccessViews(0, 5, uav, nullptr);
-        c->CSSetShader(s.csReduce, nullptr, 0);
-        c->Dispatch(BLOCK_W, BLOCK_H, 1);
-    }
-
-    // Pass 4: solve, boost parameters.
-    ClearCS(c);
-    {
-        ID3D11ShaderResourceView* srv[7] = { s.globalCount.srv, s.globalOffset.srv, s.globalMaxNits.srv, s.globalLoad.srv, s.aplPrev.srv, s.globalOffsetSq.srv, s.frameTop.srv };
-        ID3D11UnorderedAccessView* uav[3] = { s.aplInstant.uav, s.boostParams.uav, s.boostCurve.uav };
-        c->CSSetShaderResources(0, 7, srv);
-        c->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
-        c->CSSetShader(s.csSolve, nullptr, 0);
-        c->Dispatch(1, 1, 1);
-    }
-    ClearCS(c);
-
-    // Pass 5: fullscreen boost, clean copy -> back buffer.
-    c->OMSetRenderTargets(1, &bbRTV, nullptr);
-    D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)s.width, (float)s.height, 0.0f, 1.0f };
-    c->RSSetViewports(1, &vp);
-    c->IASetInputLayout(nullptr);
-    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    c->VSSetShader(s.vsBoost, nullptr, 0);
-    c->GSSetShader(nullptr, nullptr, 0);
-    c->PSSetShader(s.psBoost, nullptr, 0);
-
-    // Default states: no scissor, no blend, no depth, so the whole frame is replaced whatever DWM left bound.
-    c->RSSetState(nullptr);
-    c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
-    c->OMSetDepthStencilState(nullptr, 0);
-    {
-        ID3D11ShaderResourceView* srv[3] = { s.clean.srv, s.boostParams.srv, s.boostCurve.srv };
-        c->PSSetShaderResources(0, 3, srv);
-    }
-    c->Draw(3, 0);
-}
-
 bool RectInKickZone(const RECT& rc, long w, long h)
 {
     const long kz = DWMBOOST_KICK_ZONE_PX;
@@ -377,7 +197,7 @@ void UpdateCleanCopy(MonitorState& s, ID3D11Texture2D* backBuffer, const RECT* r
         if (r <= l || b <= t) continue;
 
         D3D11_BOX box = { (UINT)l, (UINT)t, 0, (UINT)r, (UINT)b, 1 };
-        s.ctx->CopySubresourceRegion(s.clean.t, 0, (UINT)l, (UINT)t, 0, backBuffer, 0, &box);
+        s.ctx->CopySubresourceRegion(s.pipe.clean.t, 0, (UINT)l, (UINT)t, 0, backBuffer, 0, &box);
         s.cover.Mark(l, t, r, b);
     }
 }
@@ -492,7 +312,7 @@ __int64 __fastcall PresentDetour(void* self, void* overlaySwapChain, unsigned in
                                 __try
                                 {
                                     SaveState(s.ctx, sb);
-                                    RunPipeline(s, bbRTV, resetThisRun);
+                                    s.pipe.Run(s.ctx, bbRTV, resetThisRun, g_monLitFraction.load());
                                     RestoreState(s.ctx, sb);
                                 }
                                 __except (EXCEPTION_EXECUTE_HANDLER)

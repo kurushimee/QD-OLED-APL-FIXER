@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # Numeric parity check for boost.hlsl against the ReShade shader's values.
 #
-# A CPU mirror of the histogram, the curve solve and the boost. It checks that the baked table matches the
-# measured peaks, that from an unboosted frame the gain reaches the closed-loop solve within the host's settle
-# runs, that a flat field shows the full gain up to the panel peak, that through cuts and flashes every frame is
-# compensated for the dimming the panel applies to it, that the curve keeps the full gain up to the knee, stays
-# exact while nothing on screen needs the room above it, never goes past the panel peak, under the fixed shoulder
-# or flatter than its slope where content sits, pins nothing but the top of the content on the panel peak,
-# moves no level by more than the room one added pixel takes or by half a 10-bit code for ten pixels spread over
-# part of the range, that the null test's curve checks carry the loads
-# the boost settles on, and that the settle runs in present_hook.cpp cover the slowest gain convergence the table
-# allows. Run: python parity_check.py
+# A CPU mirror of the histogram, the gain search, the curve solve and the boost. It checks that the baked table
+# matches the measured peaks, that from an unboosted frame the gain reaches the closed-loop solve within the host's
+# settle runs, that a flat field shows its source level up to the panel peak, that through cuts and flashes every
+# frame is compensated for the dimming the panel applies to it, that the curve keeps the full gain up to the knee,
+# stays exact while nothing on screen needs the room above it, never goes past the panel peak, under the fixed
+# shoulder or flatter than its slope where content sits, pins nothing but the top of the content on the panel peak,
+# moves no level, through the gain and the curve, by more than the room one added pixel takes or by half a 10-bit
+# code for ten pixels spread over part of the range, that the null test's curve checks carry the loads the boost
+# settles on, and that the settle runs in present_hook.cpp cover the slowest gain convergence the table allows.
+# Run: python parity_check.py
 
 import math
 import re
@@ -23,7 +23,8 @@ HIGHLIGHT_CONTRAST = 0.25
 KNEE_TRANSITION = 0.04
 DETAIL_PQ = 0.022
 CURVE_CELLS = 512
-CURVE_SOLVE_STEPS = 32
+CURVE_SOLVE_STEPS = 21
+GAIN_SEARCH_STEPS = 12
 SINGLE_PRIMARY_LOAD = 0.75
 
 SCREEN_PIXELS = 2560 * 1440
@@ -276,42 +277,48 @@ def build_curve(gain, bins):
     c["floorSlope"] = floor
 
     # Each slope costs the least for the frame. Flattening a cell costs its pixels DETAIL_PQ times the log of the
-    # contrast they lose, and keeping it shifts every pixel above it down by the room it holds. mu is the shifted
-    # share each PQ step of room is worth. The share per PQ width is averaged over the cells within half the knee
-    # transition, empty ones included, so slopes change smoothly and a level's weight grows from nothing with its
-    # share. Empty levels near content keep some slope that way, and only levels with no share nearby are free.
+    # contrast they lose, and keeping it costs its weight for each PQ step of room it holds. Every pixel above the
+    # cell's middle shifts down by the step, and its contrast against every pixel below grows by it, once for each
+    # order of the pair. mu is what each PQ step of room is worth. The share per PQ width is averaged over the cells
+    # within half the knee transition, empty ones included, so slopes change smoothly and a level's weight grows from
+    # nothing with its share. Empty levels near content keep some slope that way, and only levels with no share nearby
+    # are free.
     c["phase"] = "fitted"
     reach = int(0.5 * KNEE_TRANSITION / width)
     density = []
     for i in range(cells):
         window = share[max(i - reach, 0):min(i + reach + 1, cells)]
         density.append(sum(window) / len(window) / width)
-    above, share_above = [0.0] * cells, 0.0
+    weight, share_above = [0.0] * cells, 0.0
     for i in range(cells - 1, -1, -1):
-        above[i] = share_above + 0.5 * share[i]
+        above = share_above + 0.5 * share[i]
+        weight[i] = above + 2.0 * above * (1.0 - above)
         share_above += share[i]
 
     def slopes(mu):
-        return [cap[i] if mu <= above[i] else min(cap[i], max(floor[i], DETAIL_PQ * density[i] / (mu - above[i])))
+        return [cap[i] if mu <= weight[i] else min(cap[i], max(floor[i], DETAIL_PQ * density[i] / (mu - weight[i])))
                 for i in range(cells)]
 
     def rise(slope):
         return knee_u + sum(s * n for s, n in zip(slope, length))
 
-    # At the top price every cell sits on the fixed shoulder.
-    mu_lo, mu_hi = 0.0, 1.0 + max(DETAIL_PQ * d / f for d, f in zip(density, floor))
+    # At the top price every cell sits on the fixed shoulder. Each step prices two values of mu and keeps the third of
+    # the bracket where the rise meets the panel peak.
+    mu_lo, mu_hi = 0.0, max(w + DETAIL_PQ * d / f for w, d, f in zip(weight, density, floor))
     for _ in range(CURVE_SOLVE_STEPS):
-        mu = 0.5 * (mu_lo + mu_hi)
-        if rise(slopes(mu)) > peak:
-            mu_lo = mu
+        mu_a, mu_b = mu_lo + (mu_hi - mu_lo) * 1.0 / 3.0, mu_lo + (mu_hi - mu_lo) * 2.0 / 3.0
+        if rise(slopes(mu_b)) > peak:
+            mu_lo = mu_b
+        elif rise(slopes(mu_a)) > peak:
+            mu_lo, mu_hi = mu_a, mu_b
         else:
-            mu_hi = mu
+            mu_hi = mu_a
     slope = slopes(mu_lo)
 
     # Free levels at the price give up the rest of the room from the top down, which moves only what sits above them.
     excess = rise(slope) - peak
     for i in range(cells - 1, -1, -1):
-        if density[i] <= 0.0 and mu_lo <= above[i] < mu_hi and length[i] > 0.0:
+        if density[i] <= 0.0 and mu_lo <= weight[i] < mu_hi and length[i] > 0.0:
             given = min(max(excess, 0.0), length[i] * (slope[i] - floor[i]))
             slope[i] -= given / length[i]
             excess -= given
@@ -366,6 +373,85 @@ def raw_apl(bins):
     return min(sum(min(b["load"] / APL_REF_WHITE, 1.0) * b["count"] for b in bins) / total, 1.0)
 
 
+def cost_grid(bins):
+    """The frame's brightest channels on CURVE_CELLS equal cells of PQ from black to the frame's top, each bin's share
+    spread evenly in PQ over its span. Each cell's shift weighs once for its own pixels and, with shifts rising with
+    the level, once for each order of every pair it forms, plus against the pixels below it and minus against those
+    above."""
+    top = max(b["top"] for b in bins)
+    width = nits_to_pq(top) / CURVE_CELLS
+    total = sum(b["count"] for b in bins)
+    share = [0.0] * CURVE_CELLS
+    for b in bins:
+        lo, hi = bin_span(b)
+        ua, uz = nits_to_pq(min(lo, top)), nits_to_pq(min(hi, top))
+        s = b["count"] / total
+        if uz - ua < 1e-6:
+            share[min(int(uz / width), CURVE_CELLS - 1)] += s
+            continue
+        for i in range(int(ua / width), min(int(uz / width), CURVE_CELLS - 1) + 1):
+            overlap = min((i + 1) * width, uz) - max(i * width, ua)
+            if overlap > 0.0:
+                share[i] += s * overlap / (uz - ua)
+
+    weight, below = [], 0.0
+    for s in share:
+        weight.append(1.0 + 2.0 * (below - (1.0 - below - s)))
+        below += s
+    return width, share, weight
+
+
+def shown_pq(nits, c):
+    return min(curve_pq(full_gain_pq(nits, c), c), c["peakPQ"])
+
+
+def gain_cost(c, grid):
+    """What the curve costs the frame against the exact levels, less the part only the exact levels make. Each pixel
+    pays its PQ shift, its contrast error against every other pixel, the difference of their shifts, and DETAIL_PQ
+    times the log of the fine contrast it loses across its cell. The exact levels add the same to every gain, so the
+    gain that costs the least is the same whatever the compensation."""
+    width, share, weight = grid
+    cost = 0.0
+    for i, s in enumerate(share):
+        if s <= 0.0:
+            continue
+        shown_lo, shown_hi = shown_pq(pq_to_nits(i * width), c), shown_pq(pq_to_nits((i + 1) * width), c)
+        cost -= s * (weight[i] * 0.5 * (shown_lo + shown_hi) + DETAIL_PQ * math.log(shown_hi - shown_lo))
+    return cost
+
+
+def search_gain(bins):
+    """The gain that costs the frame the least, by golden section on its log up to the table's top compensation, or
+    None while the bracket's top never comes down and the cost falls all the way to the top. The cost leaves out the
+    exact levels, so the search never depends on the compensation, and CS_Solve's search every frame finds this."""
+    grid = cost_grid(bins)
+    golden = 0.5 * (math.sqrt(5.0) - 1.0)
+
+    def cost(log_gain):
+        return gain_cost(build_curve(math.exp(log_gain), bins), grid)
+
+    lo, hi = 0.0, cand_max_log_gain() * math.log(2.0)
+    a, b = hi - golden * hi, golden * hi
+    cost_a, cost_b = cost(a), cost(b)
+    lowered = False
+    for _ in range(GAIN_SEARCH_STEPS):
+        if cost_a < cost_b:
+            hi, b, cost_b = b, a, cost_a
+            a = hi - golden * (hi - lo)
+            cost_a = cost(a)
+            lowered = True
+        else:
+            lo, a, cost_a = a, b, cost_b
+            b = lo + golden * (hi - lo)
+            cost_b = cost(b)
+    return math.exp(a if cost_a < cost_b else b) if lowered else None
+
+
+def choose_gain(searched, comp):
+    """The searched gain held under this frame's compensation, which wins for a frame that fits, so it stays exact."""
+    return comp if searched is None else min(searched, comp)
+
+
 # Scenes.
 def gray(nits):
     return (nits, nits, nits)
@@ -390,12 +476,12 @@ def flat_bins(level):
 
 
 def null_test_pattern(raw, patch_nits, window=False):
-    """ABL_NullTest's patch check at 2560x1440: a patch in a black gap, the rest filled to the raw load, or with half
-    the fill's light gathered into a 900 nit window."""
-    patch, gap = 2 * round(0.07 * 1440), 2 * round(0.24 * 1440)
+    """ABL_NullTest's grid checks at 2560x1440 in state A: nine patches in a black gap, the rest filled to the raw
+    load, or with half the fill's light gathered into a 900 nit window."""
+    patches, gap = 9 * (2 * round(0.035 * 1440)) ** 2, 2 * round(0.24 * 1440)
     load_pixels = SCREEN_PIXELS - gap * gap
-    light = raw * APL_REF_WHITE * SCREEN_PIXELS - patch_nits * patch * patch
-    pixels = [(patch * patch, gray(patch_nits)), (gap * gap - patch * patch, gray(0.0))]
+    light = raw * APL_REF_WHITE * SCREEN_PIXELS - patch_nits * patches
+    pixels = [(patches, gray(patch_nits)), (gap * gap - patches, gray(0.0))]
     if not window:
         return pixels + [(load_pixels, gray(light / load_pixels))]
     side = 2 * round(0.5 * math.sqrt(0.5 * light / 900.0))
@@ -403,36 +489,46 @@ def null_test_pattern(raw, patch_nits, window=False):
     return pixels + [(side * side, gray(900.0)), (load_pixels - side * side, gray(rest))]
 
 
-def run_frames(bins_per_frame, last_disp=None, start_gain=None):
-    """Mirror CS_Solve over consecutive frames. Each frame's gain is the compensation for the display APL of the
-    frame before it, and its own display APL is measured through the curve it gets."""
-    if start_gain is not None:
+def run_frames(bins_per_frame, last_disp=None, start_comp=None):
+    """Mirror CS_Solve over consecutive frames. Each frame's compensation is for the display APL of the frame before
+    it, its gain the one under that costing the frame the least, and its own display APL is measured through the curve
+    it gets."""
+    if start_comp is not None:
         last_disp = None
     elif last_disp is None:
         last_disp = solve_settled(bins_per_frame[0])[1]
-    gains, curves = [], []
+    gains, curves, searched = [], [], {}
     for bins in bins_per_frame:
-        gain = start_gain if last_disp is None else 2.0 ** scene_log_gain(last_disp)
-        c = build_curve(gain, bins)
-        gains.append(gain)
+        comp = start_comp if last_disp is None else 2.0 ** scene_log_gain(last_disp)
+        if id(bins) not in searched:
+            searched[id(bins)] = search_gain(bins)
+        c = build_curve(choose_gain(searched[id(bins)], comp), bins)
+        gains.append(c["gain"])
         curves.append(c)
         last_disp = display_apl(bins, c)
     return gains, curves
 
 
 def solve_settled(bins):
-    """Settled state of a still frame, where the gain is the compensation for the APL it shows. The compensation rises
-    slower than the log gain, so bisection finds the one settled gain."""
+    """Settled state of a still frame, where the compensation is for the APL the frame shows. A higher compensation
+    never picks a lower gain, so the shown APL only rises with it while the compensation for that APL falls, and
+    bisection finds the one settled compensation."""
+    searched = search_gain(bins)
     lo, hi = 0.0, cand_max_log_gain()
     for _ in range(40):
         mid = 0.5 * (lo + hi)
-        if scene_log_gain(display_apl(bins, build_curve(2.0 ** mid, bins))) > mid:
+        if scene_log_gain(display_apl(bins, build_curve(choose_gain(searched, 2.0 ** mid), bins))) > mid:
             lo = mid
         else:
             hi = mid
-    gain = 2.0 ** (0.5 * (lo + hi))
-    c = build_curve(gain, bins)
-    return raw_apl(bins), display_apl(bins, c), gain, c
+    comp = 2.0 ** (0.5 * (lo + hi))
+    c = build_curve(choose_gain(searched, comp), bins)
+    return raw_apl(bins), display_apl(bins, c), c["gain"], c, comp
+
+
+def solve_at(comp, bins):
+    """The curve CS_Solve fits to a frame at this compensation."""
+    return build_curve(choose_gain(search_gain(bins), comp), bins)
 
 
 def smallest_10bit_step():
@@ -482,7 +578,7 @@ def main():
     print(f"\n  level(nits)  rawAPL%  solvedAPL%   gain   gain error after {settle_runs} runs")
     for level in (20, 60, 150, 230, 300, 530, 795, 1060):
         bins = flat_bins(level)
-        raw, disp, gain, _ = solve_settled(bins)
+        raw, disp, gain, _, _ = solve_settled(bins)
         settled = run_frames([bins] * (settle_runs + 1), last_disp=raw)[0][-1]
         error = abs(math.log2(settled / gain))
         print(f"  {level:9.0f}  {raw*100:7.2f}  {disp*100:9.2f}  {gain:6.3f}  {(2.0 ** error - 1.0) * 100:10.3f}%")
@@ -490,27 +586,27 @@ def main():
             print(f"FAIL settling at {level} nits: gain {settled:.4f} after {settle_runs} runs vs solve {gain:.4f}")
             fails += 1
 
-    # 3. A flat field shows the full gain up to the panel peak and the panel peak above it, to under half the
+    # 3. A flat field shows its source level up to the panel peak and the panel peak above it, to under half the
     # smallest 10-bit step.
     step_tolerance = 0.5 * smallest_10bit_step()
     worst = 0.0
     for level in list(range(1, 1061, 10)) + [1500, 4000, 10000]:
-        _, _, gain, c = solve_settled(flat_bins(float(level)))
+        _, _, _, c, comp = solve_settled(flat_bins(float(level)))
         out = boost_nits(float(level), c)
-        exact = min(level * gain, PANEL_PEAK)
+        exact = min(level * comp, PANEL_PEAK)
         worst = max(worst, abs(out / exact - 1.0))
         if abs(out / exact - 1.0) > step_tolerance:
             print(f"FAIL flat field at {level} nits: out {out:.2f}, exact {exact:.2f}")
             fails += 1
-    print(f"\nflat field check: worst miss of the full gain or the panel peak {worst * 100:.3f}%")
+    print(f"\nflat field check: worst miss of the exact level or the panel peak {worst * 100:.3f}%")
 
-    # 4. Shadow/midtone gain is the full table gain below the knee (mid-gray is fully restored).
-    _, _, gain, c = solve_settled(histogram([(SCREEN_PIXELS - 1000, gray(80.0)), (1000, gray(20.0))]))
+    # 4. A midtone below the knee shows its source level (mid-gray is fully restored).
+    _, _, _, c, comp = solve_settled(histogram([(SCREEN_PIXELS - 1000, gray(80.0)), (1000, gray(20.0))]))
     mid_out = boost_nits(20.0, c)
-    if abs(mid_out - 20.0 * gain) > 0.5:
-        print(f"FAIL midtone: 20-nit sample out {mid_out:.3f} vs full-gain {20.0*gain:.3f}")
+    if abs(mid_out - 20.0 * comp) > 0.5:
+        print(f"FAIL midtone: 20-nit sample out {mid_out:.3f} vs exact {20.0*comp:.3f}")
         fails += 1
-    print(f"midtone check: 20-nit sample boosted by full gain {gain:.3f} -> {mid_out:.2f} nits")
+    print(f"midtone check: 20-nit sample boosted by the compensation {comp:.3f} -> {mid_out:.2f} nits")
 
     # 5. Through cuts and a two-frame flash, every frame shows its source level on a panel one frame behind, and
     # the gain settles on the closed-loop solve.
@@ -535,10 +631,10 @@ def main():
     # the panel peak or under the fixed shoulder (beyond the gap a straight cell leaves under its bend), levels rise
     # with the source, the mids stay within half a 10-bit code of exact while the room above them is free (the
     # averaged share thins at a content's edge, so its top cell can give a little), no level gets flatter than the fixed
-    # shoulder, only the top of the content lands on the panel peak, one added pixel moves no level by more than the
-    # room it takes (the cells it gives share and the top it adds) and half a 10-bit code, ten added pixels spread
-    # over part of the range, as sparks or stray highlights, move no level by more than half a 10-bit code, and the
-    # frame loop settles from any gain within the host's settle runs.
+    # shoulder, only the top of the content lands on the panel peak, one added pixel, through the gain it picks and the
+    # curve, moves no level by more than the room it takes (the cells it gives share and the top it adds) and half a
+    # 10-bit code, ten added pixels spread over part of the range, as sparks or stray highlights, move no level by more
+    # than half a 10-bit code, and the frame loop settles from any compensation within the host's settle runs.
     half_code = 0.5 / 1023.0
     scenes = {
         "speck over a gap": ([(0.8, 5, 350), (0.001, 600, 700)], (5, 350)),
@@ -553,13 +649,14 @@ def main():
         "full screen above the ceiling": ([(1.0, 300, 1060)], None),
         "sun over a sky": ([(0.6, 10, 300), (0.2, 300, 2000), (0.001, 4000, 4000)], None),
         "dark room, lamps to 4000": ([(0.02, 5, 100), (0.005, 1060, 4000)], None),
+        "dense snowfield": ([(0.15, 5, 84), (0.85, 84, 1100)], None),
     }
-    print("\n  scene                           gain   curve     knee   1-pixel move (codes, bound)  10-pixel move  "
+    print("\n  scene                           gain   comp   curve     knee   1-pixel move (codes, bound)  10-pixel move  "
           "settle frames from 1.0/2.0/max")
     for name, (parts, exact_range) in scenes.items():
         pixels = scene(parts)
         bins = histogram(pixels)
-        _, _, gain, c = solve_settled(bins)
+        _, _, gain, c, comp = solve_settled(bins)
         fixed = make_curve(gain)
         bend = c["width"] ** 2 / 8.0 * (1.0 - HIGHLIGHT_CONTRAST) / KNEE_TRANSITION
         top = max(hi for _, _, hi in parts)
@@ -575,7 +672,7 @@ def main():
                 problems.append(f"{level:.1f} nits shows at {out:.2f} after {prev:.2f}")
             if nits_to_pq(out) < nits_to_pq(fixed_shoulder_nits(level, fixed)) - bend - 1e-9:
                 problems.append(f"{level:.1f} nits shows under the fixed shoulder")
-            if exact_range and exact_range[0] <= level <= exact_range[1] and abs(nits_to_pq(out) - nits_to_pq(level * gain)) > half_code:
+            if exact_range and exact_range[0] <= level <= exact_range[1] and abs(nits_to_pq(out) - nits_to_pq(level * comp)) > half_code:
                 problems.append(f"{level:.1f} nits misses exact while the room above is free")
             if nits_to_pq(out) >= c["peakPQ"] - half_code and full_gain_pq(level, c) < c["topU"] - half_code / HIGHLIGHT_CONTRAST:
                 problems.append(f"{level:.1f} nits lands on the panel peak below the top of the content")
@@ -592,7 +689,7 @@ def main():
         worst_move, worst_bound = 0.0, 0.0
         for k in range(41):
             speck = c["kneeNits"] * (top / c["kneeNits"]) ** (k / 40)
-            moved = build_curve(gain, histogram(pixels + [(1, gray(speck))]))
+            moved = solve_at(comp, histogram(pixels + [(1, gray(speck))]))
             move = max(abs(nits_to_pq(boost_nits(lv, moved)) - y) for lv, y in zip(knee_levels, base))
             given = sum(1 for a, b in zip(c["share"], moved["share"]) if b > 0.0 and a <= 0.0)
             bound = moved["width"] * given + max(moved["topU"] - c["topU"], 0.0) + half_code
@@ -607,7 +704,7 @@ def main():
             for k in range(windows + 1):
                 start = c["kneeU"] + (1.0 - fraction) * span * k / windows
                 group = [(1, gray(pq_to_nits(start + fraction * span * (j + 0.5) / 10) / gain)) for j in range(10)]
-                moved = build_curve(gain, histogram(pixels + group))
+                moved = solve_at(comp, histogram(pixels + group))
                 move = max((abs(nits_to_pq(boost_nits(lv, moved)) - y) for lv, y in zip(knee_levels, base)), default=0.0)
                 worst_group = max(worst_group, move)
         if worst_group > half_code:
@@ -615,13 +712,13 @@ def main():
 
         settles = []
         for start in (1.0, 2.0, 2.0 ** cand_max_log_gain()):
-            gains = run_frames([bins] * 40, start_gain=start)[0]
+            gains = run_frames([bins] * 40, start_comp=start)[0]
             off = [abs(math.log2(g / gain)) for g in gains]
             settles.append(next((i for i in range(len(off)) if max(off[i:]) <= tolerance), None))
         if any(s is None or s > settle_runs for s in settles):
             problems.append(f"frame loop settles after {settles} frames")
 
-        print(f"  {name:30s}  {gain:5.3f}  {c['phase']:8s}  {c['kneeNits']:6.1f}  {worst_move * 1023:8.2f} / {worst_bound * 1023:5.2f}"
+        print(f"  {name:30s}  {gain:5.3f}  {comp:5.3f}  {c['phase']:8s}  {c['kneeNits']:6.1f}  {worst_move * 1023:8.2f} / {worst_bound * 1023:5.2f}"
               f"              {worst_group * 1023:8.2f}       {settles}")
         for p in problems:
             print(f"FAIL {name}: {p}")
@@ -640,8 +737,8 @@ def main():
         fails += 1
 
     # 8. Each null test curve check's raw loads are the ones the boost settles on the named out APL for, which with
-    # every fill below the ceiling is the out APL over its compensation. The bright window check's patch keeps the
-    # full gain in both states.
+    # every fill below the ceiling is the out APL over its compensation. The bright window check's patches show their
+    # source level in both states.
     named = [(0.03, 0.06), (0.06, 0.10), (0.08, 0.12), (0.10, 0.25), (0.25, 0.50), (0.50, 0.80)]
     print("\n  null test curve check   baked raw APL")
     for (out_a, out_b), (raw_a, raw_b) in zip(named, null_test_curve_loads()):
@@ -655,12 +752,12 @@ def main():
 
     bright = {}
     for state in ("A", "B"):
-        _, disp, gain, c = solve_settled(histogram(null_test_pattern(0.08, 150.0, window=state == "B")))
-        bright[state] = (disp, boost_nits(150.0, c) / gain)
+        _, disp, _, c, comp = solve_settled(histogram(null_test_pattern(0.08, 150.0, window=state == "B")))
+        bright[state] = (disp, boost_nits(150.0, c) / comp)
     print(f"  bright window check     out APL {bright['A'][0]:.1%} in state A, {bright['B'][0]:.1%} in state B, "
-          f"patch shows {bright['A'][1]:.2f} / {bright['B'][1]:.2f} nits")
+          f"patches show {bright['A'][1]:.2f} / {bright['B'][1]:.2f} nits")
     if any(abs(shown / 150.0 - 1.0) > 1e-6 for _, shown in bright.values()):
-        print("FAIL bright window check: the patch misses the full gain")
+        print("FAIL bright window check: the patches miss their source level")
         fails += 1
 
     print("\nALL CHECKS PASSED" if fails == 0 else f"\n{fails} CHECK(S) FAILED")

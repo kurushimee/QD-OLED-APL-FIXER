@@ -2,10 +2,11 @@
     EOTF Boost v8.18.7.15
     Calibrated for 3rd gen QD-OLEDS TB400
 
-    Undoes the panel's automatic brightness limiter (ABL) with a scene-uniform gain
-    equal to the measured compensation at the panel load the boosted frame causes.
+    Undoes the panel's automatic brightness limiter (ABL) with a scene-uniform gain. Full
+    compensation is the gain equal to the measured compensation at the panel load the
+    boosted frame causes.
 
-        gain = compensation(load(boosted frame)),  load = mean luminance / panel peak
+        full gain = compensation(load(boosted frame)),  load = mean luminance / panel peak
 
     The panel can't show more than peak / gain in any channel of a frame boosted this way.
     The boost maps each pixel's brightest channel and scales the others with it, so colors
@@ -17,12 +18,18 @@
     the contrast its share of the shoulder earns and never more than the source has (Ward
     Larson, Rushmeier and Piatko 1997).
 
+    More gain lifts the frame but squeezes more of it into the shoulder, so the gain used is
+    the one between 1 and full compensation that maximizes the shown mean luminance times the
+    detail the curve keeps, weighing 1% of brightness against 1% of detail. A frame that fits
+    under the ceiling keeps all its detail and gets full compensation, and a frame already at
+    the panel's limit, like a screen full of snow, stays close to how it shows unboosted.
+
     Live pipeline:
       1. Frame setup and rolling-row clear
       2. Full-frame row histogram build
       3. Global histogram reduction
-      4. Gain solve, smoothing, and tone curve slopes
-      5. Knee solve and tone curve lookup
+      4. Full compensation solve, gain pick, smoothing, tone curve slopes, and knee solve
+      5. Tone curve lookup
       6. Fullscreen boost and optional calibration LUT
 
     Max Raw Nits is tracked only while the OSD is visible.
@@ -256,7 +263,7 @@ storage2D<float4> StorageToneCurve
 };
 
 
-// Knee bend start and width and the ceiling in PQ, and the bend start in nits.
+// Knee bend start and width and the ceiling in PQ, and the level in nits where the lookup takes over.
 texture TexToneCurveShape
 {
     Width = 1;
@@ -1973,6 +1980,7 @@ groupshared float APL_CurveAbove[APL_FFH_LEVEL_BINS];
 static const int APL_TOP_LEVEL_BIN = 60;
 
 static const int APL_GAIN_SOLVE_STEPS = 10;
+static const int APL_GAIN_PICK_POINTS = 9;
 static const int APL_KNEE_SOLVE_STEPS = 20;
 static const int APL_BEND_MAX_PIECES = 8;
 
@@ -2101,21 +2109,23 @@ float APL_CurveRampIntegral(float bendStart, float bendWidth, float pq)
         pieceStart = pieceEnd;
     }
 
-    return total / bendWidth;
+    return (bendWidth > 0.0) ? total / bendWidth : 0.0;
 }
 
 // The knee bends over a quarter octave, about one histogram bin, and never less than at 1 nit.
-float APL_BendWidthPQ(float kneePQ)
+// It never spans more than the gain lowered the ceiling, so an unboosted frame keeps the panel's own clip.
+float APL_BendWidthPQ(float kneePQ, float ceilingPQ)
 {
     float kneeNits = max(PQToLinearScalar(kneePQ) * 10000.0, 1.0);
     float halfWidth = exp2(0.125);
-    return NitsToPQ(kneeNits * halfWidth) - NitsToPQ(kneeNits / halfWidth);
+    float quarterOctavePQ = NitsToPQ(kneeNits * halfWidth) - NitsToPQ(kneeNits / halfWidth);
+    return min(quarterOctavePQ, NitsToPQ(PANEL_PEAK_NITS) - ceilingPQ);
 }
 
 // Bent curve minus top-down curve where the bend ends. It grows with the knee and is 0 at the right one.
 float APL_KneeMismatch(float kneePQ, float ceilingPQ)
 {
-    float bendWidth = APL_BendWidthPQ(kneePQ);
+    float bendWidth = APL_BendWidthPQ(kneePQ, ceilingPQ);
     float bendStart = kneePQ - 0.5 * bendWidth;
     float bendEnd = bendStart + bendWidth;
     float bentEndPQ = kneePQ + APL_CurveRampIntegral(bendStart, bendWidth, bendEnd);
@@ -2175,10 +2185,12 @@ float APL_LevelBinPixelCount(int levelBin)
     return APL_EvalBinCount[first] + APL_EvalBinCount[first + 1] + APL_EvalBinCount[first + 2] + APL_EvalBinCount[first + 3];
 }
 
-// Builds the tone curve for one gain in groupshared and returns the boosted frame's summed luma.
+// Builds the tone curve for one gain in groupshared and returns the boosted frame's summed luma
+// and the detail it keeps: each lit level bin's pixels times the share of its PQ width the
+// curve keeps, counting only the part of the bin the panel can show at all.
 // Each thread brings its own histogram bin and, below APL_FFH_LEVEL_BINS, its own level bin.
 // Bins are mapped without the knee bend, which moves the load by a fraction of a percent.
-float APL_SumBoostedFrame(int localIndex, float logGain, float binCount, float meanLevelNits, float meanLevelPQ, float lumaSumNits)
+float2 APL_SumBoostedFrame(int localIndex, float logGain, float binCount, float meanLevelNits, float meanLevelPQ, float lumaSumNits)
 {
     float gain = exp2(logGain);
     float ceilingPQ = NitsToPQ(PANEL_PEAK_NITS / gain);
@@ -2230,12 +2242,59 @@ float APL_SumBoostedFrame(int localIndex, float logGain, float binCount, float m
         boostedNits = gain * shownNits / meanLevelNits * lumaSumNits;
     }
 
-    APL_EvalSum[localIndex] = float2(boostedNits, binCount);
-    return APL_ReduceEvalSum(localIndex).x;
+    float keptDetail = 0.0;
+    if (localIndex > 0 && localIndex < APL_FFH_LEVEL_BINS && APL_IsRealLevelBin(localIndex))
+    {
+        float lowerPQ = APL_CurveLowerPQ[localIndex];
+        float upperPQ = APL_CurveUpperPQ[localIndex];
+        float shownLowerPQ = min(lowerPQ, ceilingPQ - APL_CurveAbove[localIndex]);
+        float shownUpperPQ = min(upperPQ, ceilingPQ - (APL_CurveAbove[localIndex] - APL_CurveBinIntegral[localIndex]));
+        float visibleShare = saturate((NitsToPQ(PANEL_PEAK_NITS) - lowerPQ) / widthPQ);
+        keptDetail = APL_LevelBinPixelCount(localIndex) * min((shownUpperPQ - shownLowerPQ) / widthPQ, visibleShare);
+    }
+
+    APL_EvalSum[localIndex] = float2(boostedNits, keptDetail);
+    return APL_ReduceEvalSum(localIndex);
+}
+
+// Shown mean luminance times kept detail, in log, so 1% of brightness weighs as much as 1% of detail.
+float APL_GainScore(float2 frame, float fullLoadNitsSum)
+{
+    float loadPercent = 100.0 * frame.x / fullLoadNitsSum;
+    return log(max(loadPercent, 1e-6)) - log(LookupMeasuredComp1D(loadPercent)) + log(max(frame.y, 1e-6));
+}
+
+// Scores gains from 1 up to full compensation on a grid and takes the vertex of the parabola
+// through the best point and its neighbors, so the pick moves smoothly as the frame changes.
+float APL_PickLogGain(int localIndex, float fullLogGain, float binCount, float meanLevelNits, float meanLevelPQ, float lumaSumNits, float fullLoadNitsSum)
+{
+    float scores[APL_GAIN_PICK_POINTS];
+    float spacing = fullLogGain / float(APL_GAIN_PICK_POINTS - 1);
+
+    [loop]
+    for (int gridIndex = 0; gridIndex < APL_GAIN_PICK_POINTS; ++gridIndex)
+    {
+        float2 frame = APL_SumBoostedFrame(localIndex, spacing * float(gridIndex), binCount, meanLevelNits, meanLevelPQ, lumaSumNits);
+        scores[gridIndex] = APL_GainScore(frame, fullLoadNitsSum);
+    }
+
+    int best = 0;
+
+    [loop]
+    for (int candidate = 1; candidate < APL_GAIN_PICK_POINTS; ++candidate)
+        best = (scores[candidate] > scores[best]) ? candidate : best;
+
+    int center = clamp(best, 1, APL_GAIN_PICK_POINTS - 2);
+    float below = scores[center - 1];
+    float above = scores[center + 1];
+    float curvature = below - 2.0 * scores[center] + above;
+    float offset = (curvature < 0.0) ? 0.5 * (below - above) / curvature : float(best - center);
+
+    return clamp(spacing * (float(center) + offset), max(spacing * float(best - 1), 0.0), min(spacing * float(best + 1), fullLogGain));
 }
 
 [shader("compute")]
-// Pass 4: solve the gain the boosted frame calls for, smooth it, and build its tone curve.
+// Pass 4: solve full compensation, pick the gain up to it, smooth it, and build its tone curve.
 void CS_SolveGainAndToneCurve(uint3 threadID : SV_GroupThreadID)
 {
     bool aplActive = NeedsAPLProcessing();
@@ -2281,7 +2340,7 @@ void CS_SolveGainAndToneCurve(uint3 threadID : SV_GroupThreadID)
     {
         float2 range = APL_SolveLogGainRange;
         float midLogGain = 0.5 * (range.x + range.y);
-        float boostedNitsSum = APL_SumBoostedFrame(localIndex, midLogGain, binCount, meanLevelNits, meanLevelPQ, lumaSumNits);
+        float boostedNitsSum = APL_SumBoostedFrame(localIndex, midLogGain, binCount, meanLevelNits, meanLevelPQ, lumaSumNits).x;
 
         if (localIndex == 0)
         {
@@ -2293,15 +2352,16 @@ void CS_SolveGainAndToneCurve(uint3 threadID : SV_GroupThreadID)
     }
 
     float2 solvedRange = APL_SolveLogGainRange;
-    float solvedLogGain = 0.5 * (solvedRange.x + solvedRange.y);
+    float fullLogGain = 0.5 * (solvedRange.x + solvedRange.y);
+    float pickedLogGain = APL_PickLogGain(localIndex, fullLogGain, binCount, meanLevelNits, meanLevelPQ, lumaSumNits, fullLoadNitsSum);
 
     float4 prevData = tex2Dlod(SamplerAPLPrev, float4(0.5, 0.5, 0.0, 0.0));
     float hasPrev = (prevData.b > 0.0) ? 1.0 : 0.0;
     float alpha = ComputeTemporalBlendFactor(TransitionSpeed);
 
     // Smoothing in log gain covers the same share of a brightness change both ways.
-    float logGain = lerp(solvedLogGain, lerp(prevData.a, solvedLogGain, alpha), hasPrev);
-    float boostedNitsSum = APL_SumBoostedFrame(localIndex, logGain, binCount, meanLevelNits, meanLevelPQ, lumaSumNits);
+    float logGain = lerp(pickedLogGain, lerp(prevData.a, pickedLogGain, alpha), hasPrev);
+    float boostedNitsSum = APL_SumBoostedFrame(localIndex, logGain, binCount, meanLevelNits, meanLevelPQ, lumaSumNits).x;
 
     if (localIndex < APL_FFH_LEVEL_BINS)
     {
@@ -2314,10 +2374,13 @@ void CS_SolveGainAndToneCurve(uint3 threadID : SV_GroupThreadID)
 
     float ceilingPQ = NitsToPQ(PANEL_PEAK_NITS / exp2(logGain));
     float kneePQ = APL_SolveKneePQ(ceilingPQ);
-    float bendWidth = APL_BendWidthPQ(kneePQ);
+    float bendWidth = APL_BendWidthPQ(kneePQ, ceilingPQ);
     float bendStart = kneePQ - 0.5 * bendWidth;
-    float bendStartNits = PQToLinearScalar(bendStart) * 10000.0;
-    tex2Dstore(StorageToneCurveShape, int2(0, 0), float4(bendStart, bendWidth, ceilingPQ, bendStartNits));
+
+    // The lookup takes over at its last entry before the bend, so it continues the source exactly.
+    float lookupStartPQ = floor(bendStart * (TONE_CURVE_LUT_SIZE - 1)) / (TONE_CURVE_LUT_SIZE - 1);
+    float lookupStartNits = PQToLinearScalar(lookupStartPQ) * 10000.0;
+    tex2Dstore(StorageToneCurveShape, int2(0, 0), float4(bendStart, bendWidth, ceilingPQ, lookupStartNits));
 
     if (!aplActive)
     {

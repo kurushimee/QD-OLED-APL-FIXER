@@ -10,12 +10,14 @@
 # shoulder or flatter than its slope where content sits, pins nothing but the top of the content on the panel peak,
 # moves no level, through the gain and the curve, by more than the room one added pixel takes or by half a 10-bit
 # code for ten pixels spread over part of the range, that the null test's curve checks carry the loads the boost
-# settles on, and that the settle runs and seconds in pipeline.h cover the slowest gain convergence the table allows
-# and the slowest ease the smoothing time allows.
+# settles on, that the settle runs and seconds in pipeline.h cover the slowest gain convergence the table allows
+# and the slowest ease the smoothing time allows, and that with smoothing a cut into or out of a frame the gain comes
+# down on moves the shown gain one way.
 # Run: python parity_check.py
 
 import math
 import re
+from itertools import accumulate
 from pathlib import Path
 
 # Baked defaults (must match boost.hlsl).
@@ -98,6 +100,16 @@ def lookup_log_comp_1d(apl_pct):
 
 def scene_log_gain(apl01):
     return max(lookup_log_comp_1d(min(max(apl01, 0.0), 1.0) * 100.0), 0.0)
+
+
+def apl_from_gain(gain):
+    """The APL whose compensation is the gain, the table read the other way."""
+    y = min(max(math.log2(max(gain, 1.0)), APL_ANCHORS[0][1]), APL_ANCHORS[-1][1])
+    i = 0
+    while i < len(APL_ANCHORS) - 2 and APL_ANCHORS[i + 1][1] <= y:
+        i += 1
+    (x0, y0), (x1, y1) = APL_ANCHORS[i], APL_ANCHORS[i + 1]
+    return 2.0 ** seg_lerp(y, y0, x0, y1, x1) / 100.0
 
 
 def cand_max_log_gain():
@@ -494,31 +506,34 @@ def null_test_pattern(raw, patch_nits, window=False):
 
 def run_frames(bins_per_frame, last_disp=None, start_comp=None, smoothing=0.0, frame_seconds=0.0):
     """Mirror CS_Solve over consecutive frames. The track compensates each frame for the display APL it measured on
-    the frame before, through the curve that compensation gives. The shown compensation is for the APL that eases
-    toward the track's over the smoothing time, and each gain is the one under its compensation costing the frame the
-    least."""
+    the frame before, held under the APL whose compensation is that frame's best gain, and measures the display APL
+    through the curve its gain gives. The shown gain is the compensation for the APL that eases toward the one whose
+    compensation is the track's gain over the smoothing time."""
     if start_comp is not None:
-        last_disp = None
-    elif last_disp is None:
-        last_disp = solve_settled(bins_per_frame[0])[1]
+        last_disp = apl_from_gain(start_comp)
     alpha = 1.0 if smoothing <= 1e-6 else 1.0 - math.exp(-frame_seconds / smoothing)
-    track = eased = last_disp
+    load, best_apl, eased = last_disp, 1.0, last_disp
+    if last_disp is None:
+        # The state a still first frame leaves, with its best gain held where the search lowers it.
+        _, load, gain, _, comp = solve_settled(bins_per_frame[0])
+        best = search_gain(bins_per_frame[0])
+        best_apl = 1.0 if best is None else apl_from_gain(best)
+        eased = apl_from_gain(gain) if gain < comp else load
     gains, curves, searched = [], [], {}
     for bins in bins_per_frame:
-        if track is None:
-            comp = track_comp = start_comp
-        else:
-            eased += alpha * (track - eased)
-            comp, track_comp = 2.0 ** scene_log_gain(eased), 2.0 ** scene_log_gain(track)
         if id(bins) not in searched:
             searched[id(bins)] = search_gain(bins)
-        c = build_curve(choose_gain(searched[id(bins)], comp), bins)
-        track_c = c if track_comp == comp else build_curve(choose_gain(searched[id(bins)], track_comp), bins)
+        best = searched[id(bins)]
+        track_apl = min(load, best_apl)
+        track_comp = 2.0 ** scene_log_gain(track_apl)
+        track_gain = choose_gain(best, track_comp)
+        eased += alpha * ((apl_from_gain(track_gain) if track_gain < track_comp else track_apl) - eased)
+        c = build_curve(2.0 ** scene_log_gain(eased), bins)
+        track_c = c if c["gain"] == track_gain else build_curve(track_gain, bins)
         gains.append(c["gain"])
         curves.append(c)
-        track = display_apl(bins, track_c)
-        if eased is None:
-            eased = track
+        load = display_apl(bins, track_c)
+        best_apl = 1.0 if best is None else apl_from_gain(best)
     return gains, curves
 
 
@@ -792,7 +807,24 @@ def main():
             took = next(i for i in range(len(off)) if max(off[i:]) <= tolerance) + 1
             print(f"  {a:6.1f} -> {b:6.1f} nits at {hz} Hz: within tolerance after {took / hz:.3f} s of {frames / hz:.3f} s")
 
-    # 8. Each null test curve check's raw loads are the ones the boost settles on the named out APL for, which with
+    # 8. With smoothing, cuts between a scene the gain comes down on and scenes that fit, settling below and above the
+    # APL it eases on, move the shown gain one way at 60 Hz through the runs the track takes to settle.
+    print("\n  cut at 60 Hz                                         shown gain        ride back (codes)")
+    dense = histogram(scene(scenes["dense snowfield"][0]))
+    for other in ("dark room, lamps to 4000", "big sky over a gap"):
+        fits = histogram(scene(scenes[other][0]))
+        for (a, b), name in (((dense, fits), f"dense snowfield -> {other}"), ((fits, dense), f"{other} -> dense snowfield")):
+            gains = run_frames([a] + [b] * (settle_runs + 8), smoothing=SMOOTHING_SECONDS, frame_seconds=1.0 / 60)[0]
+            logs = [math.log2(g) for g in gains]
+            way = 1.0 if logs[-1] >= logs[0] else -1.0
+            reached = accumulate(logs, max if way > 0 else min)
+            back = max(0.0, max(way * (r - g) for r, g in zip(reached, logs)))
+            print(f"  {name:51s}  {gains[0]:5.3f} -> {gains[-1]:5.3f}      {back / tolerance * 0.5:.6f}")
+            if back > 1e-9:
+                print(f"FAIL cut {name}: the shown gain rides back by {back / tolerance * 0.5:.4f} codes")
+                fails += 1
+
+    # 9. Each null test curve check's raw loads are the ones the boost settles on the named out APL for, which with
     # every fill below the ceiling is the out APL over its compensation. The bright window check's patches show their
     # source level in both states.
     named = [(0.03, 0.06), (0.06, 0.10), (0.08, 0.12), (0.10, 0.25), (0.25, 0.50), (0.50, 0.80)]

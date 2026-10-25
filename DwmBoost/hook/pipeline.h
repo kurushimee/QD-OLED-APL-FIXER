@@ -16,7 +16,7 @@ inline UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
 // half a 10-bit PQ code.
 const int SETTLE_RUNS = 22;
 
-// Seconds after those runs that DWM keeps composing while the shown compensation eases in. Once the runs settle the
+// Seconds after those runs that DWM keeps composing while the shown gain eases in. Once the runs settle the
 // ease's gap shrinks as exp(-t / smoothing time), so from any APL 4.08 s bring the gain under half a 10-bit PQ code.
 const double SETTLE_SECONDS = 4.08;
 

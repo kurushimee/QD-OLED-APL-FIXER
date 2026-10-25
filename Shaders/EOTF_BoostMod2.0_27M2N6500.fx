@@ -41,9 +41,11 @@
     A full-frame histogram of every frame gives its raw APL and the
     display-side APL it shows with the boost applied. The panel dims each frame
     for the display-side APL of the frame before it, so the full gain is the
-    compensation for that load. With smoothing that loop keeps running on its
-    own, and the shown compensation eases toward the load it settles on over
-    the smoothing time.
+    compensation for that load. When content stops needing a lower gain, the
+    loop starts again from the gain it showed. With smoothing that loop keeps
+    running on its own, and the shown gain eases toward the one it settles on
+    over the smoothing time. The ease runs on the APL each gain compensates, so
+    a change of content moves the gain one way.
 
     Live pipeline:
       1. Frame setup and row histogram clear
@@ -355,7 +357,7 @@ sampler3D PQHDRLUTSampler
 #endif
 
 // This frame's raw APL, solved display APL, a written flag and the frame stamp, and in its second texel the track's
-// load and the eased APL.
+// load, the APL whose compensation is the shown gain and the APL whose compensation is the frame's best gain.
 texture TexAPLInstant
 {
     Width = 2;
@@ -1155,6 +1157,22 @@ float ComputeSceneLogGainFromAPL(float currentAPL)
 float SceneGainFromLogGain(float sceneLogGain)
 {
     return exp2(max(sceneLogGain, 0.0));
+}
+
+// The APL whose compensation is the gain, the table read the other way. The compensation rises at every anchor, so
+// each gain up to the top one has a single APL.
+float APLFromSceneGain(float gain)
+{
+    float logGain = clamp(log2(max(gain, 1.0)), APL_ANCHORS[0].y, APL_ANCHORS[APL_ANCHOR_COUNT - 1].y);
+    int a0 = 0;
+    [unroll]
+    for (int i = 0; i < APL_ANCHOR_COUNT - 2; ++i)
+        a0 += int(step(APL_ANCHORS[i + 1].y, logGain));
+
+    float2 p0 = APL_ANCHORS[a0];
+    float2 p1 = APL_ANCHORS[a0 + 1];
+
+    return exp2(SegmentLerp(logGain, p0.y, p0.x, p1.y, p1.x)) * 0.01;
 }
 
 float ComputeTemporalBlendFactor(float smoothingSeconds)
@@ -2868,18 +2886,19 @@ void CS_EvaluateAndSolveAPLFullFrameHistogram(uint3 threadID : SV_GroupThreadID)
     bin.slot = APL_LitBinSlot(localIndex, pixelCount);
 
     // The panel dims each frame for the load of the frame before it, the last one it has fully received. The track
-    // follows that without smoothing. Each frame it takes the compensation for its last load and measures the load
-    // the frame shows through the curve that gives, so it lands where the compensation stops moving. The shown
-    // compensation eases toward the track's load over the smoothing time. While the game presents nothing new the
-    // panel keeps showing that frame, so its load still holds. Without history the panel last showed the frame
-    // unboosted.
+    // follows that without smoothing. Each frame it takes the compensation for its last load, finds its gain under it
+    // and measures the load the frame shows through the curve that gives, so it lands where the compensation stops
+    // moving. It holds that load under the APL whose compensation is the last frame's best gain, so a lowering that
+    // lets go starts the track from the gain it showed. The shown gain eases toward the track's gain over the smoothing
+    // time as the APL whose compensation it is, so a frame that fits eases its load linearly and a change of content
+    // moves the gain one way. While the game presents nothing new the panel keeps showing that frame, so its load
+    // still holds. Without history the panel last showed the frame unboosted.
     float4 lastFrame = tex2Dfetch(SamplerAPLPrev, int2(0, 0));
-    float2 lastTrack = tex2Dfetch(SamplerAPLPrev, int2(1, 0)).xy;
+    float3 lastTrack = tex2Dfetch(SamplerAPLPrev, int2(1, 0)).xyz;
     bool hasHistory = lastFrame.z > 0.0;
-    float trackAPL = hasHistory ? lastTrack.x : APL_AverageFromSums(rawSums);
-    float easedAPL = hasHistory ? lerp(lastTrack.y, trackAPL, ComputeTemporalBlendFactor(APLSmoothingSeconds)) : trackAPL;
+    float lastLoad = hasHistory ? lastTrack.x : APL_AverageFromSums(rawSums);
+    float trackAPL = hasHistory ? min(lastLoad, lastTrack.z) : lastLoad;
     float trackComp = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(trackAPL));
-    float comp = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(easedAPL));
     float costWidth = APL_BuildCostGrid(localIndex, bin);
 
     // The gain that costs the frame the least, by golden section on its log up to the table's top compensation, held
@@ -2898,20 +2917,37 @@ void CS_EvaluateAndSolveAPLFullFrameHistogram(uint3 threadID : SV_GroupThreadID)
     bool fillA = true;
     bool lowered = false;
     float trackLoad = 0.0;
+    float bestAPL = 1.0;
+    float easedAPL = 0.0;
+    float shownGain = 0.0;
+    float shownComp = 0.0;
 
     // Every fit runs from this one call site, so the shader holds one copy of the fit, which runs faster than four. The
     // first two fits cost both inner points and each step after costs the point its shift adds. The track's fit then
-    // measures the load the track's compensation gives, and the last fit leaves the shown curve.
+    // measures the load the track's gain gives, and the last fit leaves the shown curve at the eased gain.
     [loop]
     for (int fit = 0; fit <= finalFit; ++fit)
     {
         float best = (costA < costB) ? a : b;
-        float fitComp = (fit == trackFit) ? trackComp : comp;
-        float gain = (fit < trackFit) ? exp(fillA ? a : b) : (lowered ? min(exp(best), fitComp) : fitComp);
+        float trackGain = lowered ? min(exp(best), trackComp) : trackComp;
+        float gain = (fit < trackFit) ? exp(fillA ? a : b) : ((fit == trackFit) ? trackGain : shownGain);
+        float fitComp = (fit == finalFit) ? shownComp : trackComp;
         float cost = APL_FitAndCost(localIndex, gain, fitComp, costWidth, bin);
 
         if (fit == trackFit)
+        {
             trackLoad = APL_ShownAPL(localIndex, pixelCount, sceneNits, maxChannelNits, loadNits);
+            if (lowered)
+                bestAPL = APLFromSceneGain(exp(best));
+
+            // The compensation is read at the eased APL plus however far the last load sits above the APL the ease
+            // runs toward, which is nothing for a frame that fits, so there the gain matches it exactly.
+            float targetAPL = (trackGain < trackComp) ? APLFromSceneGain(trackGain) : trackAPL;
+            float loweredAPL = lastLoad - targetAPL;
+            easedAPL = hasHistory ? lerp(lastTrack.y, targetAPL, ComputeTemporalBlendFactor(APLSmoothingSeconds)) : targetAPL;
+            shownGain = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(easedAPL));
+            shownComp = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(easedAPL + loweredAPL));
+        }
 
         if (fit >= trackFit)
             continue;
@@ -2952,7 +2988,7 @@ void CS_EvaluateAndSolveAPLFullFrameHistogram(uint3 threadID : SV_GroupThreadID)
         tex2Dstore(StorageBoostParams, int2(0, 0), APL_EvalBoostParams[0]);
         tex2Dstore(StorageBoostParams, int2(1, 0), APL_EvalBoostParams[1]);
         tex2Dstore(StorageAPLInstant, int2(0, 0), float4(APL_AverageFromSums(rawSums), shownAPL, 1.0, float(APL_GetFrameStamp())));
-        tex2Dstore(StorageAPLInstant, int2(1, 0), float4(trackLoad, easedAPL, 0.0, 0.0));
+        tex2Dstore(StorageAPLInstant, int2(1, 0), float4(trackLoad, easedAPL, bestAPL, 0.0));
     }
 }
 

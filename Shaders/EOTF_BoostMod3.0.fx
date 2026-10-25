@@ -928,11 +928,14 @@ static const float NIT_POINTS[NIT_COUNT] =
 
 
 // Live compensation table. Values correspond to COMP_APL_POINTS.
-static const int COMP_APL_COUNT = 14;
+static const int COMP_APL_COUNT = 17;
 
 static const float COMP_APL_POINTS[COMP_APL_COUNT] =
 {
-    3.000000,
+    1.993086,
+    2.632772,
+    3.412472,
+    4.393706,
     5.000000,
     7.000000,
     10.000000,
@@ -948,12 +951,16 @@ static const float COMP_APL_POINTS[COMP_APL_COUNT] =
     100.000000
 };
 
-// Compensation at each load above. Up to 50% the values are taken/approximated from the
-// original denser tables, past it they are the full-field window measurement, input over
-// measured output.
+// Compensation at each load above. Below 5% and past 50% the values are the full-field
+// window measurement, input over measured output, in between they are taken/approximated
+// from the original denser tables. Under 2% the full field reads below 1 from the panel's
+// low-level tracking, which small windows share, so the table starts there.
 static const float COMP_APL_1D[COMP_APL_COUNT] =
 {
-    1.000000, // 3%
+    0.987821, // 2.0%
+    1.121183, // 2.6%
+    1.103268, // 3.4%
+    1.235945, // 4.4%
     1.352556, // 5%
     1.673813, // 7%
     2.151376, // 10%

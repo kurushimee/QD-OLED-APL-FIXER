@@ -2,30 +2,20 @@
 
 DwmBoost runs the EOTF Boost shader on the **whole Windows 11 desktop** by hooking the desktop compositor (`dwm.exe`) and boosting each composed frame, the way [DesktopLUT](https://github.com/sup3rflyer/DesktopLUT) and the `dwm_lut` family do for desktop color calibration.
 
-The shader is `EOTF_BoostMod3.0.fx` (EOTF Boost v8.18.7.15, calibrated for third-generation TB400 QD-OLED panels). It offsets the automatic brightness limiter (ABL) of the panel: it measures the average picture level (APL) of each frame with a rolling full-frame histogram, solves the APL the panel sees after the boost, smooths it over time, and raises the HDR signal by the measured compensation for that APL, scaled by the boost strength. A PQ highlight roll-off fades the added boost out toward the roll-off target.
+The shader is `EOTF_BoostMod3.0.fx` (EOTF Boost v8.18.7.15, calibrated for third-generation TB400 QD-OLED panels). It undoes the automatic brightness limiter (ABL) of the panel with one gain for the whole frame, the measured compensation at the load the boosted frame puts on the panel, where the load is the mean luminance over the panel peak. A rolling full-frame histogram of each pixel's brightest channel measures the frame, a bisection finds the gain that matches its own load, and the gain is smoothed in log2 over time.
+
+A frame boosted this way can show at most the panel peak divided by the gain in any channel. The boost scales each pixel by the tone curve of its brightest channel, so colors keep their channel ratios and no channel passes the peak. Frames that fit under that ceiling show at their source levels. Frames that don't get a shoulder that starts at BT.2390's knee for a source mastered to the panel peak and shown under the ceiling, and the range above the knee is shared out by the frame's own histogram from the ceiling down (Ward Larson, Rushmeier and Piatko 1997), each histogram bin getting no more contrast than the source has.
 
 ## The shader in DWM
 
-[`DwmBoost/hook/boost.hlsl`](DwmBoost/hook/boost.hlsl) holds the shader's code unchanged. A short shim maps ReShade's intrinsics onto plain D3D11 (`tex2Dfetch` to `Load`, `tex2Dstore` to a UAV write, storage atomics to `Interlocked` operations, `barrier` to a group sync), the hook's clean copy of the composed desktop stands in for ReShade's back buffer, and the frame time is measured between runs. The debug graph, the calibration LUT and the tooltips are off in the settings below, so they are left out.
+[`DwmBoost/hook/boost.hlsl`](DwmBoost/hook/boost.hlsl) holds the shader's code unchanged. A short shim maps ReShade's intrinsics onto plain D3D11 (`tex2Dfetch` to `Load`, `tex2Dstore` to a UAV write, storage atomics to `Interlocked` operations, `barrier` to a group sync), the hook's clean copy of the composed desktop stands in for ReShade's back buffer, and the frame time is measured between runs. DWM composes in scRGB, so `BUFFER_COLOR_SPACE` is 2. The debug graph, the calibration LUT and the tooltips are off in the settings below, so they are left out.
 
 The settings are baked in as constants:
 
 | Setting | Value |
 |---|---|
 | Enable EOTF Boost | On |
-| APL Input Mode | scRGB Normalized |
-| APL Reference White (nits) | 150 |
-| Compensation Freeze APL % | 80.0 |
-| Global APL Boost Strength | 0.25 |
-| Enable Per-APL Boost Strength | On |
-| APL 3% / 5% / 7% / 10% Boost Strength | 0.45 / 0.45 / 0.42 / 0.36 |
-| APL 14% / 18% / 22% / 25% Boost Strength | 0.31 / 0.29 / 0.28 / 0.28 |
-| APL 35% / 50% Boost Strength | 0.36 / 0.55 |
-| Boost Roll-Off Target (nits) | 800 |
-| Boost Roll-Off Shape | 1.20 |
 | APL Smoothing Time (s) | 0.50 |
-| Preserve Color by Reducing Boost | On |
-| scRGB Signal Reference (nits) | 150 |
 | Show APL Stats | Off |
 | OSD Brightness | 0.50 |
 
@@ -34,7 +24,6 @@ The settings are baked in as constants:
 | `APL_FULLFRAME_ROLLING_PHASES` | 6 |
 | `ENABLE_APL_GRAPH` | 0 |
 | `ENABLE_UI_TOOLTIPS` | 0 |
-| `PER_APL_BOOST_STRENGTH_ENABLE` | 1 |
 | `PQHDRLUT_ENABLE` | 0 |
 
 ## Using it
@@ -47,7 +36,7 @@ A tray app injects a hook into `dwm.exe` and keeps it resident. Toggling is inst
 - **Ctrl+Alt+Shift+Home** turns it off, which reverts the composition patches so VRR returns.
 - The tray menu has **Enable**, **Disable**, **Install autostart task** (an elevated logon task, no per-launch prompt), and **Quit**. Quit ejects the hook cleanly.
 
-On a static desktop DWM stops composing, so the app nudges the monitor once per refresh with a 1 px corner window after each change, then stops. The histogram takes 6 runs to cover a new frame, and the smoothed APL then closes its gap with a 0.5 s time constant, so the nudging lasts about 3.5 seconds, until the gain is within half a 10-bit PQ code of where it settles.
+On a static desktop DWM stops composing, so the app nudges the monitor once per refresh with a 1 px corner window after each change, then stops. The histogram takes 6 runs to cover a new frame, and the smoothed gain then closes its gap with a 0.5 s time constant, so the nudging lasts about 3 seconds, until the gain is within half a 10-bit PQ code of where it settles.
 
 The tool injects only into Windows 11 25H2 (build 26200 or later) and refuses to inject if any `dwmcore.dll` byte pattern it relies on is missing or ambiguous, which also guards against a future Windows update changing the compositor.
 

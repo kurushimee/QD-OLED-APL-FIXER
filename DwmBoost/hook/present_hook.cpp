@@ -21,15 +21,17 @@ const UINT TILE_SIZE = 32;
 const UINT BLOCK_W = 16, BLOCK_H = 16;
 const UINT ROLLING_PHASES = 6;
 const UINT FAST_PQ_NODES = 129;
+const UINT LEVEL_BINS = 64;
+const UINT TONE_CURVE_LUT_SIZE = 1024;
 
 UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
 UINT RollingRowSlots(UINT px) { return (TileCount(px) + ROLLING_PHASES - 1) / ROLLING_PHASES; }
 
-// After a content change the histogram takes ROLLING_PHASES runs to cover the new frame, then the smoothed APL
-// closes its gap with a 0.5 s time constant. The log gain moves at most 6.36 per unit of APL at the baked
-// settings, and half a 10-bit PQ code is 0.0065 of log2 gain at its steepest, so the gain lands within it after
-// ln(6.36 / 0.0065) = 6.9 time constants.
-const double SMOOTHING_SETTLE_MS = 3450.0;
+// After a content change the histogram takes ROLLING_PHASES runs to cover the new frame, then the smoothed log2
+// gain closes its gap with a 0.5 s time constant. The gap is at most log2(3.940351) = 1.978, the table's full
+// range, and half a 10-bit PQ code is 0.0065 of log2 gain at its steepest, so the gain lands within it after
+// ln(1.978 / 0.0065) = 5.72 time constants.
+const double SMOOTHING_SETTLE_MS = 2865.0;
 const double PRIME_MIN_GAP_MS = 1000.0;
 
 // Host config mirror (written by the watcher thread, read in the present path).
@@ -74,15 +76,16 @@ struct MonitorState
     UINT width = 0, height = 0;
 
     Tex clean;                                                       // RGBA16F clean copy (SRV)
-    Tex apl, candidateBoostParams, boostParams, aplInstant, aplPrev; // RGBA32F (SRV+UAV)
-    Tex fastPQNits;                                                  // R32_FLOAT (SRV+UAV)
-    Tex rowCount, rowOffset10, rowMaxNits, rowMeta, globalCount;     // R32_SINT (SRV+UAV)
-    Tex globalOffset10, globalMaxNits;                               // R32_FLOAT (SRV+UAV)
+    Tex apl, toneCurve, toneCurveShape, aplInstant, aplPrev;         // RGBA32F (SRV+UAV)
+    Tex toneCurveLUT, fastPQNits;                                    // R32_FLOAT (SRV+UAV)
+    Tex rowCount, rowOffset10, rowLumaRatio10, rowMeta, globalCount; // R32_SINT (SRV+UAV)
+    Tex globalOffset10, globalLumaRatio10;                           // R32_FLOAT (SRV+UAV)
 
     ID3D11ComputeShader* csSetup = nullptr;
     ID3D11ComputeShader* csBuild = nullptr;
     ID3D11ComputeShader* csReduce = nullptr;
     ID3D11ComputeShader* csSolve = nullptr;
+    ID3D11ComputeShader* csLookup = nullptr;
     ID3D11VertexShader* vsBoost = nullptr;
     ID3D11PixelShader* psBoost = nullptr;
     ID3D11SamplerState* pointClamp = nullptr;
@@ -106,14 +109,15 @@ struct MonitorState
     void Release()
     {
         clean.Release();
-        apl.Release(); candidateBoostParams.Release(); boostParams.Release(); aplInstant.Release(); aplPrev.Release();
-        fastPQNits.Release();
-        rowCount.Release(); rowOffset10.Release(); rowMaxNits.Release(); rowMeta.Release(); globalCount.Release();
-        globalOffset10.Release(); globalMaxNits.Release();
+        apl.Release(); toneCurve.Release(); toneCurveShape.Release(); aplInstant.Release(); aplPrev.Release();
+        toneCurveLUT.Release(); fastPQNits.Release();
+        rowCount.Release(); rowOffset10.Release(); rowLumaRatio10.Release(); rowMeta.Release(); globalCount.Release();
+        globalOffset10.Release(); globalLumaRatio10.Release();
         if (csSetup) { csSetup->Release(); csSetup = nullptr; }
         if (csBuild) { csBuild->Release(); csBuild = nullptr; }
         if (csReduce) { csReduce->Release(); csReduce = nullptr; }
         if (csSolve) { csSolve->Release(); csSolve = nullptr; }
+        if (csLookup) { csLookup->Release(); csLookup = nullptr; }
         if (vsBoost) { vsBoost->Release(); vsBoost = nullptr; }
         if (psBoost) { psBoost->Release(); psBoost = nullptr; }
         if (pointClamp) { pointClamp->Release(); pointClamp = nullptr; }
@@ -148,23 +152,25 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     bool ok = true;
     ok &= CreateTex(s.dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, s.clean);
     ok &= CreateTex(s.dev, 1, 1, RGBA32F, true, true, s.apl);
-    ok &= CreateTex(s.dev, 3, 1, RGBA32F, true, true, s.candidateBoostParams);
-    ok &= CreateTex(s.dev, 1, 1, RGBA32F, true, true, s.boostParams);
+    ok &= CreateTex(s.dev, LEVEL_BINS, 1, RGBA32F, true, true, s.toneCurve);
+    ok &= CreateTex(s.dev, 1, 1, RGBA32F, true, true, s.toneCurveShape);
+    ok &= CreateTex(s.dev, TONE_CURVE_LUT_SIZE, 1, DXGI_FORMAT_R32_FLOAT, true, true, s.toneCurveLUT);
     ok &= CreateTex(s.dev, 1, 1, RGBA32F, true, true, s.aplInstant);
     ok &= CreateTex(s.dev, 1, 1, RGBA32F, true, true, s.aplPrev);
     ok &= CreateTex(s.dev, FAST_PQ_NODES, 1, DXGI_FORMAT_R32_FLOAT, true, true, s.fastPQNits);
     ok &= CreateTex(s.dev, BLOCK_W + 1, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowCount);
     ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowOffset10);
-    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowMaxNits);
+    ok &= CreateTex(s.dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, s.rowLumaRatio10);
     ok &= CreateTex(s.dev, 1, tileCountY, DXGI_FORMAT_R32_SINT, true, true, s.rowMeta);
     ok &= CreateTex(s.dev, BLOCK_W + 1, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, s.globalCount);
     ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalOffset10);
-    ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalMaxNits);
+    ok &= CreateTex(s.dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, s.globalLumaRatio10);
 
     ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Setup, sizeof(g_CS_Setup), nullptr, &s.csSetup));
     ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Build, sizeof(g_CS_Build), nullptr, &s.csBuild));
     ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Reduce, sizeof(g_CS_Reduce), nullptr, &s.csReduce));
     ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Solve, sizeof(g_CS_Solve), nullptr, &s.csSolve));
+    ok &= SUCCEEDED(s.dev->CreateComputeShader(g_CS_Lookup, sizeof(g_CS_Lookup), nullptr, &s.csLookup));
     ok &= SUCCEEDED(s.dev->CreateVertexShader(g_VS_Boost, sizeof(g_VS_Boost), nullptr, &s.vsBoost));
     ok &= SUCCEEDED(s.dev->CreatePixelShader(g_PS_Boost, sizeof(g_PS_Boost), nullptr, &s.psBoost));
 
@@ -194,10 +200,10 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
     // ReShade creates its textures zeroed, which the shader reads as no history.
     const UINT zeroU[4] = {};
     const FLOAT zeroF[4] = {};
-    for (Tex* t : { &s.apl, &s.candidateBoostParams, &s.boostParams, &s.aplInstant, &s.aplPrev, &s.fastPQNits,
-                    &s.globalOffset10, &s.globalMaxNits })
+    for (Tex* t : { &s.apl, &s.toneCurve, &s.toneCurveShape, &s.toneCurveLUT, &s.aplInstant, &s.aplPrev,
+                    &s.fastPQNits, &s.globalOffset10, &s.globalLumaRatio10 })
         s.ctx->ClearUnorderedAccessViewFloat(t->uav, zeroF);
-    for (Tex* t : { &s.rowCount, &s.rowOffset10, &s.rowMaxNits, &s.rowMeta, &s.globalCount })
+    for (Tex* t : { &s.rowCount, &s.rowOffset10, &s.rowLumaRatio10, &s.rowMeta, &s.globalCount })
         s.ctx->ClearUnorderedAccessViewUint(t->uav, zeroU);
 
     s.cover.Init(w, h, TILE_SIZE);
@@ -213,7 +219,7 @@ bool BuildState(MonitorState& s, ID3D11Texture2D* backBuffer, void* owner, UINT 
 
 // -------- DWM immediate-context state save / restore --------
 
-const UINT SRV_SLOTS = 14, UAV_SLOTS = 7, SAMPLER_SLOTS = 2;
+const UINT SRV_SLOTS = 15, UAV_SLOTS = 6, SAMPLER_SLOTS = 2;
 
 struct StateBlock
 {
@@ -359,29 +365,33 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float frameTime
     c->CSSetSamplers(0, SAMPLER_SLOTS, samplers);
 
     RunCS(c, s.csSetup,
-          { { 1, s.apl.srv }, { 4, s.aplInstant.srv } },
-          { { 0, s.candidateBoostParams.uav }, { 1, s.fastPQNits.uav }, { 2, s.aplPrev.uav },
-            { 3, s.rowCount.uav }, { 4, s.rowOffset10.uav }, { 5, s.rowMaxNits.uav }, { 6, s.rowMeta.uav } },
+          { { 1, s.apl.srv }, { 5, s.aplInstant.srv } },
+          { { 0, s.fastPQNits.uav }, { 1, s.aplPrev.uav },
+            { 2, s.rowCount.uav }, { 3, s.rowOffset10.uav }, { 4, s.rowLumaRatio10.uav }, { 5, s.rowMeta.uav } },
           1, 1);
 
     RunCS(c, s.csBuild,
-          { { 0, s.clean.srv }, { 5, s.aplPrev.srv }, { 6, s.fastPQNits.srv } },
-          { { 3, s.rowCount.uav }, { 4, s.rowOffset10.uav }, { 5, s.rowMaxNits.uav }, { 6, s.rowMeta.uav } },
+          { { 0, s.clean.srv }, { 6, s.aplPrev.srv } },
+          { { 2, s.rowCount.uav }, { 3, s.rowOffset10.uav }, { 4, s.rowLumaRatio10.uav }, { 5, s.rowMeta.uav } },
           TileCount(s.width), RollingRowSlots(s.height));
 
     RunCS(c, s.csReduce,
-          { { 7, s.rowCount.srv }, { 8, s.rowOffset10.srv }, { 9, s.rowMaxNits.srv }, { 10, s.rowMeta.srv } },
-          { { 0, s.globalCount.uav }, { 1, s.globalOffset10.uav }, { 2, s.globalMaxNits.uav } },
+          { { 8, s.rowCount.srv }, { 9, s.rowOffset10.srv }, { 10, s.rowLumaRatio10.srv }, { 11, s.rowMeta.srv } },
+          { { 0, s.globalCount.uav }, { 1, s.globalOffset10.uav }, { 2, s.globalLumaRatio10.uav } },
           BLOCK_W, BLOCK_H);
 
     RunCS(c, s.csSolve,
-          { { 2, s.candidateBoostParams.srv }, { 5, s.aplPrev.srv },
-            { 11, s.globalCount.srv }, { 12, s.globalOffset10.srv }, { 13, s.globalMaxNits.srv } },
-          { { 0, s.aplInstant.uav }, { 1, s.apl.uav }, { 2, s.boostParams.uav } },
+          { { 6, s.aplPrev.srv }, { 12, s.globalCount.srv }, { 13, s.globalOffset10.srv }, { 14, s.globalLumaRatio10.srv } },
+          { { 0, s.toneCurve.uav }, { 1, s.toneCurveShape.uav }, { 2, s.aplInstant.uav }, { 3, s.apl.uav } },
+          1, 1);
+
+    RunCS(c, s.csLookup,
+          { { 2, s.toneCurve.srv }, { 3, s.toneCurveShape.srv } },
+          { { 0, s.toneCurveLUT.uav } },
           1, 1);
     ClearCS(c);
 
-    // Pass 5: fullscreen boost, clean copy -> back buffer.
+    // Pass 6: fullscreen boost, clean copy -> back buffer.
     c->OMSetRenderTargets(1, &bbRTV, nullptr);
     D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)s.width, (float)s.height, 0.0f, 1.0f };
     c->RSSetViewports(1, &vp);
@@ -396,7 +406,7 @@ void RunPipeline(MonitorState& s, ID3D11RenderTargetView* bbRTV, float frameTime
     c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     c->OMSetDepthStencilState(nullptr, 0);
     {
-        ID3D11ShaderResourceView* srv[5] = { s.clean.srv, s.apl.srv, nullptr, s.boostParams.srv, s.aplInstant.srv };
+        ID3D11ShaderResourceView* srv[5] = { s.clean.srv, s.apl.srv, nullptr, s.toneCurveShape.srv, s.toneCurveLUT.srv };
         c->PSSetShaderResources(0, 5, srv);
         c->PSSetSamplers(0, SAMPLER_SLOTS, samplers);
         c->PSSetConstantBuffers(0, 1, &s.cb);

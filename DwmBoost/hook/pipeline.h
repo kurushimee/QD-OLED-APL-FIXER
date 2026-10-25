@@ -17,8 +17,9 @@ inline UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
 const int SETTLE_RUNS = 22;
 
 // Seconds after those runs that DWM keeps composing while the shown gain eases in. Once the runs settle the
-// ease's gap shrinks as exp(-t / smoothing time), so from any APL 4.08 s bring the gain under half a 10-bit PQ code.
-const double SETTLE_SECONDS = 4.08;
+// ease's gap in log gain shrinks as exp(-t / smoothing time), so from any gain 2.85 s bring it under half a 10-bit
+// PQ code.
+const double SETTLE_SECONDS = 2.85;
 
 struct Tex
 {

@@ -57,9 +57,12 @@ static const float APLSmoothingSeconds   = 0.5;
 // Each step of the curve solve keeps a third of its bracket, so 21 make it as narrow as 32 halvings.
 #define BOOST_CURVE_SOLVE_STEPS   21
 
-// Golden section steps of the gain search. Each keeps 0.618 of the bracket, so 12 shrink it from ln 3.77, up to the
-// table's top compensation, to 0.0041, under the 0.0045 in ln of half a 10-bit PQ code at the panel peak.
-#define BOOST_GAIN_SEARCH_STEPS   12
+// Fits that find the frame's gain, on an even grid of log gains from 1 to the table's top compensation and then in
+// passes of two either side of the gain the fits before them give, half as far each pass. On recorded game frames
+// with the flattest costs they keep the gain within 1.5% of the same average taken over 128 gains.
+#define BOOST_GAIN_GRID_POINTS    8
+#define BOOST_GAIN_PASSES         3
+#define BOOST_GAIN_FITS           (BOOST_GAIN_GRID_POINTS + 2 * BOOST_GAIN_PASSES)
 
 // The solve runs one thread per curve cell, and the first threads also read one histogram bin each.
 #define APL_EVAL_THREADS         BOOST_CURVE_CELLS
@@ -164,6 +167,10 @@ static const float KNEE_TRANSITION_PQ = 0.04;
 // PQ size of the fine detail a pixel carries, the 0.2 average local RMS contrast of natural images (Frazor and
 // Geisler 2006) at highlight levels, where a unit of natural log luminance spans about 0.108 PQ.
 static const float DETAIL_PQ = 0.022;
+
+// Half a 10-bit PQ code, the step the eye cannot see. The gain's cost is in PQ, so it is also the cost of shifting
+// every pixel by that step.
+static const float HALF_CODE_PQ = 0.5 / 1023.0;
 
 // Full gain up to the knee. Above it the output PQ codes come from a table fitted to the frame, up to maxU, the
 // full-gain PQ code of a 10000 nit signal. Levels named U are PQ codes after the full gain. comp is the gain that
@@ -789,6 +796,9 @@ groupshared float APL_CurveNodes[BOOST_CURVE_CELLS + 1];
 groupshared float APL_CostShare[BOOST_CURVE_CELLS];
 groupshared float APL_CostWeight[BOOST_CURVE_CELLS];
 
+// Log gain and cost of each fit of the gain, in the order the fits run.
+groupshared float2 APL_GainCosts[BOOST_GAIN_FITS];
+
 // Sums every thread's APL_EvalSums entry and hands the total to every thread.
 float2 APL_SumEvalSums(int localIndex)
 {
@@ -979,21 +989,22 @@ float APL_GatherCellShare(int cell, float originU, float width)
     return share;
 }
 
-// Screen share per PQ width, averaged over the cells within half the knee transition, empty ones included, so slopes
-// change smoothly and a level's weight grows from nothing with its share.
+// Screen share per PQ width over half the knee transition either side of the cell's middle, inside the curve's range
+// and empty cells included, so slopes change smoothly and a level's weight grows from nothing with its share.
 float APL_SmoothedCellDensity(int cell, BoostCurve curve)
 {
     float width = CurveCellWidth(curve);
-    int reach = int(min(0.5 * KNEE_TRANSITION_PQ / width, BOOST_CURVE_CELLS));
-    int first = max(cell - reach, 0);
-    int last = min(cell + reach, BOOST_CURVE_CELLS - 1);
+    float reach = 0.5 * KNEE_TRANSITION_PQ / width;
+    float lower = max(cell + 0.5 - reach, 0.0);
+    float upper = min(cell + 0.5 + reach, float(BOOST_CURVE_CELLS));
+    int last = min(int(ceil(upper)), BOOST_CURVE_CELLS) - 1;
     float shareSum = 0.0;
 
     [loop]
-    for (int i = first; i <= last; ++i)
-        shareSum += APL_CurveShare[i];
+    for (int i = int(lower); i <= last; ++i)
+        shareSum += APL_CurveShare[i] * (min(upper, i + 1.0) - max(lower, float(i)));
 
-    return shareSum / float(last - first + 1) / width;
+    return shareSum / ((upper - lower) * width);
 }
 
 // What each PQ step a cell gives up costs the frame. Every pixel above the cell's middle shifts down by the step, and
@@ -1018,12 +1029,12 @@ float APL_CellSlope(int cell, float mu, float weight, float density, BoostCurve 
     return slope;
 }
 
-// Levels with no share nearby whose price ties mu give up the rest of the room from the top down, which moves only
-// what sits above them. Returns the room the cell gives up.
-float APL_FreeLevelGiven(int cell, float excess, float muLo, float muHi, float weight, float density, float slope, float length, BoostCurve curve)
+// Levels whose slope still changes inside the last bracket of the price give up the room left above the panel peak,
+// from the top down to their slope at the bracket's high end, which moves only what sits above them. Returns the room
+// the cell gives up.
+float APL_LeftoverGiven(int cell, float excess, float slope, float slopeAtMuHi, float length)
 {
-    bool tied = density <= 0.0 && weight >= muLo && weight < muHi && length > 0.0;
-    float room = tied ? length * (slope - CurveCellFloor(cell, curve)) : 0.0;
+    float room = length * (slope - slopeAtMuHi);
 
     int fromTop = BOOST_CURVE_CELLS - 1 - cell;
     APL_EvalSums[fromTop] = float2(room, 0.0);
@@ -1112,7 +1123,8 @@ void APL_FitBoostCurve(int cell, float topU, BoostCurve curve)
     APL_EvalSums[cell] = float2(slope * length, 0.0);
     float excess = curve.kneeU + APL_SumEvalSums(cell).x - curve.peakPQ;
 
-    float given = APL_FreeLevelGiven(cell, excess, muLo, muHi, weight, density, slope, length, curve);
+    float slopeAtMuHi = fits ? 1.0 : APL_CellSlope(cell, muHi, weight, density, curve);
+    float given = APL_LeftoverGiven(cell, excess, slope, slopeAtMuHi, length);
     if (given > 0.0)
         slope -= given / length;
 
@@ -1179,6 +1191,65 @@ float APL_BuildCostGrid(int localIndex, SolveBin bin)
     APL_CostShare[localIndex] = cellShare;
     APL_CostWeight[localIndex] = 1.0 + 2.0 * (below - (1.0 - below - cellShare));
     return width;
+}
+
+// Integrals over one step of log gain of exp(-cost) and of log gain times it, with the cost in half codes over the
+// least running linearly from c0 to c1 across the width w from x0. Both exponentials stay at or under 1.
+float2 APL_SoftStep(float x0, float w, float c0, float c1)
+{
+    float rise = c1 - c0;
+    float e0 = exp(-c0);
+
+    if (abs(rise) < 0.05)
+    {
+        float mass = 1.0 - rise / 2.0 + rise * rise / 6.0;
+        return w * e0 * float2(mass, x0 * mass + w * (0.5 - rise / 3.0 + rise * rise / 8.0));
+    }
+
+    float e1 = exp(-c1);
+    float mass = (e0 - e1) / rise;
+    return w * float2(mass, x0 * mass + w * (mass - e1) / rise);
+}
+
+// The log gain the first count fits give, the average log gain over the table's range weighed by exp(-cost), with the
+// cost in half codes over the least and running linearly from each fit to the next one up. Every thread reads the fits
+// in place and works out the same gain, so the solve needs no branch on the thread around its barriers. The loops run
+// over every slot and skip the ones not yet filled, so their bounds stay fixed.
+float APL_SoftLogGain(int count)
+{
+    float least = APL_GainCosts[0].y;
+    [loop]
+    for (int k = 1; k < BOOST_GAIN_FITS; ++k)
+    {
+        if (k < count)
+            least = min(least, APL_GainCosts[k].y);
+    }
+
+    float2 sums = 0.0;
+    [loop]
+    for (int i = 0; i < BOOST_GAIN_FITS; ++i)
+    {
+        float2 lower = APL_GainCosts[i];
+        float2 upper = lower;
+        bool first = i < count;
+        bool hasUpper = false;
+
+        // A fit that repeats an earlier one's log gain adds nothing, so only the first of them starts a step.
+        [loop]
+        for (int j = 0; j < BOOST_GAIN_FITS; ++j)
+        {
+            float2 other = APL_GainCosts[j];
+            bool nearer = j < count && other.x > lower.x && (!hasUpper || other.x < upper.x);
+            first = first && !(j < i && other.x == lower.x);
+            upper = nearer ? other : upper;
+            hasUpper = hasUpper || nearer;
+        }
+
+        if (first && hasUpper)
+            sums += APL_SoftStep(lower.x, upper.x - lower.x, lower.y - least, upper.y - least);
+    }
+
+    return sums.y / sums.x;
 }
 
 // What the curve costs the pixels of one cost cell against the exact levels, less the part only the exact levels make.
@@ -1275,9 +1346,9 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
     // and measures the load the frame shows through the curve that gives, so it lands where the compensation stops
     // moving. It holds that load under the APL whose compensation is the last frame's best gain, so a lowering that
     // lets go starts the track from the gain it showed. The shown gain eases toward the track's gain over the smoothing
-    // time as the APL whose compensation it is, so a frame that fits eases its load linearly and a change of content
-    // moves the gain one way. While nothing new is composed the panel keeps showing that frame, so its load still
-    // holds. Without history the panel last showed the frame unboosted.
+    // time in log gain, so one smoothing time covers the same share of a brightness change up or down, and a change of
+    // content moves the gain one way. While nothing new is composed the panel keeps showing that frame, so its load
+    // still holds. Without history the panel last showed the frame unboosted.
     float4 lastFrame = Solve_APLPrev.Load(int3(0, 0, 0));
     float3 lastTrack = Solve_APLPrev.Load(int3(1, 0, 0)).xyz;
     bool hasHistory = lastFrame.z > 0.0;
@@ -1286,21 +1357,19 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
     float trackComp = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(trackAPL));
     float costWidth = APL_BuildCostGrid(localIndex, bin);
 
-    // The gain that costs the frame the least, by golden section on its log up to the table's top compensation, held
-    // under the compensation. While the bracket's top never comes down the cost falls all the way to the top, so the
-    // compensation wins and a frame that fits stays exact. The search runs every frame, since barriers cannot sit
-    // inside a branch on the frame's content.
-    const float golden = 0.5 * (sqrt(5.0) - 1.0);
-    const int trackFit = BOOST_GAIN_SEARCH_STEPS + 2;
+    // The frame's gain averages the log gains the cost cannot tell apart, each weighed by exp(-d) for a cost d half
+    // 10-bit codes over the least, and is held under the compensation. A flat or bumpy cost moves it smoothly with the
+    // frame. A cost that falls all the way to the table's top compensation puts it under the top by one over the cost's
+    // slope there, 0.5 to 1% on recorded game frames, so a frame that fits keeps its compensation unless it is near
+    // full white. The cost runs linearly between fits on an even grid of log gains and fits either side of the gain
+    // the fits before them give, which move smoothly with the frame too. Every fit runs every frame, since barriers
+    // cannot sit inside a branch on the frame's content.
+    const int trackFit = BOOST_GAIN_FITS;
     const int finalFit = trackFit + 1;
-    float lo = 0.0;
-    float hi = APL_ANCHORS[APL_ANCHOR_COUNT - 1].y * log(2.0);
-    float a = hi - golden * hi;
-    float b = golden * hi;
-    float costA = 0.0;
-    float costB = 0.0;
-    bool fillA = true;
-    bool lowered = false;
+    const float topLog = APL_ANCHORS[APL_ANCHOR_COUNT - 1].y;
+    const float gridStep = topLog / (BOOST_GAIN_GRID_POINTS - 1);
+    float frameLogGain = 0.0;
+    float trackGain = trackComp;
     float trackLoad = 0.0;
     float bestAPL = 1.0;
     float easedAPL = 0.0;
@@ -1308,58 +1377,52 @@ void CS_Solve(uint3 threadID : SV_GroupThreadID)
     float shownComp = 0.0;
 
     // Every fit runs from this one call site, so the shader holds one copy of the fit, which runs faster than four. The
-    // first two fits cost both inner points and each step after costs the point its shift adds. The track's fit then
-    // measures the load the track's gain gives, and the last fit leaves the shown curve at the eased gain.
+    // grid's fits come first, then two for each pass. The track's fit then measures the load the track's gain gives,
+    // and the last fit leaves the shown curve at the eased gain.
     [loop]
     for (int fit = 0; fit <= finalFit; ++fit)
     {
-        float best = (costA < costB) ? a : b;
-        float trackGain = lowered ? min(exp(best), trackComp) : trackComp;
-        float gain = (fit < trackFit) ? exp(fillA ? a : b) : ((fit == trackFit) ? trackGain : shownGain);
+        int passFit = fit - BOOST_GAIN_GRID_POINTS;
+        if (passFit >= 0 && (passFit & 1) == 0 && fit <= trackFit)
+        {
+            GroupMemoryBarrierWithGroupSync();
+            frameLogGain = APL_SoftLogGain(fit);
+        }
+
+        float logGain = gridStep * fit;
+        if (passFit >= 0 && fit < trackFit)
+        {
+            float spread = gridStep / float(1 << (passFit >> 1));
+            logGain = clamp(frameLogGain - spread, 0.0, topLog - 2.0 * spread) + 2.0 * spread * float(passFit & 1);
+        }
+
+        if (fit == trackFit)
+        {
+            float frameGain = SceneGainFromLogGain(frameLogGain);
+            trackGain = min(frameGain, trackComp);
+            bestAPL = APLFromSceneGain(frameGain);
+        }
+
+        float gain = (fit < trackFit) ? SceneGainFromLogGain(logGain) : ((fit == trackFit) ? trackGain : shownGain);
         float fitComp = (fit == finalFit) ? shownComp : trackComp;
-        float cost = APL_FitAndCost(localIndex, gain, fitComp, costWidth, bin);
+        float cost = APL_FitAndCost(localIndex, gain, fitComp, costWidth, bin) / HALF_CODE_PQ;
+
+        if (localIndex == 0 && fit < trackFit)
+            APL_GainCosts[fit] = float2(logGain, cost);
 
         if (fit == trackFit)
         {
             trackLoad = APL_ShownAPL(localIndex, pixelCount, sceneNits, maxChannelNits, loadNits);
-            if (lowered)
-                bestAPL = APLFromSceneGain(exp(best));
 
             // The compensation is read at the eased APL plus however far the last load sits above the APL the ease
             // runs toward, which is nothing for a frame that fits, so there the gain matches it exactly.
             float targetAPL = (trackGain < trackComp) ? APLFromSceneGain(trackGain) : trackAPL;
             float loweredAPL = lastLoad - targetAPL;
-            easedAPL = hasHistory ? lerp(lastTrack.y, targetAPL, ComputeTemporalBlendFactor(APLSmoothingSeconds)) : targetAPL;
+            float blend = ComputeTemporalBlendFactor(APLSmoothingSeconds);
+            float easedLogGain = lerp(ComputeSceneLogGainFromAPL(lastTrack.y), ComputeSceneLogGainFromAPL(targetAPL), blend);
+            easedAPL = hasHistory ? APLFromSceneGain(SceneGainFromLogGain(easedLogGain)) : targetAPL;
             shownGain = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(easedAPL));
             shownComp = SceneGainFromLogGain(ComputeSceneLogGainFromAPL(easedAPL + loweredAPL));
-        }
-
-        if (fit >= trackFit)
-            continue;
-
-        if (fillA)
-            costA = cost;
-        else
-            costB = cost;
-
-        fillA = costA < costB;
-
-        if (fit == 0 || fit > BOOST_GAIN_SEARCH_STEPS)
-            fillA = false;
-        else if (fillA)
-        {
-            hi = b;
-            b = a;
-            costB = costA;
-            a = hi - golden * (hi - lo);
-            lowered = true;
-        }
-        else
-        {
-            lo = a;
-            a = b;
-            costA = costB;
-            b = lo + golden * (hi - lo);
         }
     }
 

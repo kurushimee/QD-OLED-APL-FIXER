@@ -28,7 +28,9 @@ KNEE_TRANSITION = 0.04
 DETAIL_PQ = 0.022
 CURVE_CELLS = 512
 CURVE_SOLVE_STEPS = 21
-GAIN_SEARCH_STEPS = 12
+GAIN_GRID_POINTS = 8
+GAIN_PASSES = 3
+HALF_CODE_PQ = 0.5 / 1023.0
 SINGLE_PRIMARY_LOAD = 0.75
 SMOOTHING_SECONDS = 0.5
 
@@ -294,16 +296,18 @@ def build_curve(gain, bins):
     # Each slope costs the least for the frame. Flattening a cell costs its pixels DETAIL_PQ times the log of the
     # contrast they lose, and keeping it costs its weight for each PQ step of room it holds. Every pixel above the
     # cell's middle shifts down by the step, and its contrast against every pixel below grows by it, once for each
-    # order of the pair. mu is what each PQ step of room is worth. The share per PQ width is averaged over the cells
-    # within half the knee transition, empty ones included, so slopes change smoothly and a level's weight grows from
-    # nothing with its share. Empty levels near content keep some slope that way, and only levels with no share nearby
-    # are free.
+    # order of the pair. mu is what each PQ step of room is worth. The share per PQ width is averaged over half the knee
+    # transition either side of the cell's middle, inside the curve's range and empty cells included, so slopes change
+    # smoothly and a level's weight grows from nothing with its share. Empty levels near content keep some slope that
+    # way.
     c["phase"] = "fitted"
-    reach = int(0.5 * KNEE_TRANSITION / width)
+    reach = 0.5 * KNEE_TRANSITION / width
     density = []
     for i in range(cells):
-        window = share[max(i - reach, 0):min(i + reach + 1, cells)]
-        density.append(sum(window) / len(window) / width)
+        lower, upper = max(i + 0.5 - reach, 0.0), min(i + 0.5 + reach, float(cells))
+        covered = sum(share[k] * (min(upper, k + 1.0) - max(lower, float(k)))
+                      for k in range(int(lower), min(math.ceil(upper), cells)))
+        density.append(covered / ((upper - lower) * width))
     weight, share_above = [0.0] * cells, 0.0
     for i in range(cells - 1, -1, -1):
         above = share_above + 0.5 * share[i]
@@ -330,11 +334,13 @@ def build_curve(gain, bins):
             mu_hi = mu_a
     slope = slopes(mu_lo)
 
-    # Free levels at the price give up the rest of the room from the top down, which moves only what sits above them.
+    # Levels whose slope still changes inside the last bracket of the price give up the room left above the panel peak,
+    # from the top down to their slope at the bracket's high end, which moves only what sits above them.
     excess = rise(slope) - peak
+    slope_hi = slopes(mu_hi)
     for i in range(cells - 1, -1, -1):
-        if density[i] <= 0.0 and mu_lo <= weight[i] < mu_hi and length[i] > 0.0:
-            given = min(max(excess, 0.0), length[i] * (slope[i] - floor[i]))
+        given = min(max(excess, 0.0), length[i] * (slope[i] - slope_hi[i]))
+        if given > 0.0:
             slope[i] -= given / length[i]
             excess -= given
 
@@ -435,36 +441,48 @@ def gain_cost(c, grid):
     return cost
 
 
-def search_gain(bins):
-    """The gain that costs the frame the least, by golden section on its log up to the table's top compensation, or
-    None while the bracket's top never comes down and the cost falls all the way to the top. The cost leaves out the
-    exact levels, so the search never depends on the compensation, and CS_Solve's search every frame finds this."""
-    grid = cost_grid(bins)
-    golden = 0.5 * (math.sqrt(5.0) - 1.0)
-
-    def cost(log_gain):
-        return gain_cost(build_curve(math.exp(log_gain), bins), grid)
-
-    lo, hi = 0.0, cand_max_log_gain() * math.log(2.0)
-    a, b = hi - golden * hi, golden * hi
-    cost_a, cost_b = cost(a), cost(b)
-    lowered = False
-    for _ in range(GAIN_SEARCH_STEPS):
-        if cost_a < cost_b:
-            hi, b, cost_b = b, a, cost_a
-            a = hi - golden * (hi - lo)
-            cost_a = cost(a)
-            lowered = True
+def soft_log_gain(fits):
+    """The average log gain weighed by exp(-cost), with the cost in half codes over the least running linearly between
+    the fits, sorted by log gain."""
+    least = min(cost for _, cost in fits)
+    mass = moment = 0.0
+    for (x0, c0), (x1, c1) in zip(fits, fits[1:]):
+        w, rise, e0 = x1 - x0, c1 - c0, math.exp(-(c0 - least))
+        if abs(rise) < 0.05:
+            m = 1.0 - rise / 2.0 + rise * rise / 6.0
+            mass += w * e0 * m
+            moment += w * e0 * (x0 * m + w * (0.5 - rise / 3.0 + rise * rise / 8.0))
         else:
-            lo, a, cost_a = a, b, cost_b
-            b = lo + golden * (hi - lo)
-            cost_b = cost(b)
-    return math.exp(a if cost_a < cost_b else b) if lowered else None
+            e1 = math.exp(-(c1 - least))
+            m = (e0 - e1) / rise
+            mass += w * m
+            moment += w * (x0 * m + w * (m - e1) / rise)
+    return moment / mass
+
+
+def search_gain(bins):
+    """The frame's gain, the average log gain the cost cannot tell apart. The cost runs linearly between fits on an even
+    grid of log gains up to the table's top compensation and passes of two fits either side of the gain the fits
+    before them give, half as far each pass. It leaves out the exact levels, so the gain never depends on the
+    compensation, and CS_Solve's search every frame finds this."""
+    grid = cost_grid(bins)
+
+    def fit(log_gain):
+        return log_gain, gain_cost(build_curve(2.0 ** log_gain, bins), grid) / HALF_CODE_PQ
+
+    top = cand_max_log_gain()
+    step = top / (GAIN_GRID_POINTS - 1)
+    fits = [fit(step * k) for k in range(GAIN_GRID_POINTS)]
+    for p in range(GAIN_PASSES):
+        half = step / 2 ** p
+        low = min(max(soft_log_gain(sorted(fits)) - half, 0.0), top - 2.0 * half)
+        fits += [fit(low), fit(low + 2.0 * half)]
+    return 2.0 ** soft_log_gain(sorted(fits))
 
 
 def choose_gain(searched, comp):
-    """The searched gain held under this frame's compensation, which wins for a frame that fits, so it stays exact."""
-    return comp if searched is None else min(searched, comp)
+    """The searched gain held under this frame's compensation, which wins for a frame that fits."""
+    return min(searched, comp)
 
 
 # Scenes.
@@ -507,8 +525,8 @@ def null_test_pattern(raw, patch_nits, window=False):
 def run_frames(bins_per_frame, last_disp=None, start_comp=None, smoothing=0.0, frame_seconds=0.0):
     """Mirror CS_Solve over consecutive frames. The track compensates each frame for the display APL it measured on
     the frame before, held under the APL whose compensation is that frame's best gain, and measures the display APL
-    through the curve its gain gives. The shown gain is the compensation for the APL that eases toward the one whose
-    compensation is the track's gain over the smoothing time."""
+    through the curve its gain gives. The shown gain eases toward the track's gain in log gain over the smoothing
+    time, carried as the APL whose compensation it is."""
     if start_comp is not None:
         last_disp = apl_from_gain(start_comp)
     alpha = 1.0 if smoothing <= 1e-6 else 1.0 - math.exp(-frame_seconds / smoothing)
@@ -516,8 +534,7 @@ def run_frames(bins_per_frame, last_disp=None, start_comp=None, smoothing=0.0, f
     if last_disp is None:
         # The state a still first frame leaves, with its best gain held where the search lowers it.
         _, load, gain, _, comp = solve_settled(bins_per_frame[0])
-        best = search_gain(bins_per_frame[0])
-        best_apl = 1.0 if best is None else apl_from_gain(best)
+        best_apl = apl_from_gain(search_gain(bins_per_frame[0]))
         eased = apl_from_gain(gain) if gain < comp else load
     gains, curves, searched = [], [], {}
     for bins in bins_per_frame:
@@ -527,13 +544,15 @@ def run_frames(bins_per_frame, last_disp=None, start_comp=None, smoothing=0.0, f
         track_apl = min(load, best_apl)
         track_comp = 2.0 ** scene_log_gain(track_apl)
         track_gain = choose_gain(best, track_comp)
-        eased += alpha * ((apl_from_gain(track_gain) if track_gain < track_comp else track_apl) - eased)
+        target = apl_from_gain(track_gain) if track_gain < track_comp else track_apl
+        eased_log_gain = scene_log_gain(eased) + alpha * (scene_log_gain(target) - scene_log_gain(eased))
+        eased = apl_from_gain(2.0 ** eased_log_gain)
         c = build_curve(2.0 ** scene_log_gain(eased), bins)
         track_c = c if c["gain"] == track_gain else build_curve(track_gain, bins)
         gains.append(c["gain"])
         curves.append(c)
         load = display_apl(bins, track_c)
-        best_apl = 1.0 if best is None else apl_from_gain(best)
+        best_apl = apl_from_gain(best)
     return gains, curves
 
 
@@ -570,22 +589,6 @@ def host_settle():
     runs = int(re.search(r"SETTLE_RUNS = (\d+);", text).group(1))
     seconds = float(re.search(r"SETTLE_SECONDS = ([\d.]+);", text).group(1))
     return runs, seconds
-
-
-def ease_seconds(target, start, tolerance):
-    """Seconds the eased APL takes from start to bring the compensation within tolerance of the target's, once the
-    track holds still on the target. Its gap shrinks as exp(-t / smoothing time) whatever the frame rate."""
-    goal = scene_log_gain(target)
-    if abs(scene_log_gain(start) - goal) <= tolerance:
-        return 0.0
-    near, far = target, start
-    for _ in range(60):
-        mid = 0.5 * (near + far)
-        if abs(scene_log_gain(mid) - goal) <= tolerance:
-            near = mid
-        else:
-            far = mid
-    return SMOOTHING_SECONDS * math.log(abs(start - target) / abs(near - target))
 
 
 def null_test_curve_loads():
@@ -783,11 +786,11 @@ def main():
         print(f"FAIL settle runs: pipeline.h keeps {settle_runs}, the table needs {needed}")
         fails += 1
 
-    # After those runs the host keeps composing for SETTLE_SECONDS while the ease closes on the track. From the
-    # farthest APL the ease can start at, 0 or 1, it must bring the compensation under the same tolerance for every
-    # APL a frame can settle on. Cuts between the flat fields that settle on 100% and 3% out APL, the slowest pair,
-    # then land within it at 60 and 240 Hz.
-    ease = max(ease_seconds(k / 4000, start, tolerance) for k in range(1, 4000) for start in (0.0, 1.0))
+    # After those runs the host keeps composing for SETTLE_SECONDS while the ease closes on the track. Its gap in log
+    # gain shrinks as exp(-t / smoothing time) whatever the frame rate, so across the whole table it must come under the
+    # same tolerance. Cuts between the flat fields that settle on 100% and 3% out APL, the slowest pair, then land
+    # within it at 60 and 240 Hz.
+    ease = SMOOTHING_SECONDS * math.log(span / tolerance)
     needed_seconds = math.ceil(ease * 100) / 100
     print(f"ease check: slowest ease {ease:.4f} s at {SMOOTHING_SECONDS} s smoothing, host keeps {settle_seconds} s")
     if settle_seconds != needed_seconds:

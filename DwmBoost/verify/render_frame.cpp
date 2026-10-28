@@ -34,8 +34,8 @@ const int WOBBLE_FRAMES = 20;
 const int TIMED_FRAMES = 100;
 const int TIMED_BATCHES = 8;
 
-// The peak boost.hlsl tonemaps into.
-const double PANEL_PEAK_NITS = 1060.0;
+// The peak boost.hlsl tonemaps into, PANEL_SIGNAL_PEAK_NITS in Shaders/PanelModel_27M2N6500.fxh.
+const double PANEL_SIGNAL_PEAK_NITS = 1007.93;
 
 const double PQ_M1 = 0.1593017578125, PQ_M2 = 78.84375;
 const double PQ_C1 = 0.8359375, PQ_C2 = 18.8515625, PQ_C3 = 18.6875;
@@ -248,7 +248,7 @@ std::vector<T> ReadBack(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Textu
 double HalfCodeRatio()
 {
     double smallest = 1.0;
-    for (int code = 1; code < int(NitsToPQ(PANEL_PEAK_NITS) * 1023.0); ++code)
+    for (int code = 1; code < int(NitsToPQ(PANEL_SIGNAL_PEAK_NITS) * 1023.0); ++code)
         smallest = std::min(smallest, PQToNits((code + 1) / 1023.0) / PQToNits(code / 1023.0) - 1.0);
     return 0.5 * smallest;
 }
@@ -375,11 +375,11 @@ int Run(const wchar_t* sourcePath, const wchar_t* outputPath)
     for (int frame = 0; frame < frames; ++frame)
     {
         pipe.Run(ctx.Get(), rtv.Get(), frame == 0, 1.0f, frameMs);
-        gains.push_back(ReadBack<float>(dev.Get(), ctx.Get(), pipe.boostParams.t, 4)[0]);
+        gains.push_back(std::exp2(ReadBack<float>(dev.Get(), ctx.Get(), pipe.aplState.t, 4)[3]));
     }
 
-    std::vector<float> apl = ReadBack<float>(dev.Get(), ctx.Get(), pipe.aplInstant.t, 4);
-    std::vector<float> params = ReadBack<float>(dev.Get(), ctx.Get(), pipe.boostParams.t, 4);
+    // (frame mean PQ, out load, has history, log gain) and (raw load, full log gain, bend start nits, ceiling nits).
+    std::vector<float> state = ReadBack<float>(dev.Get(), ctx.Get(), pipe.aplState.t, 4);
     double gpuMs = TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Run(ctx.Get(), rtv.Get(), false, 1.0f, frameMs); });
     double solveMs = TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Solve(ctx.Get()); });
 
@@ -390,8 +390,9 @@ int Run(const wchar_t* sourcePath, const wchar_t* outputPath)
         return 1;
     }
 
-    wprintf(L"raw_apl %.6f out_apl %.6f gain %.6f comp %.6f knee_nits %.3f departure_nits %.3f settle_s %.3f wobble %.1e gpu_ms %.4f solve_ms %.4f\n",
-            apl[0], apl[1], params[0], params[6], params[2], PQToNits(params[5]), SettleFrames(gains) * frameMs / 1000.0, Wobble(gains), gpuMs, solveMs);
+    wprintf(L"raw_load %.6f out_load %.6f gain %.6f full_gain %.6f knee_nits %.3f ceiling_nits %.3f settle_s %.3f wobble %.1e gpu_ms %.4f solve_ms %.4f\n",
+            state[4], state[1], std::exp2(state[3]), std::exp2(state[5]), state[6], state[7],
+            SettleFrames(gains) * frameMs / 1000.0, Wobble(gains), gpuMs, solveMs);
     return 0;
 }
 

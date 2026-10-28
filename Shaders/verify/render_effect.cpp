@@ -46,6 +46,7 @@ const float FRAME_MS = 1000.0f / 60.0f;
 // The output counts as settled once it holds still this long, and the run gives up after a minute.
 const int HOLD_FRAMES = 60;
 const int MAX_FRAMES = 3600;
+const int TIMED_FRAMES = 200;
 
 const double SCRGB_NITS = 80.0;
 
@@ -697,6 +698,10 @@ private:
             {
                 memcpy(&_constantData[info.offset], &FRAME_MS, sizeof(FRAME_MS));
             }
+            else if (source == "framecount" || source == "timer")
+            {
+                // Held at 0, so per-frame noise like a dither stays put and a held frame's output can settle
+            }
             else if (!source.empty())
             {
                 fprintf(stderr, "%s: RenderEffect has no uniform source %s\n", info.name.c_str(), source.c_str());
@@ -837,6 +842,36 @@ std::vector<uint8_t> ReadBack(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D1
     return bytes;
 }
 
+// Mean GPU time of one run of the effect over TIMED_FRAMES runs, or a negative value if the GPU can't time it.
+double MeasureGpuMs(ID3D11Device* dev, ID3D11DeviceContext* ctx, EffectRunner& effect)
+{
+    D3D11_QUERY_DESC disjointDesc = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+    D3D11_QUERY_DESC stampDesc = { D3D11_QUERY_TIMESTAMP, 0 };
+    ComPtr<ID3D11Query> disjoint, begin, end;
+    if (FAILED(dev->CreateQuery(&disjointDesc, &disjoint)) || FAILED(dev->CreateQuery(&stampDesc, &begin)) ||
+        FAILED(dev->CreateQuery(&stampDesc, &end)))
+        return -1.0;
+
+    ctx->Begin(disjoint.Get());
+    ctx->End(begin.Get());
+    for (int i = 0; i < TIMED_FRAMES; ++i)
+        effect.Render(ctx);
+    ctx->End(end.Get());
+    ctx->End(disjoint.Get());
+
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock = {};
+    while (ctx->GetData(disjoint.Get(), &clock, sizeof(clock), 0) == S_FALSE)
+        ;
+
+    UINT64 beginTicks = 0, endTicks = 0;
+    ctx->GetData(begin.Get(), &beginTicks, sizeof(beginTicks), 0);
+    ctx->GetData(end.Get(), &endTicks, sizeof(endTicks), 0);
+    if (clock.Disjoint)
+        return -1.0;
+
+    return double(endTicks - beginTicks) / double(clock.Frequency) * 1000.0 / TIMED_FRAMES;
+}
+
 int Run(const Args& args)
 {
     ComPtr<IWICImagingFactory> wic;
@@ -908,6 +943,11 @@ int Run(const Args& args)
 
     const int settled = frames - HOLD_FRAMES;
     printf("settled after %d frames (%.2f s)\n", settled, settled * FRAME_MS / 1000.0f);
+
+    // Each timed run boosts the back buffer again, which costs the same work as the held frame
+    const double gpuMs = MeasureGpuMs(dev.Get(), ctx.Get(), effect);
+    if (gpuMs >= 0.0)
+        printf("GPU time %.3f ms per frame at %ux%u\n", gpuMs, source.width, source.height);
     return 0;
 }
 

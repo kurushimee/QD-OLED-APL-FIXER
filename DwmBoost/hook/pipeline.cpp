@@ -47,19 +47,12 @@ bool BoostPipeline::Create(ID3D11Device* dev, UINT w, UINT h)
     ok &= CreateTex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, clean);
     ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowCount);
     ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowOffset);
-    ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowMaxNits);
-    ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowLoad);
-    ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowOffsetSq);
     ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, globalCount);
-    ok &= CreateTex(dev, 1, 1, DXGI_FORMAT_R32_SINT, true, true, frameTop);
     ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, globalOffset);
-    ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, globalMaxNits);
-    ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, globalLoad);
-    ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, globalOffsetSq);
-    ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplInstant);
+    ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplState);
     ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplPrev);
-    ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, boostParams);
-    ok &= CreateTex(dev, BOOST_CURVE_CELLS + 1, 1, DXGI_FORMAT_R32_FLOAT, true, true, boostCurve);
+    ok &= CreateTex(dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, toneShape);
+    ok &= CreateTex(dev, TONE_CURVE_LUT_SIZE, 1, DXGI_FORMAT_R32_FLOAT, true, true, toneLUT);
 
     ok &= SUCCEEDED(dev->CreateComputeShader(g_CS_Setup, sizeof(g_CS_Setup), nullptr, &csSetup));
     ok &= SUCCEEDED(dev->CreateComputeShader(g_CS_Build, sizeof(g_CS_Build), nullptr, &csBuild));
@@ -91,14 +84,14 @@ void BoostPipeline::Run(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv, boo
         c->Unmap(cb, 0);
     }
 
-    // Pass 1: setup / row clear.
+    // Pass 1: last run's state copy and row clear.
     ClearCS(c);
     c->CSSetConstantBuffers(0, 1, &cb);
     {
-        ID3D11ShaderResourceView* srv[1] = { aplInstant.srv };
-        ID3D11UnorderedAccessView* uav[7] = { rowCount.uav, rowOffset.uav, rowMaxNits.uav, rowLoad.uav, aplPrev.uav, rowOffsetSq.uav, frameTop.uav };
+        ID3D11ShaderResourceView* srv[1] = { aplState.srv };
+        ID3D11UnorderedAccessView* uav[3] = { rowCount.uav, rowOffset.uav, aplPrev.uav };
         c->CSSetShaderResources(0, 1, srv);
-        c->CSSetUnorderedAccessViews(0, 7, uav, nullptr);
+        c->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
         c->CSSetShader(csSetup, nullptr, 0);
         c->Dispatch(1, 1, 1);
     }
@@ -107,9 +100,9 @@ void BoostPipeline::Run(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv, boo
     ClearCS(c);
     {
         ID3D11ShaderResourceView* srv[1] = { clean.srv };
-        ID3D11UnorderedAccessView* uav[6] = { rowCount.uav, rowOffset.uav, rowMaxNits.uav, rowLoad.uav, rowOffsetSq.uav, frameTop.uav };
+        ID3D11UnorderedAccessView* uav[2] = { rowCount.uav, rowOffset.uav };
         c->CSSetShaderResources(0, 1, srv);
-        c->CSSetUnorderedAccessViews(0, 6, uav, nullptr);
+        c->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
         c->CSSetShader(csBuild, nullptr, 0);
         c->Dispatch(TileCount(width), TileCount(height), 1);
     }
@@ -117,10 +110,10 @@ void BoostPipeline::Run(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv, boo
     // Pass 3: reduce to the global histogram.
     ClearCS(c);
     {
-        ID3D11ShaderResourceView* srv[5] = { rowCount.srv, rowOffset.srv, rowMaxNits.srv, rowLoad.srv, rowOffsetSq.srv };
-        ID3D11UnorderedAccessView* uav[5] = { globalCount.uav, globalOffset.uav, globalMaxNits.uav, globalLoad.uav, globalOffsetSq.uav };
-        c->CSSetShaderResources(0, 5, srv);
-        c->CSSetUnorderedAccessViews(0, 5, uav, nullptr);
+        ID3D11ShaderResourceView* srv[2] = { rowCount.srv, rowOffset.srv };
+        ID3D11UnorderedAccessView* uav[2] = { globalCount.uav, globalOffset.uav };
+        c->CSSetShaderResources(0, 2, srv);
+        c->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
         c->CSSetShader(csReduce, nullptr, 0);
         c->Dispatch(BLOCK_W, BLOCK_H, 1);
     }
@@ -142,8 +135,8 @@ void BoostPipeline::Run(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv, boo
     c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     c->OMSetDepthStencilState(nullptr, 0);
     {
-        ID3D11ShaderResourceView* srv[3] = { clean.srv, boostParams.srv, boostCurve.srv };
-        c->PSSetShaderResources(0, 3, srv);
+        ID3D11ShaderResourceView* srv[4] = { clean.srv, aplState.srv, toneShape.srv, toneLUT.srv };
+        c->PSSetShaderResources(0, 4, srv);
     }
     c->Draw(3, 0);
 }
@@ -152,9 +145,9 @@ void BoostPipeline::Solve(ID3D11DeviceContext* c)
 {
     ClearCS(c);
     {
-        ID3D11ShaderResourceView* srv[7] = { globalCount.srv, globalOffset.srv, globalMaxNits.srv, globalLoad.srv, aplPrev.srv, globalOffsetSq.srv, frameTop.srv };
-        ID3D11UnorderedAccessView* uav[3] = { aplInstant.uav, boostParams.uav, boostCurve.uav };
-        c->CSSetShaderResources(0, 7, srv);
+        ID3D11ShaderResourceView* srv[3] = { globalCount.srv, globalOffset.srv, aplPrev.srv };
+        ID3D11UnorderedAccessView* uav[3] = { aplState.uav, toneShape.uav, toneLUT.uav };
+        c->CSSetShaderResources(0, 3, srv);
         c->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
         c->CSSetShader(csSolve, nullptr, 0);
         c->Dispatch(1, 1, 1);
@@ -165,10 +158,10 @@ void BoostPipeline::Solve(ID3D11DeviceContext* c)
 void BoostPipeline::Release()
 {
     clean.Release();
-    rowCount.Release(); rowOffset.Release(); rowMaxNits.Release(); rowLoad.Release(); rowOffsetSq.Release();
-    globalCount.Release(); frameTop.Release(); globalOffset.Release(); globalMaxNits.Release(); globalLoad.Release(); globalOffsetSq.Release();
-    aplInstant.Release(); aplPrev.Release(); boostParams.Release();
-    boostCurve.Release();
+    rowCount.Release(); rowOffset.Release();
+    globalCount.Release(); globalOffset.Release();
+    aplState.Release(); aplPrev.Release();
+    toneShape.Release(); toneLUT.Release();
     if (csSetup) { csSetup->Release(); csSetup = nullptr; }
     if (csBuild) { csBuild->Release(); csBuild = nullptr; }
     if (csReduce) { csReduce->Release(); csReduce = nullptr; }

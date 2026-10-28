@@ -4,7 +4,7 @@ This ReShade shader offsets the automatic brightness limiter (ABL) of the **Phil
 
 QD-OLED panels get dimmer when a large part of the screen is bright. On this panel, a small highlight reaches the full peak of about 1000 nits, but a full white screen reaches only about a quarter of it. The shader measures how bright each frame is and raises the HDR signal by the amount the panel is expected to dim, so bright scenes keep their intended brightness. It works much like the "EOTF Boost" option on some MSI QD-OLED monitors.
 
-The shader file is [`Shaders/EOTF_BoostMod2.0_27M2N6500.fx`](Shaders/EOTF_BoostMod2.0_27M2N6500.fx).
+The shader file is [`Shaders/EOTF_BoostMod2.0_27M2N6500.fx`](Shaders/EOTF_BoostMod2.0_27M2N6500.fx). [EOTF Boost 3.1](#eotf-boost-31) is a newer version calibrated from `abl_curve.csv` that aims to show every level at its PQ target, and the null test and the desktop-wide version follow it.
 
 ## Calibration target
 
@@ -81,7 +81,7 @@ The table holds the peak the panel reaches with a full-signal window at each siz
 
 Below 3% APL the gain is 1, and the curve only makes room for content brighter than the panel peak. Between the points, it interpolates the logarithm of the peak against the logarithm of the APL, so the peak follows a power law from one point to the next.
 
-This table comes from an earlier measurement of white windows only. The shader doesn't use `abl_curve.csv` yet.
+This table comes from an earlier measurement of white windows only. 2.0 doesn't use `abl_curve.csv`, and 3.1 takes its panel model from it.
 
 ### abl_curve.csv
 
@@ -105,25 +105,24 @@ Every value is the luminance in the middle of the 2% window, the same spot on th
 
 `self_relative` is reliable for every pattern. `relative`, `nits`, `x`, and `y` of colored windows rely on the phone's color matrix, which can't separate narrow QD primaries well, so they're rough, and red likely reads too bright. Chromaticity shifts between sizes of one pattern are real.
 
-#### Using it in the shader
+#### The panel model
 
-The panel dims a frame by the mean over all pixels of its brightest channel in linear light, relative to the panel peak and capped at 1. A full red, green, blue, or yellow window dims like a white window of the same size, and a gray window dims like a white window whose area is its own area times its level.
+The panel dims a frame by the mean over all pixels of its brightest channel in linear light, relative to a load peak and capped at 1. A full red, green, blue, or yellow window dims like a white window of the same size, and a gray window dims like a white window whose area is its own area times its level. Gray 593 at 50% and gray 667 at 25% carry loads of 9.5% and 9.4% with very different codes and dim to 0.484 and 0.483, so the load is taken in linear light, not in code values.
 
-1. Measure each frame's load the same way as `load_percent`: decode each pixel's channels from PQ, take the brightest, divide by 1015.24 nits, cap it at 1, and average it over the frame.
-2. Look up the dimming from the white rows, `self_relative` against `load_percent`, interpolating the logarithm of one against the logarithm of the other. The compensation is 1 over the dimming, and 1 below the 2% load.
-3. The gray and colored rows check the load metric. A correct one puts every row's `self_relative` on the white curve at its `load_percent`.
+[`Shaders/verify/fit_panel_model.py`](Shaders/verify/fit_panel_model.py) fits the compensation curve and the load peak to every row by least squares on the log of the dimming, and writes them into [`Shaders/PanelModel_27M2N6500.fxh`](Shaders/PanelModel_27M2N6500.fxh), which 3.1 and the null test include. Compensation is 1 up to a load of 3.16%, rises by 0.168 per percent up to a knee at 10.32%, and follows a power law with an exponent of 0.2366 above it, with the load peak at 1056.8 nits. It reaches 2.149 at 10%, 2.716 at 25%, 3.200 at 50%, and 3.770 at 100%. Its log slope against load peaks at 0.787 just under the knee, so the boost always pays for the load it adds and the gain that cancels the dimming exists and is unique. Run `python fit_panel_model.py --check` in `Shaders/verify/` to confirm the include matches a fresh fit.
 
-How well each load metric predicts the gray and colored rows from the white curve:
+How well each load model fits the 25 rows above 2%. The held out RMS predicts each row from a fit to the others:
 
-| Load metric | RMS error | Worst error |
-|---|---|---|
-| Brightest channel | 2.8% | 6.6% |
-| The current mix, a pure primary at 0.75 of white | 4.8% | 7.9% |
-| Luminance | 32.6% | 91.5% |
+| Load model | RMS error | Worst error | Held out RMS |
+|---|---|---|---|
+| Brightest channel, load peak fitted | 1.33% | 3.85% | 1.69% |
+| Brightest channel, load peak at the EDID | 1.51% | 3.92% | 1.95% |
+| Brightest channel with per-channel weights | 1.26% | 2.92% | 1.88% |
+| 2.0's mix, a pure primary at 0.75 of white | 2.70% | 4.64% | 3.18% |
+| Channel sum | 13.46% | 23.62% | 15.63% |
+| BT.2020 luminance | 25.28% | 63.12% | 25.98% |
 
-With the brightest channel, red and yellow land within 1% and green within 2.5%. The current mix predicts 5% to 8% too little dimming for every primary. Luminance can't explain the colors, since a 25% blue window carries 2.6% of full white's luminance and still dims to 0.369, the same as a 25% white window at 0.368.
-
-The biggest misses are the 100-nit gray at 25% and 50%, which dim about 5% less than predicted, and the 100% blue window. The white curve has points only at 2%, 5%, and 10% where it falls fastest, so measuring white windows at 3%, 4%, and 7% would show whether the gray misses come from interpolation. The colored windows are pure BT.2020 primaries, which the panel shows at its own primaries, so the data can't tell whether the brightest channel should come from BT.2020 or from the panel's own primaries.
+Per-channel weights fit better but predict held out rows worse, so the model keeps the plain brightest channel. The worst row is the 100% blue window, which dims 3.9% less than predicted. Luminance can't explain the colors, since a 25% blue window carries 2.6% of full white's luminance and still dims like a 25% white window. The colored windows are pure BT.2020 primaries, which the panel shows at its own primaries, so the data can't tell whether the brightest channel should come from BT.2020 or from the panel's own primaries, and the model takes it in BT.2020.
 
 ## Settings
 
@@ -168,9 +167,66 @@ With `ENABLE_APL_GRAPH=1`, the shader can draw a graph of input nits against out
 
 The graph's 2D compensation table and window curves come from earlier measurements of the Samsung Odyssey OLED G8 (G85SB), not of the 27M2N6500. The live boost does not use them.
 
+## EOTF Boost 3.1
+
+[`Shaders/EOTF_BoostMod3.1_27M2N6500.fx`](Shaders/EOTF_BoostMod3.1_27M2N6500.fx) shows every level at its PQ target wherever the panel can reach it. Where it can't, the gain goes up only as far as the panel can deliver and the highlights roll off under the panel peak with their detail kept. It starts from shansolox's v8.18.7.15 shader, `Shaders/EOTF_BoostMod3.0.fx` here, and runs on the [panel model](#the-panel-model) fitted to `abl_curve.csv`.
+
+Copy `EOTF_BoostMod3.1_27M2N6500.fx` and `PanelModel_27M2N6500.fxh` into the game's `reshade-shaders\Shaders` folder, turn on **EOTF_Boost_3_1_27M2N6500**, and move it to the bottom of the effect list. It reads HDR10 or scRGB, whichever ReShade reports.
+
+### How 3.1 works
+
+1. **Measure the load.** Every frame, the shader builds a histogram of every pixel's brightest channel in linear BT.2020 and takes the load from it the way the panel model does.
+2. **Solve full compensation.** Boosting the frame raises its load, so the shader finds the gain that equals the compensation at the load that gain causes, by bisection on the histogram within the frame.
+3. **Pick the gain.** Full compensation shows every level at its target only when the frame fits under the ceiling, the signal peak divided by the gain. The shader scores 9 gains from 1 to full compensation by their predicted EOTF error, each histogram bin's shown level under the panel model against its target, in log2 and weighted by its pixels. It takes the vertex of the parabola through the best gain and its neighbors, so the gain moves smoothly as the frame changes, and takes full compensation as is when it scores best.
+4. **Tone map the highlights.** Levels below the shoulder get exactly the gain. The shoulder starts at BT.2408's 203-nit reference white, or at BT.2390's knee where that's higher, and the histogram shares its range up to the ceiling out from the top down (Ward Larson, Rushmeier, and Piatko 1997), with no level stretched past its own contrast. A bend of a quarter octave joins the two. The brightest channel lands at most on 1007.93 nits, the brightest 10-bit PQ code at or under the 1015.24-nit peak, so nothing clips. All three channels of a pixel scale by the same factor, so hue and saturation stay.
+5. **Smooth the gain.** The gain eases on its log with libplacebo's single-pole filter over a 20-frame period. A change of 1% to 3% in the frame's mean PQ counts as a scene change and goes through partly to fully.
+6. **Dither HDR10.** Pixels the boost changed get triangular noise of one 10-bit code before quantization, so each code's mean lands on its target.
+
+Under the panel model, the mean EOTF error over a frame's pixels is 0.0001 stops on a dim frame and 0.01 stops on a game frame. It rises to 0.25 to 1.0 stops only on frames whose bright areas fill much of the screen, a bright sky or a snowfield, where the panel can't reach the target. The pipeline takes 0.76 ms per frame at 2560 by 1440 on an RTX 2070.
+
+### 3.1 settings
+
+| Setting | Default | What it does |
+|---|---|---|
+| Enable EOTF Boost | On | Turns the compensation on or off. |
+| Gain Smoothing Period (frames) | 20 | Sets the period of the gain's smoothing. 0 turns smoothing off. |
+| Gain Pick | Lowest predicted EOTF error | **Brightness times kept detail** picks by 3.0's score instead. |
+| Scene Change Low Threshold (% PQ) | 1 | Sets the change in the frame's mean PQ where a scene change starts to bypass the smoothing. |
+| Scene Change High Threshold (% PQ) | 3 | Sets the change where it bypasses the smoothing fully. |
+| Shoulder Start | Held at 203 nit reference white | **BT.2390 knee** starts the shoulder at BT.2390's knee alone, which falls lower on bright frames. |
+| Shoulder Channel Blend | 0 | Blends each channel in the shoulder toward its own trip through the tone curve, as BT.2408 and libplacebo's film strength do. The brightest channel stays, so the load and the ceiling stay exact, but colors in the shoulder shift. |
+| Dither HDR10 Output | On | Dithers the pixels the boost changed. |
+| Show Stats | Off | Shows live numbers. |
+| OSD Brightness | 0.5 | Sets the brightness of the stats display and the debug graph. |
+
+| Stats row | Meaning |
+|---|---|
+| RAW LOAD | Load of the game's frame. |
+| OUT LOAD | Load the panel sees after the boost. |
+| FULL | Full compensation for the frame. |
+| GAIN | Gain the boost applies. |
+| CEIL | Ceiling in source nits, the signal peak divided by the gain. |
+| KNEE | Source level where the bend leaves the gain, in nits. |
+| RAW NITS | Brightest channel of the brightest source pixel. |
+
+3.1 has the same preprocessor definitions as 2.0. The calibration LUT runs after the boost, and the load counts what it sends. The debug graph draws from the panel model. `APL_FULLFRAME_ROLLING_PHASES` above 0 refreshes the histogram in that many row phases, one per frame, which costs less GPU time but makes the load lag.
+
+### Using 3.1
+
+- In the Windows HDR Calibration app, set the max luminance to 1015 nits, the peak the measurement is scaled to, and the max full-frame luminance to 265 nits, the 100% white window. Games that tone map read these values.
+- Keep 3.1 last in the effect chain, since it measures the signal the panel receives.
+- Keep DwmBoost off while 3.1 runs, or DWM boosts the frame again.
+- Let the game fill the screen. Light outside the back buffer adds load that 3.1 can't see.
+- Don't let a Windows color profile or another LUT change luminance after it.
+- Turn off every burn-in protection the monitor's OSD offers. Samsung's `QD_burn_in.c`, from related controller code for its TVs and monitors, gives PC modes no local protection with logo protection off, and its only other uniform cut follows the OSD's own state, which the signal can't show. So 3.1 compensates the power limit alone.
+
+### 3.1 verification
+
+`Shaders/verify/` builds `RenderEffect.exe`, which runs a ReShade effect on a saved frame the way ReShade 6.8 runs it in a D3D11 game, see CLAUDE.md. [`Shaders/verify/eotf_check.py`](Shaders/verify/eotf_check.py) replays a boosted frame through the panel model and reports the shown error against the PQ target by level band. It fails if any pixel sends more than the signal peak or the curve falls anywhere. Run `python eotf_check.py source.png boosted.png`.
+
 ## Null test
 
-[`Shaders/ABL_NullTest.fx`](Shaders/ABL_NullTest.fx) checks the compensation by eye, with no measuring gear. Copy it next to the boost, turn on **ABL_NullTest**, and move it above **EOTF_Boost_1D_APL_LUT** in the effect list so the boost analyzes the pattern. It writes the format ReShade reports, so keep the boost's **Input Signal** on **Auto**. For the checks that run with the boost on, set its **APL Smoothing Time** to 0, since the patches expect the compensation to follow the panel's dimming from the next frame.
+[`Shaders/ABL_NullTest.fx`](Shaders/ABL_NullTest.fx) checks 3.1's compensation by eye, with no measuring gear. Copy it next to 3.1 and its panel model, turn on **ABL_NullTest**, and move it above **EOTF_Boost_3_1_27M2N6500** in the effect list so the boost analyzes the pattern. It writes the format ReShade reports, as 3.1 reads it. In the checks that run with the boost on, the boost eases over its smoothing period after each switch, so judge the patches a moment after the fill changes.
 
 The pattern is a grid of nine gray patches inside a wide black gap. The rest of the screen switches once a second between state A, the first content in the test's name, and state B, the second. The middle patch keeps its level in both states. In state B the others change by 2% steps, starting one frame after the switch, when the panel's own dimming follows the load:
 
@@ -184,40 +240,42 @@ The panel dims all nine alike, so the patch that holds still shows how much more
 
 | Test | Boost | What it checks |
 |---|---|---|
-| Gray vs white window | Off | Whether a small bright window loads the panel the same as a dim fill with the same total light. |
-| Gray vs red, green, or blue | Off | Whether the panel's own red, green, or blue primary, taken from its EDID, loads it as the boost's load model counts it. |
-| Gray vs pastel red | Off | Whether a color halfway between the panel's red and white loads it as the load model counts it, which covers how mixed colors fall between a primary and white. |
+| Gray vs window at the peak | Off | Whether a small window at the panel peak loads the panel the same as a dim fill with the same total light. |
+| Gray vs red, green, or blue | Off | Whether a BT.2020 primary loads the panel as the panel model counts it. |
+| Gray vs pastel red | Off | Whether a color halfway between BT.2020 red and white loads the panel as the model counts it, which covers how mixed colors fall between a primary and white. |
 | Panel latency | Off | How many frames the panel's dimming lags behind a load change. |
-| Out APL 3% vs 6% through 50% vs 80% | On | How far the compensation table is off at one load relative to the other. |
+| Out load 3% vs 6% through 50% vs 80% | On | How far the model's compensation is off at one load relative to the other. |
 | Bright window, 150 nit patches | On | Whether a bright highlight coming into view leaves lower levels alone. |
 | Bright window, 150 nit patches | Off | Whether a near-peak window loads the panel the same as a fill with the same light. |
-| Shadow, 1 nit patches, out APL 3% vs 50% | On | Whether the panel dims near-black as much as brighter levels, so shadows get the right gain. |
-| Low end, APL 1% vs 3% | Off | Whether the panel holds its peak below 3% APL, where the measured table starts. |
+| Shadow, 1 nit patches, out load 3% vs 50% | On | Whether the panel dims near-black as much as brighter levels, so shadows get the right gain. |
+| Low end, load 1% vs 3% | Off | Whether the panel holds its peak up to the model's flat end at 3.16%. |
 
-In the model checks with the boost off, both states carry a 5% APL load as the boost counts it, and the RAW APL row of the stats display reads the same in both. The KNEE NIT row there shows what the boost would do if it were on, so it can be ignored. A still patch away from the middle means the panel treats one content as a heavier or lighter load than the boost counts. In the curve checks, the OUT APL row lands on the named loads, and the patches sit below the knee at every gain, so they always get the full gain.
+In the model checks with the boost off, both states carry a 5% load as the panel model counts it, each color with its brightest channel at the gray's level, and the RAW LOAD row of the stats display reads the same in both. A still patch away from the middle means the panel treats one content as a heavier or lighter load than the model counts. In the curve checks, the OUT LOAD row lands close to the named loads, and the patches sit below the shoulder at every gain, so they always get the full gain. The fill's 10-bit code moves the raw load slightly, and just under the model's knee the boost turns that into a few percent of out load, so the 10% load reads about 9.7%. The check reads true either way, since the boost follows the load it sees.
 
-The bright window checks use 150-nit patches, and both states carry the same 8% raw APL. In state B half of that light gathers into a 900-nit window left of the gap, as when a bright sky or lamp comes into view. With the boost on, the curve lands the window on the panel peak, so state B shows about 14% out APL against about 21% in state A. In state A nothing needs the room above the ceiling, and in state B the room comes from the empty levels between the patches and the window, so the patches keep the full gain in both states. With the boost off, both states load the panel the same by the boost's load model. If the middle patch holds still there, a reading away from the middle with the boost on comes from the table between those two out APLs. Otherwise the window loads the panel more or less than its light.
+The bright window checks use 150-nit patches, and both states carry the same 8% raw load. In state B half of that light gathers into a 900-nit window left of the gap, as when a bright sky or lamp comes into view, and with the boost on the shoulder rolls the window off under the ceiling. With the boost off, both states load the panel the same under the model. If the middle patch holds still there, a reading away from the middle with the boost on comes from the curve between the two out loads. Otherwise the window loads the panel more or less than its light.
 
-The shadow check uses 1-nit patches over the loads of the 3% and 50% out APL curve checks. The boost lifts near-black by the same gain as everything else, up to 3.77 times, while the measured table comes from bright windows. A still patch on the dimmer side means the panel dims near-black less than bright content, so shadows get too much gain.
+The shadow check uses 1-nit patches over the out loads 3% and 50%. The boost lifts near-black by the same gain as everything else, up to 3.77 times, while the model comes from bright windows. A still patch on the dimmer side means the panel dims near-black less than bright content, so shadows get too much gain.
 
-The low end check runs with the boost off and switches between 1% and 3% APL. The measured table starts at 3%, and the boost treats every lower load as undimmed. A still patch on the brighter side means the panel already dims between 1% and 3%.
+The low end check runs with the boost off and switches between 1% and 3% load. The model is flat up to 3.16%, so a still patch on the brighter side means the panel already dims between 1% and 3%.
 
-The panel latency check replaces the grid with a row of five in a black band across the middle, while the rest of the screen switches between 3% and 10% APL. Each patch is brightened by the measured compensation for the load of a frame further back, from the left the current frame, then 1, 2, 3, and 4 frames earlier. The panel dims all of them alike, so the patch whose delay matches the frames the panel's dimming lags behind holds still through both switches, while every other patch blinks for as many frames as its delay is off. On this panel the second patch holds still, one frame, which is what the boost is built on. Compare the patches with each other instead of watching one through a tube.
+The panel latency check replaces the grid with a row of five in a black band across the middle, while the rest of the screen switches between 3% and 10% load. Each patch is brightened by the model's compensation for the load of a frame further back, from the left the current frame, then 1, 2, 3, and 4 frames earlier. The panel dims all of them alike, so the patch whose delay matches the frames the panel's dimming lags behind holds still through both switches, while every other patch blinks for as many frames as its delay is off. Compare the patches with each other instead of watching one through a tube.
 
 ## Adapting to another monitor
 
-The live boost depends on the `APL_ANCHORS` table in the shader. In ascending APL order, each entry holds the base-2 logarithm of an APL in percent and the base-2 logarithm of the compensation at that APL.
+2.0's boost depends on the `APL_ANCHORS` table in the shader. In ascending APL order, each entry holds the base-2 logarithm of an APL in percent and the base-2 logarithm of the compensation at that APL.
 
-To retune the shader for another monitor:
+To retune 2.0 for another monitor:
 
 1. Measure the panel's peak brightness at each APL, starting with a window small enough to reach the full peak.
 2. Divide the full peak by each measurement to get the compensation values. The first value should be 1.0.
-3. Fill the table with log2 of each APL and log2 of its compensation, and set `APL_ANCHOR_COUNT` to the number of entries. `DwmBoost/hook/boost.hlsl` and `DwmBoost/verify/parity_check.py` hold copies of the same table.
+3. Fill the table with log2 of each APL and log2 of its compensation, and set `APL_ANCHOR_COUNT` to the number of entries.
 4. Set **APL Reference White** and **Panel Peak** to the panel's peak, and use the same peak in the Windows HDR color profile.
+
+To retune 3.1, measure windows the way `abl_curve.csv` does and run `fit_panel_model.py`, which rewrites the panel model for 3.1, the null test, and DwmBoost.
 
 ## Desktop-wide (DWM) version
 
-The ReShade shader only reaches a game that has ReShade installed. [`DwmBoost/`](DwmBoost) runs the same compensation on the **whole Windows 11 desktop** by hooking the desktop compositor (`dwm.exe`) and boosting each composed frame, the way [DesktopLUT](https://github.com/sup3rflyer/DesktopLUT) and the `dwm_lut` family do for desktop color calibration. It is meant for non-game desktop use; games keep using the ReShade shader. Its output matches the shader at its current default values.
+The ReShade shader only reaches a game that has ReShade installed. [`DwmBoost/`](DwmBoost) runs the same compensation on the **whole Windows 11 desktop** by hooking the desktop compositor (`dwm.exe`) and boosting each composed frame, the way [DesktopLUT](https://github.com/sup3rflyer/DesktopLUT) and the `dwm_lut` family do for desktop color calibration. It is meant for non-game desktop use, and games keep using the ReShade shader. It runs EOTF Boost 3.1's scRGB path and includes the same panel model, and its output matches 3.1 at its default settings.
 
 While the effect is on it forces DWM composition, which **disables variable refresh rate (VRR)**, so it is turned off for gaming. It applies only to the Philips 27M2N6500 (the 2560×1440 HDR monitor); other monitors are left untouched.
 
@@ -227,7 +285,7 @@ A tray app injects a hook into `dwm.exe` and keeps it resident. Toggling is inst
 - **Ctrl+Alt+Shift+Home** turns it off, which reverts the composition patches so VRR returns.
 - The tray menu has **Enable**, **Disable**, **Install autostart task** (an elevated logon task, no per-launch prompt), and **Quit**. Quit ejects the hook cleanly.
 
-On a static desktop DWM stops composing, so the app nudges the monitor once per refresh with a 1 px corner window for 22 frames and then 2.85 seconds after the last change, then stops. Each frame's gain follows the load of the frame before it within those frames, and the 0.5 second smoothing needs up to 2.85 seconds more to ease in from any gain, so this lets the gain settle on the new content without a game running.
+DWM composes only when something changes, so the gain smoothing runs on time, 3.1's 20 frames at the panel's 240 Hz. On a static desktop DWM stops composing, so the app nudges the monitor once per refresh with a 1 px corner window for one frame and then 0.48 seconds after the last change, then stops. Each frame solves its full compensation on its own, and the smoothing needs up to 0.48 seconds to ease in from any gain, so this lets the gain settle on the new content without a game running.
 
 The target panel and its build are pinned: the tool injects only into Windows 11 25H2 (build 26200 or later) and refuses to inject if any `dwmcore.dll` byte pattern it relies on is missing or ambiguous, which also guards against a future Windows update changing the compositor.
 
@@ -244,9 +302,9 @@ This produces `DwmBoost.exe` and `DwmBoostHook.dll` in `build/bin`, plus `Render
 
 ### Verification
 
-[`DwmBoost/verify/parity_check.py`](DwmBoost/verify/parity_check.py) mirrors the histogram, the curve fit and the boost on the CPU and checks them against the shader's values. It confirms the baked compensation table matches the measured panel peaks, a flat field gets the full gain up to the panel peak and lands on it above that, and midtones get the full gain. It plays cuts and short flashes frame by frame and confirms that without smoothing every frame gets exactly the dimming the panel applies to it, and that the compensation settles on the fixed point `compensation(APL after boost)` within the app's 22 settle frames, the count the table's steepest step calls for. It confirms the app's 4.08 extra settle seconds are the longest the baked smoothing needs to ease in from any APL, and plays the slowest cut with smoothing at 60 and 240 Hz to see it land within them. It plays cuts with smoothing from a snowfield the gain comes down on to a dark room and a bright sky and back, and confirms the shown gain moves one way. On synthetic scenes, from a lone speck over empty levels to a large bright sky, a snowfield that fills the screen and lamps far past the panel peak, it confirms the curve keeps the full gain up to the knee, stays exact while nothing on screen needs the room above the ceiling, never goes past the panel peak, under the fixed shoulder or flatter than it, pins nothing but the brightest content on the panel peak, moves no level by more than the room one added pixel takes or by half a 10-bit code for ten pixels spread over part of the range, and settles from any starting gain. It also checks that the null test's curve checks carry the loads the boost settles on. Run `python parity_check.py`.
+[`DwmBoost/verify/parity_check.py`](DwmBoost/verify/parity_check.py) renders synthetic frames, from black and flat fields to windows, highlights, a PQ ramp, primaries, and saturated noise, through the hook's pipeline and through 3.1 on an scRGB back buffer the way ReShade runs it, and fails if any channel differs by a quarter of a 10-bit code and by half an FP16 step of its pixel. It also checks that the geometry in `pipeline.h` matches `boost.hlsl` and that the settle time covers the slowest ease the smoothing allows. It needs `RenderFrame.exe` and the ReShade effect renderer in `Shaders/verify/` built. Run `python parity_check.py`.
 
-[`DwmBoost/verify/render_frame.cpp`](DwmBoost/verify/render_frame.cpp) builds `RenderFrame.exe`, which runs the hook's own pipeline and shader on the GPU over a saved HDR frame until the gain settles and writes the boosted frame. Both are 16-bit PQ BT.2020 PNGs like ReShade's HDR screenshots. It prints the raw and out APL, the compensation, the gain, the knee, how long the gain took to settle at the primary display's refresh rate and how far it still moves after that, and the GPU time of the whole pipeline and of the solve alone. Run `RenderFrame source.png boosted.png`.
+[`DwmBoost/verify/render_frame.cpp`](DwmBoost/verify/render_frame.cpp) builds `RenderFrame.exe`, which runs the hook's own pipeline and shader on the GPU over a saved HDR frame until the gain settles and writes the boosted frame. Both are 16-bit PQ BT.2020 PNGs like ReShade's HDR screenshots. It prints the raw and out load, the gain, the full compensation, the knee, the ceiling, how long the gain took to settle at the primary display's refresh rate and how far it still moves after that, and the GPU time of the whole pipeline and of the solve alone. Run `RenderFrame source.png boosted.png`.
 
 ## Credits
 

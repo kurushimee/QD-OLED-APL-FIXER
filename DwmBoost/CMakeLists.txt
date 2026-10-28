@@ -32,6 +32,7 @@ add_custom_command(
     OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/hook/boost_bytecode.h
     COMMAND ${CMAKE_COMMAND} -E env FXC=${FXC_EXE} cmd /c "${CMAKE_CURRENT_SOURCE_DIR}/hook/compile_shaders.cmd"
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hook/boost.hlsl
+            ${CMAKE_CURRENT_SOURCE_DIR}/../Shaders/PanelModel_27M2N6500.fxh
             ${CMAKE_CURRENT_SOURCE_DIR}/hook/compile_shaders.cmd
     COMMENT "Compiling boost.hlsl -> boost_bytecode.h")
 add_custom_target(boost_bytecode DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hook/boost_bytecode.h)

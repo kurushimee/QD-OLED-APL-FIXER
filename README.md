@@ -81,6 +81,50 @@ The table holds the peak the panel reaches with a full-signal window at each siz
 
 Below 3% APL the gain is 1, and the curve only makes room for content brighter than the panel peak. Between the points, it interpolates the logarithm of the peak against the logarithm of the APL, so the peak follows a power law from one point to the next.
 
+This table comes from an earlier measurement of white windows only. The shader doesn't use `abl_curve.csv` yet.
+
+### abl_curve.csv
+
+`abl_curve.csv` holds the latest measurement of the panel: white windows from 2% to 100% of the screen, gray windows at 100, 201, and 398 nits, red, green, blue, and yellow windows, and the black screen. Each row is one dogegen `window <size> <r> <g> <b>` pattern, with 10-bit PQ codes in BT.2020. The window size is a percentage of the screen area.
+
+Every value is the luminance in the middle of the 2% window, the same spot on the screen in every pattern. It comes from RAW photos with locked camera settings, with the black screen subtracted, the camera's lens glare fitted and removed, and each reading divided by the 2% white peak at the time of the shot, which cancels the panel's slow drift. The 2% white counts as 1015.24 nits, the panel's EDID max luminance. The 2% grays land at 96.6, 199.3, and 391.8 nits for 100.2, 201.0, and 397.9 nits of signal, so the scale holds.
+
+| Column | Meaning |
+|---|---|
+| `pattern`, `r`, `g`, `b` | Pattern name and its 10-bit PQ codes |
+| `signal_nits` | What the brightest code asks for in PQ |
+| `window_percent` | Window area as a percentage of the screen |
+| `load_percent` | Window area times the brightest channel's linear signal level relative to the 1015.24-nit peak, capped at 1. This is the load the panel dims by, see below |
+| `luminance_load_percent` | Window area times the pattern's own 2% `relative`, the frame's mean luminance as a percentage of full white at peak |
+| `relative` | Luminance relative to the 2% white peak |
+| `nits` | `relative` times 1015.24 |
+| `self_relative` | Luminance relative to the same pattern's 2% window, which is the panel's dimming alone. Compensation is its reciprocal |
+| `relative_with_glare` | `relative` before the lens glare was removed |
+| `x`, `y` | CIE 1931 chromaticity, with the 2% white taken as D65 |
+| `camera_r`, `camera_g`, `camera_b` | Raw sensor values in the measuring spot, with the black screen subtracted, before glare removal and drift correction. The black row keeps them unsubtracted |
+
+`self_relative` is reliable for every pattern. `relative`, `nits`, `x`, and `y` of colored windows rely on the phone's color matrix, which can't separate narrow QD primaries well, so they're rough, and red likely reads too bright. Chromaticity shifts between sizes of one pattern are real.
+
+#### Using it in the shader
+
+The panel dims a frame by the mean over all pixels of its brightest channel in linear light, relative to the panel peak and capped at 1. A full red, green, blue, or yellow window dims like a white window of the same size, and a gray window dims like a white window whose area is its own area times its level.
+
+1. Measure each frame's load the same way as `load_percent`: decode each pixel's channels from PQ, take the brightest, divide by 1015.24 nits, cap it at 1, and average it over the frame.
+2. Look up the dimming from the white rows, `self_relative` against `load_percent`, interpolating the logarithm of one against the logarithm of the other. The compensation is 1 over the dimming, and 1 below the 2% load.
+3. The gray and colored rows check the load metric. A correct one puts every row's `self_relative` on the white curve at its `load_percent`.
+
+How well each load metric predicts the gray and colored rows from the white curve:
+
+| Load metric | RMS error | Worst error |
+|---|---|---|
+| Brightest channel | 2.8% | 6.6% |
+| The current mix, a pure primary at 0.75 of white | 4.8% | 7.9% |
+| Luminance | 32.6% | 91.5% |
+
+With the brightest channel, red and yellow land within 1% and green within 2.5%. The current mix predicts 5% to 8% too little dimming for every primary. Luminance can't explain the colors, since a 25% blue window carries 2.6% of full white's luminance and still dims to 0.369, the same as a 25% white window at 0.368.
+
+The biggest misses are the 100-nit gray at 25% and 50%, which dim about 5% less than predicted, and the 100% blue window. The white curve has points only at 2%, 5%, and 10% where it falls fastest, so measuring white windows at 3%, 4%, and 7% would show whether the gray misses come from interpolation. The colored windows are pure BT.2020 primaries, which the panel shows at its own primaries, so the data can't tell whether the brightest channel should come from BT.2020 or from the panel's own primaries.
+
 ## Settings
 
 | Setting | Default | What it does |

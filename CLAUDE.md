@@ -12,7 +12,7 @@ ABL compensation for the Philips Evnia 27M2N6500 QD-OLED in HDR Peak 1000 mode. 
 
 `Shaders/EOTF_BoostMod3.0.fx` is a separate line, the upstream v8.18.7.15 shader with local tweaks. It has its own algorithm, nothing else mirrors it, and the README doesn't cover it
 
-`research.md` is a reading list on panel load models, the Samsung controller, timing and tonemapping. `abl_curve.csv` is the raw measurement the compensation table comes from
+`research.md` is a reading list on panel load models, the Samsung controller, timing and tonemapping. `abl_curve.csv` is the latest panel measurement, with white, gray and colored windows, and the README's `abl_curve.csv` section documents its columns and the load model it points to. The shader's current table still comes from an earlier white-only measurement, so the file isn't wired in yet
 
 ## Things that have to stay in sync
 

@@ -43,11 +43,12 @@ bool BoostPipeline::Create(ID3D11Device* dev, UINT w, UINT h)
     const UINT tileCountY = TileCount(h);
     const UINT rowTexH = tileCountY * BLOCK_H;
 
+    // The count textures carry an aux column for the brightest level.
     bool ok = true;
     ok &= CreateTex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, clean);
-    ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowCount);
+    ok &= CreateTex(dev, BLOCK_W + 1, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowCount);
     ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowOffset);
-    ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, globalCount);
+    ok &= CreateTex(dev, BLOCK_W + 1, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, globalCount);
     ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, globalOffset);
     ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplState);
     ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplPrev);

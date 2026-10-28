@@ -14,7 +14,7 @@ ABL compensation for the Philips Evnia 27M2N6500 QD-OLED in HDR Peak 1000 mode. 
 
 `Shaders/EOTF_BoostMod3.0.fx` is a separate line, the upstream v8.18.7.15 shader with local tweaks. It has its own algorithm, nothing else mirrors it, and the README doesn't cover it
 
-`research.md` is a reading list on panel load models, the Samsung controller, timing and tonemapping. `abl_curve.csv` is the latest panel measurement, with white, gray and colored windows, and the README's `abl_curve.csv` section documents its columns and the fitted panel model
+`abl_curve.csv` is the latest panel measurement, with white, gray and colored windows, and the README's `abl_curve.csv` section documents its columns and the fitted panel model
 
 ## Things that have to stay in sync
 
@@ -76,7 +76,7 @@ After editing `DwmBoost/app/icon.svg`, run `python make_icons.py` in `DwmBoost/a
 - `app/main.cpp` is the tray host. It injects `DwmBoostHook.dll` into `dwm.exe`, calls its exports on remote threads, writes the config into shared memory, handles the hotkeys and the autostart task, and nudges a static desktop with a 1 px window so DWM keeps composing until the gain settles
 - `hook/locate.cpp` finds `dwmcore.dll` internals by byte patterns pinned to Windows 11 build 26200 and later. Every pattern must match exactly once, or init refuses
 - `hook/flip_disable.cpp` patches DWM to force composition while the boost is on (this disables VRR) and reverts it on disable
-- `hook/present_hook.cpp` hooks present with MinHook and runs the pipeline only on the 27M2N6500. The present path reads a config mirror in atomics that a watcher thread fills, never the shared memory itself
+- `hook/present_hook.cpp` hooks present with MinHook and runs the pipeline only on the monitor the host targets, the first one with HDR on. The present path reads a config mirror in atomics that a watcher thread fills, never the shared memory itself
 - `hook/pipeline.cpp` runs the D3D11 passes from `boost.hlsl` (`CS_Setup`, `CS_Build`, `CS_Reduce`, `CS_Solve`, which also builds the tone curve lookup, then `VS_Boost` and `PS_Boost`) and is shared with `RenderFrame`. DWM only composes when something changes, so the gain smoothing runs on the time between runs instead of frames
 
 The hook DLL links the static CRT (`/MT`) because it lives inside `dwm.exe`. MinHook is vendored under `third_party/` and stays untouched

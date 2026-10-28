@@ -17,7 +17,7 @@ Present_t PresentGetDetour();
 // present path). resetGeneration bumps force one history-reset run.
 void PresentSetTarget(bool enabled, unsigned int resetGeneration,
                       int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr,
-                      float monLitFraction);
+                      float monLitFraction, float monRefreshMs);
 
 // Release all GPU resources and close the settle/content/prime events. Called when the effect is
 // toggled off and at Shutdown. Safe to call repeatedly and when nothing was created.

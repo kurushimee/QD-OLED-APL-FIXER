@@ -6,8 +6,9 @@
 # and by half an FP16 step of its pixel or more. The two compilers round floats differently, which can flip a buffer
 # value by one step, and on a saturated color that step is many PQ codes for a channel near black.
 # It also checks that the geometry in pipeline.h matches boost.hlsl, that the settle runs and seconds there cover
-# the in-frame solve and the slowest ease the smoothing period allows, and that a bright field covering most of the
-# screen keeps full compensation, so the gain doesn't fall away as the load climbs.
+# the in-frame solve and the slowest ease the smoothing period allows, that a bright field covering most of the
+# screen keeps full compensation, so the gain doesn't fall away as the load climbs, that both paths leave a frame
+# needing no gain untouched, and that the brightest content lands on the signal peak.
 # Needs both renderers built, see CLAUDE.md. Run: python parity_check.py
 
 import math
@@ -69,9 +70,12 @@ def window(background_nits, window_nits, area):
     return frame
 
 
-def pq_ramp():
-    levels = pq_to_nits(np.linspace(0.0, 1.0, FRAME_WIDTH))
+def horizontal_ramp(levels):
     return np.repeat(np.repeat(levels[None, :, None], FRAME_HEIGHT, axis=0), 3, axis=2)
+
+
+def pq_ramp():
+    return horizontal_ramp(pq_to_nits(np.linspace(0.0, 1.0, FRAME_WIDTH)))
 
 
 def primary_bars(nits):
@@ -130,6 +134,16 @@ def run(command):
     result = subprocess.run([str(part) for part in command], capture_output=True, text=True)
     if result.returncode != 0:
         sys.exit(f"{Path(command[0]).name} failed:\n{result.stdout}{result.stderr}")
+
+
+def effect_codes(source, space, output, *settings):
+    run([RENDER_EFFECT, SHADER_SOURCE, space, source, output, *settings])
+    return read_codes(output)
+
+
+def hook_codes(source, output):
+    run([RENDER_FRAME, source, output])
+    return read_codes(output)
 
 
 def compare_frames(folder):
@@ -192,6 +206,59 @@ def check_high_load_gain(folder):
         ok = stats["gain"] >= FULL_GAIN_TOLERANCE * stats["full_gain"]
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name}, gain {stats['gain']:.3f} of full {stats['full_gain']:.3f}")
+    return failures
+
+
+# Frames under the load where the panel starts dimming. The baseline is each renderer's own run with the boost off,
+# since scRGB rounds through FP16 on the way in.
+NO_GAIN_FRAMES = {
+    "20 nits": lambda: blank(20.0),
+    "ramp to 60 nits": lambda: horizontal_ramp(np.linspace(0.0, 60.0, FRAME_WIDTH)),
+}
+
+
+def check_no_gain_untouched(folder):
+    failures = 0
+    source = folder / "no_gain.png"
+    for name, make in NO_GAIN_FRAMES.items():
+        write_frame(source, make())
+        hdr10_off = effect_codes(source, "hdr10", folder / "no_gain_hdr10_off.png", "EnableEOTFBoost=0")
+        scrgb_off = effect_codes(source, "scrgb", folder / "no_gain_scrgb_off.png", "EnableEOTFBoost=0")
+        paths = {
+            "shader in HDR10": (effect_codes(source, "hdr10", folder / "no_gain_hdr10.png"), hdr10_off),
+            "shader in scRGB": (effect_codes(source, "scrgb", folder / "no_gain_scrgb.png"), scrgb_off),
+            "hook": (hook_codes(source, folder / "no_gain_hook.png"), scrgb_off),
+        }
+        for path, (boosted, untouched) in paths.items():
+            changed = np.any(boosted != untouched, axis=2).mean() * 100.0
+            ok = changed == 0.0
+            failures += not ok
+            print(f"{'ok  ' if ok else 'FAIL'} {name} through the {path}, {changed:.2f}% of pixels changed")
+    return failures
+
+
+# A window far past the ceiling, whose brightest level the curve tops out at the signal peak. HDR10 without the dither
+# sends the peak's code, and scRGB comes within one FP16 step of it.
+def check_peak(folder, model_text):
+    peak_nits = constant(model_text, "PANEL_SIGNAL_PEAK_NITS")
+    peak_code = round(float(nits_to_pq(peak_nits)) * 1023.0)
+    source = folder / "peak.png"
+    write_frame(source, window(0.0, 4000.0, 0.10))
+
+    hdr10_top = effect_codes(source, "hdr10", folder / "peak_hdr10.png", "EnableDither=0").max()
+    hdr10_ok = round(hdr10_top) == peak_code
+    print(f"{'ok  ' if hdr10_ok else 'FAIL'} brightest level through the shader in HDR10 at code {hdr10_top:.2f}, "
+          f"the peak is {peak_code}")
+
+    fp16_step = fp16_step_nits(np.full((1, 1, 3), peak_nits))[0, 0]
+    failures = not hdr10_ok
+    for path, codes in (("shader in scRGB", effect_codes(source, "scrgb", folder / "peak_scrgb.png")),
+                        ("hook", hook_codes(source, folder / "peak_hook.png"))):
+        top_nits = float(pq_to_nits(codes.max() / 1023.0))
+        ok = abs(top_nits - peak_nits) <= fp16_step
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} brightest level through the {path} at {top_nits:.2f} nits, "
+              f"the peak is {peak_nits:.2f} and an FP16 step {fp16_step:.2f}")
     return failures
 
 
@@ -266,11 +333,14 @@ def main():
 
     pipeline = PIPELINE_SOURCE.read_text()
     boost = BOOST_SOURCE.read_text()
+    model = PANEL_MODEL_SOURCE.read_text()
     failures = check_geometry(pipeline, boost)
-    failures += check_settle(pipeline, boost, PANEL_MODEL_SOURCE.read_text())
+    failures += check_settle(pipeline, boost, model)
 
     with tempfile.TemporaryDirectory() as folder:
         failures += check_high_load_gain(Path(folder))
+        failures += check_no_gain_untouched(Path(folder))
+        failures += check_peak(Path(folder), model)
         failures += compare_frames(Path(folder))
 
     print("\nall checks pass" if failures == 0 else f"\n{failures} checks failed")

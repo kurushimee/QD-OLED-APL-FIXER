@@ -4,6 +4,7 @@
 
 #include <d3d11.h>
 #include <dxgi.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +22,7 @@ std::atomic<int>      g_monLeft{0}, g_monTop{0};
 std::atomic<uint32_t> g_monWidth{0}, g_monHeight{0};
 std::atomic<bool>     g_monHdr{false};
 std::atomic<float>    g_monLitFraction{1.0f};
+std::atomic<float>    g_monRefreshMs{1000.0f / 60.0f};
 
 std::atomic<long>     g_inFlight{0};
 Present_t             g_orig = nullptr;
@@ -309,7 +311,10 @@ __int64 __fastcall PresentDetour(void* self, void* overlaySwapChain, unsigned in
                                 if (s.runsSinceContent < SETTLE_RUNS && ++s.runsSinceContent == SETTLE_RUNS)
                                     s.runsSettledQpc = now.QuadPart;
 
+                                // DWM keeps composing while the gain settles, so a longer gap means the desktop sat
+                                // still on a settled gain, and new content has been on screen for one refresh.
                                 float frameMs = (float)MsSince(s, s.lastRunQpc);
+                                if (newContent) frameMs = (std::min)(frameMs, g_monRefreshMs.load());
                                 s.lastRunQpc = now.QuadPart;
 
                                 StateBlock sb;
@@ -375,12 +380,13 @@ Present_t PresentGetDetour() { return (Present_t)PresentDetour; }
 
 void PresentSetTarget(bool enabled, unsigned int resetGeneration,
                       int monLeft, int monTop, unsigned int monWidth, unsigned int monHeight, bool monHdr,
-                      float monLitFraction)
+                      float monLitFraction, float monRefreshMs)
 {
     g_monLeft.store(monLeft); g_monTop.store(monTop);
     g_monWidth.store(monWidth); g_monHeight.store(monHeight);
     g_monHdr.store(monHdr);
     g_monLitFraction.store(monLitFraction);
+    if (monRefreshMs > 0.0f) g_monRefreshMs.store(monRefreshMs);
     g_resetGeneration.store(resetGeneration);
     g_enabled.store(enabled);
 }

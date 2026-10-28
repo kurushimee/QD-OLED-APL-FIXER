@@ -378,7 +378,7 @@ int Run(const wchar_t* sourcePath, const wchar_t* outputPath)
         gains.push_back(std::exp2(ReadBack<float>(dev.Get(), ctx.Get(), pipe.aplState.t, 4)[3]));
     }
 
-    // (frame mean PQ, out load, has history, log gain) and (raw load, full log gain, bend start nits, ceiling nits).
+    // (smoothed mean PQ, out load, has history, log gain) and (raw load, full log gain, bend start nits, ceiling nits).
     std::vector<float> state = ReadBack<float>(dev.Get(), ctx.Get(), pipe.aplState.t, 4);
     double gpuMs = TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Run(ctx.Get(), rtv.Get(), false, 1.0f, frameMs); });
     double solveMs = TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Solve(ctx.Get()); });

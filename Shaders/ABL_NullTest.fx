@@ -295,11 +295,11 @@ float FillNits(float rawLoad)
 }
 
 // The model check's light gathered into one square at the panel peak, left of the gap, against a gray fill of the
-// same light.
+// same light. The square's side rounds up, so the square holds that light at or under the peak.
 float3 WindowCheckNits(int2 pixel, bool stateB)
 {
     float light = LoadLight(MODEL_CHECK_LOAD);
-    int halfSide = int(round(0.5 * sqrt(light / PANEL_SIGNAL_PEAK_NITS)));
+    int halfSide = int(ceil(0.5 * sqrt(light / PANEL_SIGNAL_PEAK_NITS)));
     float windowNits = light / (4.0 * halfSide * halfSide);
 
     bool inWindow = InsideSquare(pixel, int2(BUFFER_WIDTH / 5, BUFFER_HEIGHT / 2), halfSide);

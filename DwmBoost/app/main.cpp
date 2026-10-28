@@ -188,6 +188,7 @@ bool CreateConfig()
     init.monWidth = g_target.width; init.monHeight = g_target.height;
     init.monHdr = g_target.hdr ? 1u : 0u;
     init.monLitFraction = (float)g_target.litFraction;
+    init.monRefreshMs = (float)g_target.refreshMs;
     init.hostPid = GetCurrentProcessId();
     *g_config = init;
     return true;
@@ -205,6 +206,7 @@ void WriteEnabled(bool enabled)
     g_config->monWidth = g_target.width; g_config->monHeight = g_target.height;
     g_config->monHdr = g_target.hdr ? 1u : 0u;
     g_config->monLitFraction = (float)g_target.litFraction;
+    g_config->monRefreshMs = (float)g_target.refreshMs;
     g_config->hostPid = GetCurrentProcessId();
     MemoryBarrier();
     g_config->version = (v | 1u) + 1u;       // publish (even)

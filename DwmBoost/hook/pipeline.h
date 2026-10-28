@@ -32,8 +32,8 @@ struct BoostPipeline
     UINT width = 0, height = 0;
 
     Tex clean;                     // RGBA16F scRGB frame the passes read (SRV)
-    Tex rowCount, rowOffset;       // R32_SINT (SRV+UAV)
-    Tex globalCount;               // R32_SINT (SRV+UAV)
+    Tex rowCount, rowOffset;       // R32_SINT (SRV+UAV), the counts with an aux column for the brightest level
+    Tex globalCount;               // R32_SINT (SRV+UAV), with the same aux column
     Tex globalOffset;              // R32_FLOAT (SRV+UAV)
     Tex aplState, aplPrev;         // 2x1 RGBA32F (SRV+UAV)
     Tex toneShape;                 // 1x1 RGBA32F (SRV+UAV)

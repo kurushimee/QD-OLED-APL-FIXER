@@ -1,6 +1,7 @@
 // DwmBoost tray host. Injects the hook DLL into dwm.exe, keeps it resident, and toggles the effect
 // through a shared-memory flag; the effect starts on. Hotkeys: Ctrl+Alt+Shift+End = on, Home = off. The kicker thread keeps
-// DWM composing the target monitor while the effect is still settling on a static desktop.
+// DWM composing the target monitor while the effect is still settling on a static desktop. The target, the first
+// monitor with HDR on, is picked again on every display change.
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
@@ -38,7 +39,8 @@ DwmBoostConfig* g_config = nullptr;
 HANDLE g_settleEvt = nullptr, g_contentEvt = nullptr, g_primeEvt = nullptr;
 HANDLE g_kickThread = nullptr, g_kickStop = nullptr;
 DWORD g_dwmPid = 0;
-bool g_enabled = false;
+bool g_wantOn = false;    // the user's choice
+bool g_enabled = false;   // what the config says: the user's choice while an HDR monitor exists
 Target g_target;
 NOTIFYICONDATAW g_nid = {};
 bool g_trayAdded = false;
@@ -161,6 +163,12 @@ Target FindHdrMonitor()
     return t;
 }
 
+bool SameTarget(const Target& a, const Target& b)
+{
+    return a.found == b.found && a.left == b.left && a.top == b.top && a.width == b.width && a.height == b.height &&
+           a.hdr == b.hdr && a.refreshMs == b.refreshMs && a.litFraction == b.litFraction;
+}
+
 // -------- shared config + events (null DACL so SYSTEM dwm.exe can open them) --------
 
 SECURITY_ATTRIBUTES* NullDaclSa()
@@ -194,13 +202,13 @@ bool CreateConfig()
     return true;
 }
 
-void WriteEnabled(bool enabled)
+void WriteConfig(bool enabled, bool resetHistory)
 {
     if (!g_config) return;
     uint32_t v = g_config->version;
     g_config->version = v | 1u;              // begin write (odd)
     MemoryBarrier();
-    if (enabled && !g_config->enabled) g_config->resetGeneration++;   // fresh history on each enable
+    if (resetHistory || (enabled && !g_config->enabled)) g_config->resetGeneration++;   // fresh history on each enable and target change
     g_config->enabled = enabled ? 1u : 0u;
     g_config->monLeft = g_target.left; g_config->monTop = g_target.top;
     g_config->monWidth = g_target.width; g_config->monHeight = g_target.height;
@@ -221,6 +229,13 @@ void CreateEvents()
     swprintf_s(name, DWMBOOST_CONTENT_FMT, g_target.left, g_target.top);
     g_contentEvt = CreateEventW(NullDaclSa(), FALSE, FALSE, name);
     g_primeEvt = CreateEventW(NullDaclSa(), FALSE, FALSE, DWMBOOST_PRIME_NAME);
+}
+
+void CloseEvents()
+{
+    if (g_settleEvt) { CloseHandle(g_settleEvt); g_settleEvt = nullptr; }
+    if (g_contentEvt) { CloseHandle(g_contentEvt); g_contentEvt = nullptr; }
+    if (g_primeEvt) { CloseHandle(g_primeEvt); g_primeEvt = nullptr; }
 }
 
 // -------- injection --------
@@ -512,17 +527,50 @@ void SetTray(HWND hwnd, bool create)
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_enabled ? g_iconOn : g_iconOff;
-    wcscpy_s(g_nid.szTip, g_enabled ? L"DwmBoost: on" : L"DwmBoost: off");
+    if (!g_target.found) wcscpy_s(g_nid.szTip, L"DwmBoost: no HDR monitor");
+    else wcscpy_s(g_nid.szTip, g_enabled ? L"DwmBoost: on" : L"DwmBoost: off");
 
     // NIM_MODIFY succeeds when an earlier add that timed out went through after all.
     if (create) g_trayAdded = Shell_NotifyIconW(NIM_ADD, &g_nid) || Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     else Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
+// The boost runs while the user wants it and an HDR monitor is there to boost.
+void ApplyBoostState(bool resetHistory)
+{
+    const bool on = g_wantOn && g_target.found;
+    WriteConfig(on, resetHistory);
+    if (on) StartKicker();
+    SetTray(g_hwnd, false);
+}
+
 void Toggle(bool on)
 {
-    WriteEnabled(on);
-    if (on) StartKicker();
+    g_wantOn = on;
+    ApplyBoostState(false);
+}
+
+// Picks the target again after a display change. The hook's watcher thread reads the rewritten config
+// and reverts the flip patch when no HDR monitor is left.
+void RetargetMonitor()
+{
+    const Target next = FindHdrMonitor();
+    if (SameTarget(next, g_target)) return;
+
+    Logf(L"DwmBoost: target %ux%u at %d,%d, found %d", next.width, next.height, next.left, next.top, next.found ? 1 : 0);
+    StopKicker();   // it reads g_target and waits on the events
+    CloseEvents();
+    g_target = next;
+    if (g_target.found) CreateEvents();
+    ApplyBoostState(true);
+}
+
+// The hook vanished (DWM restart or fault): mark off and do not reinject.
+void HandleHookLost()
+{
+    g_wantOn = false;
+    StopKicker();
+    WriteConfig(false, false);
     SetTray(g_hwnd, false);
 }
 
@@ -530,8 +578,8 @@ void ShowMenu(HWND hwnd)
 {
     POINT pt; GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING | (g_enabled ? MF_CHECKED : 0), CMD_ENABLE, L"Enable");
-    AppendMenuW(m, MF_STRING | (!g_enabled ? MF_CHECKED : 0), CMD_DISABLE, L"Disable");
+    AppendMenuW(m, MF_STRING | (g_wantOn ? MF_CHECKED : 0), CMD_ENABLE, L"Enable");
+    AppendMenuW(m, MF_STRING | (!g_wantOn ? MF_CHECKED : 0), CMD_DISABLE, L"Disable");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, CMD_AUTOSTART, L"Install autostart task");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -558,7 +606,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) ShowMenu(hwnd);
-        else if (LOWORD(lp) == WM_LBUTTONDBLCLK) Toggle(!g_enabled);
+        else if (LOWORD(lp) == WM_LBUTTONDBLCLK) Toggle(!g_wantOn);
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp))
@@ -569,9 +617,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case CMD_QUIT: DestroyWindow(hwnd); break;
         }
         return 0;
+    case WM_DISPLAYCHANGE:
+        RetargetMonitor();
+        return 0;
     case WM_TIMER:
-        // Heartbeat watch: if the hook vanished (DWM restart / fault), mark off and do not reinject.
-        if (!HeartbeatAlive() && g_enabled) { g_enabled = false; StopKicker(); if (g_config) g_config->enabled = 0; SetTray(hwnd, false); }
+        if (g_wantOn && !HeartbeatAlive()) HandleHookLost();
+        RetargetMonitor();   // Win32 has no notification for an HDR toggle alone
         if (!g_trayAdded) SetTray(hwnd, true);   // the shell can refuse icons early in logon
         return 0;
     case WM_DESTROY:
@@ -595,19 +646,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
 
     EnablePrivilege(SE_DEBUG_NAME);
 
+    // Without an HDR monitor the host waits for one, since at logon HDR can come up after the autostart task.
     g_target = FindHdrMonitor();
-    if (!g_target.found)
-    {
-        MessageBoxW(nullptr, L"No monitor with HDR enabled found.", L"DwmBoost", MB_OK | MB_ICONERROR);
-        return 1;
-    }
 
     if (!CreateConfig())
     {
         MessageBoxW(nullptr, L"Failed to create the shared config mapping.", L"DwmBoost", MB_OK | MB_ICONERROR);
         return 1;
     }
-    CreateEvents();
+    if (g_target.found) CreateEvents();
 
     auto dwmPids = FindPids(L"dwm.exe");
     if (dwmPids.empty()) { MessageBoxW(nullptr, L"dwm.exe not found.", L"DwmBoost", MB_OK | MB_ICONERROR); return 1; }
@@ -641,6 +688,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
     g_hwnd = CreateWindowExW(0, kWndClass, L"DwmBoost", 0, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
     ChangeWindowMessageFilterEx(g_hwnd, WM_TASKBARCREATED, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(g_hwnd, WM_TRAY, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(g_hwnd, WM_DISPLAYCHANGE, MSGFLT_ALLOW, nullptr);
 
     RegisterHotKey(g_hwnd, HOTKEY_ON, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_END);
     RegisterHotKey(g_hwnd, HOTKEY_OFF, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_HOME);
@@ -658,15 +706,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
     }
 
     StopKicker();
-    WriteEnabled(false);
+    WriteConfig(false, false);
     {
         if (ElevateToSystem()) { ShutdownAndEject(g_dwmPid); RevertToSelf(); }
     }
     if (g_config) UnmapViewOfFile(g_config);
     if (g_configMap) CloseHandle(g_configMap);
-    if (g_settleEvt) CloseHandle(g_settleEvt);
-    if (g_contentEvt) CloseHandle(g_contentEvt);
-    if (g_primeEvt) CloseHandle(g_primeEvt);
+    CloseEvents();
     if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
     return 0;
 }

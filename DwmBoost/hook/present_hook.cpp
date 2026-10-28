@@ -39,6 +39,7 @@ struct MonitorState
     bool primed = false;
 
     HANDLE settleEvt = nullptr, contentEvt = nullptr, primeEvt = nullptr;
+    int evtLeft = 0, evtTop = 0;   // target origin the settle and content events are named after
     unsigned evtOpenTick = 0;
 
     LARGE_INTEGER freq = {};
@@ -49,12 +50,17 @@ struct MonitorState
     uint32_t lastResetGeneration = 0;
     bool initialized = false;
 
-    void Release()
+    void CloseEvents()
     {
-        pipe.Release();
         if (settleEvt) { CloseHandle(settleEvt); settleEvt = nullptr; }
         if (contentEvt) { CloseHandle(contentEvt); contentEvt = nullptr; }
         if (primeEvt) { CloseHandle(primeEvt); primeEvt = nullptr; }
+    }
+
+    void Release()
+    {
+        pipe.Release();
+        CloseEvents();
         if (ctx) { ctx->Release(); ctx = nullptr; }
         if (dev) { dev->Release(); dev = nullptr; }
         owner = nullptr;
@@ -206,17 +212,26 @@ void UpdateCleanCopy(MonitorState& s, ID3D11Texture2D* backBuffer, const RECT* r
 
 void OpenEventsLazily(MonitorState& s)
 {
+    const int left = g_monLeft.load(), top = g_monTop.load();
+    if (left != s.evtLeft || top != s.evtTop)
+    {
+        // The host recreated the events under the moved target's origin.
+        s.CloseEvents();
+        s.evtLeft = left; s.evtTop = top;
+        s.evtOpenTick = 0;
+    }
+
     if (s.settleEvt && s.contentEvt && s.primeEvt) return;
     if ((s.evtOpenTick++ % 120u) != 0u) return;
     wchar_t name[96];
     if (!s.settleEvt)
     {
-        swprintf_s(name, DWMBOOST_SETTLE_FMT, g_monLeft.load(), g_monTop.load());
+        swprintf_s(name, DWMBOOST_SETTLE_FMT, left, top);
         s.settleEvt = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
     }
     if (!s.contentEvt)
     {
-        swprintf_s(name, DWMBOOST_CONTENT_FMT, g_monLeft.load(), g_monTop.load());
+        swprintf_s(name, DWMBOOST_CONTENT_FMT, left, top);
         s.contentEvt = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
     }
     if (!s.primeEvt)

@@ -200,7 +200,7 @@ Measure the new panel with windows the way `abl_curve.csv` does, at least white 
 
 The ReShade shader only reaches a game that has ReShade installed. [`DwmBoost/`](DwmBoost) runs the same compensation on the **whole Windows 11 desktop** by hooking the desktop compositor (`dwm.exe`) and boosting each composed frame, the way [DesktopLUT](https://github.com/sup3rflyer/DesktopLUT) and the `dwm_lut` family do for desktop color calibration. It is meant for non-game desktop use, and games keep using the ReShade shader. It runs the shader's scRGB path with the same panel model, and its output matches the shader at its default settings.
 
-While the effect is on it forces DWM composition, which **disables variable refresh rate (VRR)**, so it is turned off for gaming. It applies to the first monitor with HDR on and leaves other monitors untouched.
+While the effect is on it forces DWM composition, which **disables variable refresh rate (VRR)**, so it is turned off for gaming. It applies to the first monitor with HDR on and leaves other monitors untouched. The target follows display changes, so after HDR is toggled, the resolution or refresh rate changes, or a monitor is plugged in or removed, the boost moves to the first monitor with HDR on within 2 seconds. With no HDR monitor left the boost turns off and VRR returns, and it comes back on when one returns if it was on before.
 
 A tray app injects a hook into `dwm.exe` and keeps it resident. Toggling is instant and reversible:
 

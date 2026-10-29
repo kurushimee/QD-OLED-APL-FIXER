@@ -24,5 +24,5 @@ struct DwmLocations
     int* disableIndependentFlip = nullptr; // CCommonRegistryData::m_fDisableIndependentFlip
 };
 
-// Fills `out`; returns DWMBOOST_INIT_OK or the failure code. Supports Windows 11 25H2 (build >= 26200).
+// Fills `out`; returns DWMBOOST_INIT_OK or the failure code. Supports Windows 11 25H2 and 26H2 (build >= 26200).
 DwmBoostInitStatus LocateDwm(DwmLocations& out);

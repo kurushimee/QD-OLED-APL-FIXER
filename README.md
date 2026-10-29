@@ -210,7 +210,7 @@ A tray app injects a hook into `dwm.exe` and keeps it resident. Toggling is inst
 
 DWM composes only when something changes, so the gain smoothing runs on time, the shader's 20 frames at the panel's 240 Hz. On a static desktop DWM stops composing, so the app nudges the monitor once per refresh with a 1 px corner window for one frame and then 0.48 seconds after the last change, then stops. Each frame solves its full compensation on its own, and the smoothing needs up to 0.48 seconds to ease in from any gain, so this lets the gain settle on the new content without a game running. Once the desktop has sat still, the gain has settled, so the first new frame after that eases by the one refresh it has been on screen instead of the whole wait.
 
-The tool injects only into Windows 11 25H2 (build 26200 or later) and refuses to inject if any `dwmcore.dll` byte pattern it relies on is missing or ambiguous, which also guards against a future Windows update changing the compositor.
+The tool injects only into Windows 11 25H2 or 26H2 (build 26200 or later) and refuses to inject if any `dwmcore.dll` byte pattern it relies on is missing or ambiguous, which also guards against a future Windows update changing the compositor.
 
 ### Building
 

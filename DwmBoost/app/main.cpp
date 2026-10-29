@@ -606,7 +606,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) ShowMenu(hwnd);
-        else if (LOWORD(lp) == WM_LBUTTONDBLCLK) Toggle(!g_wantOn);
+        else if (LOWORD(lp) == WM_LBUTTONUP) Toggle(!g_wantOn);
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp))

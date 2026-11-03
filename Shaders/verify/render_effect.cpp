@@ -2,10 +2,16 @@
 // frame stayed on screen until the effect's output stops changing, and writes that output. Input and output are 16-bit
 // PQ BT.2020 PNGs like ReShade's HDR screenshots.
 //
-//   RenderEffect <effect.fx> <scrgb|hdr10> <source.png> <output.png> [-D NAME=VALUE ...] [name=value ...]
+//   RenderEffect <effect.fx> <scrgb|hdr10> <source.png> <output.png> [options] [-D NAME=VALUE ...] [name=value ...]
 //
 // scrgb runs the effect on an FP16 scRGB back buffer (BUFFER_COLOR_SPACE 2), hdr10 on a 10-bit PQ one (3). -D adds a
 // preprocessor definition and name=value sets a uniform like a preset line, with vector components comma separated.
+//
+//   --frame-ms MS        the frame time the effect sees, 1000/60 by default
+//   --from previous.png  first holds the previous frame until the output settles, then switches to the source
+//   --frames N           writes the first N outputs after the source comes in, as <output>_0000.png and on, instead
+//                        of the settled one
+//   --then next.png N    after those, runs next.png for N more frames and writes them too, and can repeat
 
 #include "effect_codegen.hpp"
 #include "effect_parser.hpp"
@@ -41,7 +47,6 @@ using DirectX::PackedVector::XMConvertHalfToFloat;
 namespace {
 
 const char* const RESHADE_VERSION = "60800";
-const float FRAME_MS = 1000.0f / 60.0f;
 
 // The output counts as settled once it holds still this long, and the run gives up after a minute.
 const int HOLD_FRAMES = 60;
@@ -86,6 +91,10 @@ struct Args
 {
     std::filesystem::path effect, source, output;
     ColorSpace colorSpace = ColorSpace::HDR10;
+    std::filesystem::path previous;
+    float frameMs = 1000.0f / 60.0f;
+    int frames = 0;
+    std::vector<std::pair<std::filesystem::path, int>> then;
     std::vector<std::pair<std::string, std::string>> definitions;
     std::vector<std::pair<std::string, std::string>> settings;
 };
@@ -122,6 +131,29 @@ bool ParseArgs(int argc, wchar_t** argv, Args& args)
 
     for (int i = 5; i < argc; ++i)
     {
+        bool hasValue = i + 1 < argc;
+        if (std::wcscmp(argv[i], L"--frame-ms") == 0 && hasValue)
+        {
+            args.frameMs = float(_wtof(argv[++i]));
+            continue;
+        }
+        if (std::wcscmp(argv[i], L"--from") == 0 && hasValue)
+        {
+            args.previous = argv[++i];
+            continue;
+        }
+        if (std::wcscmp(argv[i], L"--frames") == 0 && hasValue)
+        {
+            args.frames = _wtoi(argv[++i]);
+            continue;
+        }
+        if (std::wcscmp(argv[i], L"--then") == 0 && i + 2 < argc)
+        {
+            args.then.emplace_back(argv[i + 1], _wtoi(argv[i + 2]));
+            i += 2;
+            continue;
+        }
+
         bool isDefinition = std::wcscmp(argv[i], L"-D") == 0;
         if (isDefinition && ++i == argc)
             return false;
@@ -489,9 +521,11 @@ bool CreateTexture(ID3D11Device* dev, UINT width, UINT height, DXGI_FORMAT forma
 class EffectRunner
 {
 public:
-    bool Create(ID3D11Device* dev, ID3D11DeviceContext* ctx, const CompiledEffect& compiled, const Texture& backBuffer)
+    bool Create(ID3D11Device* dev, ID3D11DeviceContext* ctx, const CompiledEffect& compiled, const Texture& backBuffer,
+                float frameMs)
     {
         _module = compiled.module;
+        _frameMs = frameMs;
         _backBuffer = &backBuffer;
 
         if (_module.techniques.size() != 1)
@@ -543,6 +577,7 @@ private:
     ComPtr<ID3D11RasterizerState> _rasterizer;
     ComPtr<ID3D11Buffer> _constants;
     std::vector<uint8_t> _constantData;
+    float _frameMs = 0.0f;
 
     bool CreateTextures(ID3D11Device* dev, ID3D11DeviceContext* ctx)
     {
@@ -696,7 +731,7 @@ private:
             std::string source = AnnotationString(info.annotations, "source");
             if (source == "frametime")
             {
-                memcpy(&_constantData[info.offset], &FRAME_MS, sizeof(FRAME_MS));
+                memcpy(&_constantData[info.offset], &_frameMs, sizeof(_frameMs));
             }
             else if (source == "framecount" || source == "timer")
             {
@@ -911,38 +946,100 @@ int Run(const Args& args)
         return 1;
 
     EffectRunner effect;
-    if (!effect.Create(dev.Get(), ctx.Get(), compiled, backBuffer))
+    if (!effect.Create(dev.Get(), ctx.Get(), compiled, backBuffer, args.frameMs))
         return 1;
 
-    // The game draws the same frame every time and the effect runs on it until its output holds still.
-    const std::vector<uint8_t> frame = ToBackBuffer(source, args.colorSpace);
-    std::vector<uint8_t> previous, current;
-    int frames = 0, unchanged = 0;
-    for (; frames < MAX_FRAMES && unchanged < HOLD_FRAMES; ++frames)
-    {
+    auto renderFrame = [&](const std::vector<uint8_t>& frame) {
         ctx->UpdateSubresource(backBuffer.resource.Get(), 0, nullptr, frame.data(), source.width * texelSize, 0);
         effect.Render(ctx.Get());
+        return ReadBack(dev.Get(), ctx.Get(), staging.Get(), backBuffer.resource.Get(), texelSize);
+    };
 
-        current = ReadBack(dev.Get(), ctx.Get(), staging.Get(), backBuffer.resource.Get(), texelSize);
-        unchanged = SameSignal(previous, current, args.colorSpace) ? unchanged + 1 : 0;
-        std::swap(previous, current);
+    // The game draws the same frame every time and the effect runs on it until its output holds still.
+    auto settle = [&](const std::vector<uint8_t>& frame, std::vector<uint8_t>& output, int& settledFrames) {
+        std::vector<uint8_t> current;
+        int frames = 0, unchanged = 0;
+        for (; frames < MAX_FRAMES && unchanged < HOLD_FRAMES; ++frames)
+        {
+            current = renderFrame(frame);
+            unchanged = SameSignal(output, current, args.colorSpace) ? unchanged + 1 : 0;
+            std::swap(output, current);
+        }
+        settledFrames = frames - HOLD_FRAMES;
+        return unchanged >= HOLD_FRAMES;
+    };
+
+    auto save = [&](const std::vector<uint8_t>& texels, const std::filesystem::path& path) {
+        Image output = FromBackBuffer(texels, source.width, source.height, args.colorSpace);
+        if (SavePng(wic.Get(), path, output) && CopyColorChunks(args.source, path))
+            return true;
+        fwprintf(stderr, L"cannot write %s\n", path.c_str());
+        return false;
+    };
+
+    std::vector<uint8_t> output;
+    int settledFrames = 0;
+
+    if (!args.previous.empty())
+    {
+        Image previous;
+        if (!LoadPng(wic.Get(), args.previous, previous) || previous.width != source.width || previous.height != source.height)
+        {
+            fwprintf(stderr, L"cannot read %s at the source's size\n", args.previous.c_str());
+            return 1;
+        }
+        if (!settle(ToBackBuffer(previous, args.colorSpace), output, settledFrames))
+        {
+            fprintf(stderr, "previous output still changing after %d frames\n", MAX_FRAMES);
+            return 3;
+        }
     }
 
-    Image output = FromBackBuffer(previous, source.width, source.height, args.colorSpace);
-    if (!SavePng(wic.Get(), args.output, output) || !CopyColorChunks(args.source, args.output))
+    const std::vector<uint8_t> frame = ToBackBuffer(source, args.colorSpace);
+
+    if (args.frames > 0)
     {
-        fwprintf(stderr, L"cannot write %s\n", args.output.c_str());
+        std::vector<std::pair<std::vector<uint8_t>, int>> sequence = { { frame, args.frames } };
+        for (const auto& next : args.then)
+        {
+            Image image;
+            if (!LoadPng(wic.Get(), next.first, image) || image.width != source.width || image.height != source.height)
+            {
+                fwprintf(stderr, L"cannot read %s at the source's size\n", next.first.c_str());
+                return 1;
+            }
+            sequence.emplace_back(ToBackBuffer(image, args.colorSpace), next.second);
+        }
+
+        int index = 0;
+        for (const auto& step : sequence)
+        {
+            for (int repeat = 0; repeat < step.second; ++repeat, ++index)
+            {
+                wchar_t suffix[16];
+                swprintf_s(suffix, L"_%04d.png", index);
+                std::filesystem::path path = args.output;
+                path.replace_extension();
+                path += suffix;
+                if (!save(renderFrame(step.first), path))
+                    return 1;
+            }
+        }
+        return 0;
+    }
+
+    output.clear();
+    bool settled = settle(frame, output, settledFrames);
+    if (!save(output, args.output))
         return 1;
-    }
 
-    if (unchanged < HOLD_FRAMES)
+    if (!settled)
     {
-        fprintf(stderr, "output still changing after %d frames\n", frames);
+        fprintf(stderr, "output still changing after %d frames\n", MAX_FRAMES);
         return 3;
     }
 
-    const int settled = frames - HOLD_FRAMES;
-    printf("settled after %d frames (%.2f s)\n", settled, settled * FRAME_MS / 1000.0f);
+    printf("settled after %d frames (%.2f s)\n", settledFrames, settledFrames * args.frameMs / 1000.0f);
 
     // Each timed run boosts the back buffer again, which costs the same work as the held frame
     const double gpuMs = MeasureGpuMs(dev.Get(), ctx.Get(), effect);
@@ -958,7 +1055,7 @@ int wmain(int argc, wchar_t** argv)
     Args args;
     if (!ParseArgs(argc, argv, args))
     {
-        fwprintf(stderr, L"usage: RenderEffect <effect.fx> <scrgb|hdr10> <source.png> <output.png> [-D NAME=VALUE ...] [name=value ...]\n");
+        fwprintf(stderr, L"usage: RenderEffect <effect.fx> <scrgb|hdr10> <source.png> <output.png> [--frame-ms MS] [--from previous.png] [--frames N [--then next.png N ...]] [-D NAME=VALUE ...] [name=value ...]\n");
         return 2;
     }
 

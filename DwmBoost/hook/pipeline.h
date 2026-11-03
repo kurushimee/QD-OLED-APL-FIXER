@@ -11,13 +11,14 @@ const UINT TONE_CURVE_LUT_SIZE = 1024;
 
 inline UINT TileCount(UINT px) { return (px + TILE_SIZE - 1) / TILE_SIZE; }
 
-// Runs after a content change that keep DWM composing while the gain settles. Each run solves full compensation
-// within the frame, so one is enough.
+// Runs after a content change that keep DWM composing while the panel filter and the content top settle. Each run
+// advances both by the time since the last one, so one run lands on the new content.
 const int SETTLE_RUNS = 1;
 
-// Seconds after those runs that DWM keeps composing while the shown gain eases in. The ease's gap in log gain
-// shrinks as exp(-t / smoothing period), so from the largest gain 0.48 s bring it under half a 10-bit PQ code.
-const double SETTLE_SECONDS = 0.48;
+// Seconds after those runs that DWM keeps composing. Gain feedback slows the load response by up to
+// 1 / (1 - peak elasticity); the content top releases directly in PQ. The conservative bounds are 3.47 s for load
+// and 1.85 s for the top. Four seconds leave margin for discrete refresh steps, including 60 Hz.
+const double SETTLE_SECONDS = 4.0;
 
 struct Tex
 {
@@ -32,11 +33,13 @@ struct BoostPipeline
     UINT width = 0, height = 0;
 
     Tex clean;                     // RGBA16F scRGB frame the passes read (SRV)
-    Tex rowCount, rowOffset;       // R32_SINT (SRV+UAV), the counts with an aux column for the brightest level
+    // R32_SINT (SRV+UAV), the counts with an aux column for the brightest level, and each bin's summed level position
+    // and load ratios
+    Tex rowCount, rowOffset, rowDrive, rowLoad;
     Tex globalCount;               // R32_SINT (SRV+UAV), with the same aux column
-    Tex globalOffset;              // R32_FLOAT (SRV+UAV)
-    Tex aplState, aplPrev;         // 2x1 RGBA32F (SRV+UAV)
-    Tex toneShape;                 // 1x1 RGBA32F (SRV+UAV)
+    Tex globalSums;                // RGBA32F (SRV+UAV), the summed level position and load ratios
+    Tex aplState, aplPrev;         // RGBA32F (SRV+UAV), aplState 3x1: the state, the loads and the curve's stats
+    Tex toneShape;                 // 1x1 RGBA32F (SRV+UAV): (bend start PQ, bend width PQ, ceiling PQ, lookup start nits)
     Tex toneLUT;                   // R32_FLOAT (SRV+UAV)
 
     ID3D11ComputeShader* csSetup = nullptr;

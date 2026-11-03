@@ -40,17 +40,18 @@ bool BoostPipeline::Create(ID3D11Device* dev, UINT w, UINT h)
     Release();
     width = w; height = h;
 
-    const UINT tileCountY = TileCount(h);
-    const UINT rowTexH = tileCountY * BLOCK_H;
+    const UINT rowTexH = TileCount(h) * BLOCK_H;
 
-    // The count textures carry an aux column for the brightest level.
+    // The count texture carries an aux column for the brightest level.
     bool ok = true;
     ok &= CreateTex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, clean);
     ok &= CreateTex(dev, BLOCK_W + 1, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowCount);
     ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowOffset);
+    ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowDrive);
+    ok &= CreateTex(dev, BLOCK_W, rowTexH, DXGI_FORMAT_R32_SINT, true, true, rowLoad);
     ok &= CreateTex(dev, BLOCK_W + 1, BLOCK_H, DXGI_FORMAT_R32_SINT, true, true, globalCount);
-    ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32_FLOAT, true, true, globalOffset);
-    ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplState);
+    ok &= CreateTex(dev, BLOCK_W, BLOCK_H, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, globalSums);
+    ok &= CreateTex(dev, 3, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplState);
     ok &= CreateTex(dev, 2, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, aplPrev);
     ok &= CreateTex(dev, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, true, toneShape);
     ok &= CreateTex(dev, TONE_CURVE_LUT_SIZE, 1, DXGI_FORMAT_R32_FLOAT, true, true, toneLUT);
@@ -90,9 +91,9 @@ void BoostPipeline::Run(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv, boo
     c->CSSetConstantBuffers(0, 1, &cb);
     {
         ID3D11ShaderResourceView* srv[1] = { aplState.srv };
-        ID3D11UnorderedAccessView* uav[3] = { rowCount.uav, rowOffset.uav, aplPrev.uav };
+        ID3D11UnorderedAccessView* uav[5] = { rowCount.uav, rowOffset.uav, rowDrive.uav, rowLoad.uav, aplPrev.uav };
         c->CSSetShaderResources(0, 1, srv);
-        c->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
+        c->CSSetUnorderedAccessViews(0, 5, uav, nullptr);
         c->CSSetShader(csSetup, nullptr, 0);
         c->Dispatch(1, 1, 1);
     }
@@ -101,9 +102,9 @@ void BoostPipeline::Run(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv, boo
     ClearCS(c);
     {
         ID3D11ShaderResourceView* srv[1] = { clean.srv };
-        ID3D11UnorderedAccessView* uav[2] = { rowCount.uav, rowOffset.uav };
+        ID3D11UnorderedAccessView* uav[4] = { rowCount.uav, rowOffset.uav, rowDrive.uav, rowLoad.uav };
         c->CSSetShaderResources(0, 1, srv);
-        c->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
+        c->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
         c->CSSetShader(csBuild, nullptr, 0);
         c->Dispatch(TileCount(width), TileCount(height), 1);
     }
@@ -111,9 +112,9 @@ void BoostPipeline::Run(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv, boo
     // Pass 3: reduce to the global histogram.
     ClearCS(c);
     {
-        ID3D11ShaderResourceView* srv[2] = { rowCount.srv, rowOffset.srv };
-        ID3D11UnorderedAccessView* uav[2] = { globalCount.uav, globalOffset.uav };
-        c->CSSetShaderResources(0, 2, srv);
+        ID3D11ShaderResourceView* srv[4] = { rowCount.srv, rowOffset.srv, rowDrive.srv, rowLoad.srv };
+        ID3D11UnorderedAccessView* uav[2] = { globalCount.uav, globalSums.uav };
+        c->CSSetShaderResources(0, 4, srv);
         c->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
         c->CSSetShader(csReduce, nullptr, 0);
         c->Dispatch(BLOCK_W, BLOCK_H, 1);
@@ -146,7 +147,7 @@ void BoostPipeline::Solve(ID3D11DeviceContext* c)
 {
     ClearCS(c);
     {
-        ID3D11ShaderResourceView* srv[3] = { globalCount.srv, globalOffset.srv, aplPrev.srv };
+        ID3D11ShaderResourceView* srv[3] = { globalCount.srv, globalSums.srv, aplPrev.srv };
         ID3D11UnorderedAccessView* uav[3] = { aplState.uav, toneShape.uav, toneLUT.uav };
         c->CSSetShaderResources(0, 3, srv);
         c->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
@@ -159,8 +160,8 @@ void BoostPipeline::Solve(ID3D11DeviceContext* c)
 void BoostPipeline::Release()
 {
     clean.Release();
-    rowCount.Release(); rowOffset.Release();
-    globalCount.Release(); globalOffset.Release();
+    rowCount.Release(); rowOffset.Release(); rowDrive.Release(); rowLoad.Release();
+    globalCount.Release(); globalSums.Release();
     aplState.Release(); aplPrev.Release();
     toneShape.Release(); toneLUT.Release();
     if (csSetup) { csSetup->Release(); csSetup = nullptr; }

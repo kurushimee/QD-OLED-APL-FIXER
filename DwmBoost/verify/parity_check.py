@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# Parity check for boost.hlsl against Shaders/EOTF_BoostMod3.1_27M2N6500.fx at its default settings.
+# Parity check for boost.hlsl against Shaders/EOTF_BoostMod3.1_27M2N6500.fx.
 #
-# Renders synthetic frames through the hook's pipeline (RenderFrame) and through the shader on an scRGB back buffer
-# the way ReShade runs it (RenderEffect), and fails when a channel differs by a quarter of a 10-bit PQ code or more
-# and by half an FP16 step of its pixel or more. The two compilers round floats differently, which can flip a buffer
-# value by one step, and on a saturated color that step is many PQ codes for a channel near black.
-# It also checks that the geometry in pipeline.h matches boost.hlsl, that the settle runs and seconds there cover
-# the in-frame solve and the slowest ease the smoothing period allows, that a bright field covering most of the
-# screen keeps full compensation, so the gain doesn't fall away as the load climbs, that both paths leave a frame
-# needing no gain untouched, and that the brightest content lands on the signal peak.
+# Both include Shaders/EOTF_BoostCore_27M2N6500.fxh, so most of this checks what the two wrappers around it do: it
+# renders synthetic frames through the hook's pipeline (RenderFrame) and through the shader on an scRGB back buffer the
+# way ReShade runs it (RenderEffect) and fails when a channel differs by a quarter of a 10-bit PQ code or more and by
+# half an FP16 step of its pixel or more. The two compilers round floats differently, which can flip a buffer value by
+# one step, and on a saturated color that step is many PQ codes for a channel near black.
+# It also checks the geometry in pipeline.h against the core, that the settle time covers the panel filter and the
+# content top release, that midtones keep full compensation on every frame but a whiteout, that a frame needing no gain
+# stays untouched, and that the brightest content lands on the signal peak.
 # Needs both renderers built, see CLAUDE.md. Run: python parity_check.py
 
 import math
@@ -22,8 +22,11 @@ import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT / "Shaders" / "verify"))
+import fit_panel_model as model_fit
+
 PIPELINE_SOURCE = ROOT / "DwmBoost" / "hook" / "pipeline.h"
-BOOST_SOURCE = ROOT / "DwmBoost" / "hook" / "boost.hlsl"
+CORE_SOURCE = ROOT / "Shaders" / "EOTF_BoostCore_27M2N6500.fxh"
 PANEL_MODEL_SOURCE = ROOT / "Shaders" / "PanelModel_27M2N6500.fxh"
 SHADER_SOURCE = ROOT / "Shaders" / "EOTF_BoostMod3.1_27M2N6500.fx"
 RENDER_FRAME = ROOT / "DwmBoost" / "build" / "bin" / "Release" / "RenderFrame.exe"
@@ -134,6 +137,7 @@ def run(command):
     result = subprocess.run([str(part) for part in command], capture_output=True, text=True)
     if result.returncode != 0:
         sys.exit(f"{Path(command[0]).name} failed:\n{result.stdout}{result.stderr}")
+    return result.stdout
 
 
 def effect_codes(source, space, output, *settings):
@@ -167,7 +171,7 @@ def compare_frames(folder):
 
 
 # A smooth cyan to white gradient over most of the screen, like a bright out of focus background, beside a dim blue
-# band. Its spread of bright levels once made warps read a stale load and the pick fall to gain 1.
+# band.
 def cyan_gradient(top_nits):
     x = np.linspace(0.0, 1.0, FRAME_WIDTH)
     level = top_nits * (0.25 + 0.75 * np.sqrt(np.clip(1.0 - np.abs(x - 0.35) / 0.5, 0.0, 1.0)))
@@ -176,8 +180,7 @@ def cyan_gradient(top_nits):
     return frame
 
 
-# Every gain past the ceiling sends a bright field to the peak, so its own pixels score alike and the rest of the
-# frame needs full compensation.
+# Frames whose bright areas cover most of the screen, where the panel can't reach the target.
 HIGH_LOAD_FRAMES = {
     "480 nits over 100% on 5 nits": lambda: window(5.0, 480.0, 1.0),
     "800 nits over 95% on 5 nits": lambda: window(5.0, 800.0, 0.95),
@@ -186,26 +189,27 @@ HIGH_LOAD_FRAMES = {
     "cyan gradient to 600 nits": lambda: cyan_gradient(600.0),
     "cyan gradient to 800 nits": lambda: cyan_gradient(800.0),
 }
-FULL_GAIN_TOLERANCE = 0.99
 
 
 def render_frame_stats(source, output):
-    result = subprocess.run([str(RENDER_FRAME), str(source), str(output)], capture_output=True, text=True)
-    if result.returncode != 0:
-        sys.exit(f"RenderFrame failed:\n{result.stdout}{result.stderr}")
-    fields = result.stdout.split()
+    fields = run([RENDER_FRAME, source, output]).split()
     return {name: float(value) for name, value in zip(fields[0::2], fields[1::2])}
 
 
-def check_high_load_gain(folder):
+# Midtones keep full compensation on every frame whose ceiling most of the picture fits under. The softmin only takes
+# over past the whiteout start share of the lit pixels above the ceiling, and then it never falls to gain 1.
+def check_midtone_lock(folder):
     failures = 0
     for name, make in HIGH_LOAD_FRAMES.items():
         source = folder / "high_load.png"
         write_frame(source, make())
         stats = render_frame_stats(source, folder / "high_load_out.png")
-        ok = stats["gain"] >= FULL_GAIN_TOLERANCE * stats["full_gain"]
+        full = stats["gain"] >= 0.999 * stats["full_gain"]
+        whiteout = stats["whiteout"]
+        ok = full if whiteout == 0.0 else stats["gain"] > 1.0
         failures += not ok
-        print(f"{'ok  ' if ok else 'FAIL'} {name}, gain {stats['gain']:.3f} of full {stats['full_gain']:.3f}")
+        print(f"{'ok  ' if ok else 'FAIL'} {name}, gain {stats['gain']:.3f} of full {stats['full_gain']:.3f}, "
+              f"clipped {100.0 * stats['clipped']:.1f}%, whiteout {whiteout:.2f}")
     return failures
 
 
@@ -245,7 +249,7 @@ def check_peak(folder, model_text):
     source = folder / "peak.png"
     write_frame(source, window(0.0, 4000.0, 0.10))
 
-    hdr10_top = effect_codes(source, "hdr10", folder / "peak_hdr10.png", "EnableDither=0").max()
+    hdr10_top = effect_codes(source, "hdr10", folder / "peak_hdr10.png").max()
     hdr10_ok = round(hdr10_top) == peak_code
     print(f"{'ok  ' if hdr10_ok else 'FAIL'} brightest level through the shader in HDR10 at code {hdr10_top:.2f}, "
           f"the peak is {peak_code}")
@@ -276,48 +280,56 @@ def define(text, name):
     return int(match.group(1))
 
 
-def check_geometry(pipeline, boost):
+def check_geometry(pipeline, core):
     pairs = [
-        ("TILE_SIZE", "APL_FFH_TILE_SIZE"),
-        ("BLOCK_W", "APL_FFH_BLOCK_W"),
-        ("BLOCK_H", "APL_FFH_BLOCK_H"),
+        ("TILE_SIZE", "HIST_TILE_SIZE"),
+        ("BLOCK_W", "HIST_BLOCK_W"),
+        ("BLOCK_H", "HIST_BLOCK_H"),
         ("TONE_CURVE_LUT_SIZE", "TONE_CURVE_LUT_SIZE"),
     ]
     failures = 0
     for host_name, shader_name in pairs:
         host = int(re.search(rf"\b{host_name}\s*=\s*(\d+)", pipeline).group(1))
-        shader = define(boost, shader_name)
+        shader = define(core, shader_name)
         ok = host == shader
         failures += not ok
-        print(f"{'ok  ' if ok else 'FAIL'} {host_name} {host} in pipeline.h, {shader} in boost.hlsl")
+        print(f"{'ok  ' if ok else 'FAIL'} {host_name} {host} in pipeline.h, {shader} in the core")
     return failures
 
 
-def compensation(load_percent, model):
-    flat_end, slope = model["PANEL_COMP_FLAT_END"], model["PANEL_COMP_SLOPE"]
-    knee, power = model["PANEL_COMP_KNEE"], model["PANEL_COMP_POWER"]
-    if load_percent <= knee:
-        return 1.0 + slope * max(load_percent - flat_end, 0.0)
-    return (1.0 + slope * (knee - flat_end)) * (load_percent / knee) ** power
-
-
-# The ease closes its log gain gap as exp(-t / period), from at most full compensation at a full white frame down to
-# half the smallest relative step between 10-bit PQ codes up to the signal peak.
-def slowest_ease_seconds(model, period_ms):
-    top_code = int(nits_to_pq(model["PANEL_SIGNAL_PEAK_NITS"]) * 1023.0)
+# Bound load error in percent and content-top error in PQ separately. The gain solve feeds load back into itself,
+# slowing the load filter by up to 1 / (1 - peak elasticity). The top has no such feedback and decays directly in PQ.
+def slowest_seconds(model_text, core):
+    model = {
+        "PANEL_FLAT_END_LOAD": constant(model_text, "PANEL_FLAT_END_LOAD"),
+        "PANEL_KNEE_POINT": tuple(float(v) for v in re.search(r"PANEL_KNEE_POINT\s*=\s*float2\(([^)]*)\)", model_text).group(1).split(",")),
+        "PANEL_TAIL_EXPONENT": constant(model_text, "PANEL_TAIL_EXPONENT"),
+    }
+    peak_nits = constant(model_text, "PANEL_SIGNAL_PEAK_NITS")
+    top_code = int(nits_to_pq(peak_nits) * 1023.0)
     codes = np.arange(1, top_code)
     smallest_step = np.min(pq_to_nits((codes + 1) / 1023.0) / pq_to_nits(codes / 1023.0) - 1.0)
     tolerance = math.log2(1.0 + 0.5 * smallest_step)
-    largest_gap = math.log2(compensation(100.0, model))
-    return period_ms / 1000.0 * math.log(largest_gap / tolerance)
+    curve = (model["PANEL_FLAT_END_LOAD"], *model["PANEL_KNEE_POINT"], model["PANEL_TAIL_EXPONENT"])
+    loads = np.geomspace(0.01, 100.0, 10000)
+    elasticity = model_fit.elasticity(curve, loads)
+    peak_elasticity = float(elasticity.max())
+    max_log_gain_slope = float((elasticity / (loads * math.log(2.0))).max())
+    load_tolerance = tolerance / max_log_gain_slope
+    response_seconds = max(constant(model_text, "PANEL_DIM_SECONDS"), constant(model_text, "PANEL_UNDIM_SECONDS"))
+    load_seconds = response_seconds / (1.0 - peak_elasticity) * math.log(100.0 / load_tolerance)
+
+    # A frame's content top starts as low as the lowest bin and can sit at the top of PQ, and the curve only reaches
+    # past the ceiling, so the gap is bounded by the whole PQ range.
+    pq_tolerance = min(0.5 / 1023.0, constant(core, "SETTLED_PQ"))
+    top_seconds = constant(core, "CONTENT_TOP_RELEASE_SECONDS") * math.log(1.0 / pq_tolerance)
+    return max(load_seconds, top_seconds)
 
 
-def check_settle(pipeline, boost, model_text):
-    model = {name: constant(model_text, name) for name in
-             ["PANEL_SIGNAL_PEAK_NITS", "PANEL_COMP_FLAT_END", "PANEL_COMP_SLOPE", "PANEL_COMP_KNEE", "PANEL_COMP_POWER"]}
+def check_settle(pipeline, core, model_text):
     runs = constant(pipeline, "SETTLE_RUNS")
     seconds = constant(pipeline, "SETTLE_SECONDS")
-    needed = slowest_ease_seconds(model, constant(boost, "SMOOTHING_PERIOD_MS"))
+    needed = slowest_seconds(model_text, core)
 
     runs_ok = runs >= 1
     seconds_ok = seconds >= needed
@@ -326,22 +338,72 @@ def check_settle(pipeline, boost, model_text):
     return (not runs_ok) + (not seconds_ok)
 
 
+def check_wide_histogram(folder):
+    failures = 0
+    reference = None
+    for width in (1920, 7680, 16384):
+        frame = np.empty((64, width, 3), dtype=np.float64)
+        frame[:] = (80.0, 0.0, 0.0)
+        frame[:, :width // 16] = 60.0
+        source = folder / f"wide_{width}.png"
+        write_frame(source, frame)
+        hook = hook_codes(source, folder / f"wide_{width}_hook.png")
+        shader = effect_codes(source, "scrgb", folder / f"wide_{width}_shader.png")
+        code = float(hook[32, width // 2].max())
+        if reference is None:
+            reference = code
+        difference = abs(code - reference)
+        parity = float(mismatch(hook, shader).max())
+        ok = difference <= MAX_DIFF_CODES and parity < 1.0
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} {width}-wide histogram: {difference:.3f} codes from native width, "
+              f"{parity:.2f} of the parity tolerance")
+    return failures
+
+
+def check_tab_release(folder):
+    failures = 0
+    source = folder / "black_tab.png"
+    # The boost-off shader round-trips through the same FP16 input/output as the hook. This reference contains no
+    # temporal panel model, so a shared release-time assumption cannot hide residual first-frame compensation.
+    for dark_nits in (0.0, 1.0):
+        dark = blank(dark_nits)
+        dark[200:260, 40:100] = 60.0
+        dark[280:340, 40:100] = 150.0
+        write_frame(source, dark)
+        reference = effect_codes(source, "scrgb", folder / "black_tab_reference.png", "EnableEOTFBoost=0")
+        for nits in (203.0, 1000.0):
+            previous = folder / "white_tab.png"
+            write_frame(previous, blank(nits))
+            output = folder / "black_tab_first.png"
+            stats = run([RENDER_FRAME, source, output, "--from", previous]).split()
+            stats = {key: float(value) for key, value in zip(stats[::2], stats[1::2])}
+            changed = float(np.any(read_codes(output) != reference, axis=2).mean())
+            ok = stats["gain"] == 1.0 and changed == 0.0
+            failures += not ok
+            print(f"{'ok  ' if ok else 'FAIL'} {nits:.0f} to {dark_nits:.0f} nit tab through DWM: first-frame gain "
+                  f"{stats['gain']:.6f}, {100.0 * changed:.3f}% of pixels changed")
+    return failures
+
+
 def main():
     for tool in (RENDER_FRAME, RENDER_EFFECT):
         if not tool.exists():
             sys.exit(f"{tool} isn't built, see CLAUDE.md")
 
     pipeline = PIPELINE_SOURCE.read_text()
-    boost = BOOST_SOURCE.read_text()
+    core = CORE_SOURCE.read_text()
     model = PANEL_MODEL_SOURCE.read_text()
-    failures = check_geometry(pipeline, boost)
-    failures += check_settle(pipeline, boost, model)
+    failures = check_geometry(pipeline, core)
+    failures += check_settle(pipeline, core, model)
 
     with tempfile.TemporaryDirectory() as folder:
-        failures += check_high_load_gain(Path(folder))
+        failures += check_tab_release(Path(folder))
+        failures += check_midtone_lock(Path(folder))
         failures += check_no_gain_untouched(Path(folder))
         failures += check_peak(Path(folder), model)
         failures += compare_frames(Path(folder))
+        failures += check_wide_histogram(Path(folder))
 
     print("\nall checks pass" if failures == 0 else f"\n{failures} checks failed")
     return 1 if failures else 0

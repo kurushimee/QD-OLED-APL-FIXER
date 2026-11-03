@@ -6,7 +6,7 @@
     and the rest of the screen switches between two loads once a second. The
     middle patch keeps its level in both states. In state B the others change by
     2% steps in reading order, from four steps dimmer at the top left to four
-    steps brighter at the bottom right, starting one frame after the switch. The
+    steps brighter at the bottom right, starting on the switch. The
     panel dims every patch alike, so the one that holds still reads off how much
     more the panel dims state B than the panel model expects, and the middle one
     holds still when the model is right. The frame rate has to stay at or under
@@ -14,30 +14,37 @@
     refresh.
 
     Loads follow the panel model in PanelModel_27M2N6500.fxh: the frame mean of
-    each pixel's brightest channel in linear BT.2020, over the load peak.
+    each pixel's brightest weighted native subpixel drive, including static
+    tracking, over the load peak.
 
     Model checks run with the boost off. Both states carry the same load, 5%, so
     a still patch other than the middle one means the panel weighs that content
     differently. The window check gathers the load into one square at the panel
     peak. The color checks show BT.2020's primaries and a pastel red halfway
-    between its red and white, each with its brightest channel at the gray's
-    level, which loads the panel like the gray under the model.
+    between its red and white, at the levels the model counts as the gray's load,
+    which differs per color since the panel drives its own primaries.
 
-    The panel latency check also runs with the boost off. The rest of the
+    The panel response checks also run with the boost off. The rest of the
     screen switches between 3% and 10% load, and a black band across the middle
     holds a row of patches. Each patch is brightened by the model's compensation
-    for the load of a frame further back, from the left the current frame, then
-    1, 2, 3 and 4 frames earlier. The panel dims every patch alike, so the patch
-    whose delay matches the frames the panel's dimming lags behind holds still
-    through both switches, while every other patch blinks for as many frames as
-    its delay is off.
+    for the load filtered through the panel's response with different time
+    constants. The panel undims faster than it dims, so each check varies one
+    direction and follows the model's in the other. The dimming check varies
+    the time constant toward the higher load, from the left an instant load,
+    then 40, 80, 160 and 320 ms, and reads at the switch to 10%. The undimming
+    check varies the one toward the lower load, an instant load, then 10, 20,
+    40 and 80 ms, and reads at the switch to 3%. The panel dims every patch
+    alike, so the patch whose time constant matches the panel's own holds
+    still through its switch. The boost's dimming, 80 ms, shows as the middle
+    patch of the dimming check. The boost now releases immediately, matching
+    the leftmost patch of the undimming check.
 
     Curve checks run with the boost on. Each state's raw load is the one the
-    boost settles on the named out load for, the out load over its compensation,
-    since every fill sits under the ceiling. The patches get the full gain, and
+    boost settles on the named out load for, with the signal divided by its
+    compensation before tracking is counted, since every fill sits under the ceiling. The patches get the full gain, and
     the still patch reads off how far the compensation at state B's load is off
-    from state A's. The boost eases its gain over its smoothing period after
-    each switch, so the patches settle a moment after the fill does. The
+    from state A's. The boost follows the panel's response, so the panel and the
+    gain move together and the patches settle a moment after the fill does. The
     fill's 10-bit code moves the raw load slightly, and just under the model's
     knee the boost turns that into a few percent of out load, so the out loads
     are approximate. The check reads true either way, since the boost follows
@@ -58,7 +65,7 @@
     brighter levels.
 
     The low end check runs with the boost off over 1% and 3% load. The model is
-    flat up to PANEL_COMP_FLAT_END, about 3.2%, so the middle patch holds still
+    flat up to PANEL_FLAT_END_LOAD, about 3.2%, so the middle patch holds still
     when the panel doesn't dim between them.
 
     Goes above the boost in the effect list. Writes scRGB when ReShade reports
@@ -75,12 +82,13 @@
 
 uniform int Test <
     ui_type = "combo";
-    ui_items = "Gray vs window at the peak (boost off)\0Gray vs red (boost off)\0Gray vs green (boost off)\0Gray vs blue (boost off)\0Gray vs pastel red (boost off)\0Panel latency (boost off)\0Out load 3% vs 6% (boost on)\0Out load 6% vs 10% (boost on)\0Out load 8% vs 12% (boost on)\0Out load 10% vs 25% (boost on)\0Out load 25% vs 50% (boost on)\0Out load 50% vs 80% (boost on)\0Bright window, 150 nit patches (boost on)\0Bright window, 150 nit patches (boost off)\0Shadow, 1 nit patches, out load 3% vs 50% (boost on)\0Low end, load 1% vs 3% (boost off)\0";
+    ui_items = "Gray vs window at the peak (boost off)\0Gray vs red (boost off)\0Gray vs green (boost off)\0Gray vs blue (boost off)\0Gray vs pastel red (boost off)\0Panel dimming, 0 to 320 ms (boost off)\0Panel undimming, 0 to 80 ms (boost off)\0Out load 3% vs 6% (boost on)\0Out load 6% vs 10% (boost on)\0Out load 8% vs 12% (boost on)\0Out load 10% vs 25% (boost on)\0Out load 25% vs 50% (boost on)\0Out load 50% vs 80% (boost on)\0Bright window, 150 nit patches (boost on)\0Bright window, 150 nit patches (boost off)\0Shadow, 1 nit patches, out load 3% vs 50% (boost on)\0Low end, load 1% vs 3% (boost off)\0";
     ui_label = "Test";
 > = 0;
 
 uniform int FrameCount < source = "framecount"; >;
 uniform float Timer < source = "timer"; >;
+uniform float FrameTime < source = "frametime"; >;
 
 
 static const float REFERENCE_PATCH_NITS = 60.0;
@@ -97,12 +105,13 @@ static const int   GRID_PATCHES = GRID_SIDE * GRID_SIDE;
 static const int   MODEL_CHECK_COUNT   = 5;
 static const int   PASTEL_CHECK        = 4;
 static const float MODEL_CHECK_LOAD    = 0.05;
-static const int   LATENCY_CHECK       = 5;
-static const int   FIRST_CURVE_CHECK   = 6;
-static const int   BRIGHT_WINDOW_CHECK = 12;
-static const int   BRIGHT_LOAD_CHECK   = 13;    // the bright window pattern with the boost off
-static const int   SHADOW_CHECK        = 14;
-static const int   LOW_END_CHECK       = 15;
+static const int   RESPONSE_CHECK      = 5;     // the dimming patches, after a switch from 3% to 10%
+static const int   UNDIM_CHECK         = 6;     // the undimming patches, after a switch from 10% to 3%
+static const int   FIRST_CURVE_CHECK   = 7;
+static const int   BRIGHT_WINDOW_CHECK = 13;
+static const int   BRIGHT_LOAD_CHECK   = 14;    // the bright window pattern with the boost off
+static const int   SHADOW_CHECK        = 15;
+static const int   LOW_END_CHECK       = 16;
 
 static const float BRIGHT_CHECK_LOAD  = 0.08;
 static const float BRIGHT_PATCH_NITS  = 150.0;
@@ -111,8 +120,14 @@ static const float BRIGHT_WINDOW_NITS = 900.0;
 static const float  SHADOW_PATCH_NITS      = 1.0;
 static const float2 LOW_END_CHECK_RAW_LOAD = float2(0.01, 0.03);
 
-static const float2 LATENCY_CHECK_RAW_LOAD = float2(0.03, 0.10);
-static const int    LATENCY_PATCH_COUNT    = 5;
+static const float2 RESPONSE_CHECK_RAW_LOAD = float2(0.03, 0.10);
+static const int    RESPONSE_PATCH_COUNT    = 5;
+
+// Panel response time constants of the response checks' patches, in milliseconds, from the left. The dimming check
+// varies the time constant toward a higher load and the undimming check the one toward a lower load, and the other
+// direction follows the model's.
+static const float RESPONSE_PATCH_MS[RESPONSE_PATCH_COUNT] = { 0.0, 40.0, 80.0, 160.0, 320.0 };
+static const float UNDIM_PATCH_MS[RESPONSE_PATCH_COUNT]    = { 0.0, 10.0, 20.0, 40.0, 80.0 };
 
 // Out loads of each curve check's two states.
 static const float2 CURVE_CHECK_OUT_LOAD[6] =
@@ -167,10 +182,40 @@ float3 EncodeRec2020Nits(float3 nits)
 #endif
 }
 
+float GrayLoadNits(float nits)
+{
+    return nits * PanelTrackingShare(nits);
+}
+
+// Invert the tracked load, in nits, instead of balancing signal energy. Tracking varies with the signal level.
+float GrayLevelForLoad(float loadNits)
+{
+    float nits = max(loadNits, 0.0);
+
+    [unroll]
+    for (int step = 0; step < 6; ++step)
+        nits = max(loadNits, 0.0) / max(PanelTrackingShare(nits), 1e-3);
+
+    return nits;
+}
+
 // The raw load the boost settles on an out load for, when everything on screen sits under the ceiling.
 float RawLoadForOutLoad(float outLoad)
 {
-    return outLoad / PanelCompensation(100.0 * outLoad);
+    float sentNits = GrayLevelForLoad(outLoad * PANEL_LOAD_PEAK_NITS);
+    float sourceNits = sentNits / EvaluatePanelCompensation(100.0 * outLoad);
+    return GrayLoadNits(sourceNits) / PANEL_LOAD_PEAK_NITS;
+}
+
+float ColorLevelForLoad(float3 color, float loadNits)
+{
+    float level = loadNits / max(PanelLoadNitsFromRec2020(color), 1e-3);
+
+    [unroll]
+    for (int step = 0; step < 6; ++step)
+        level *= loadNits / max(PanelLoadNitsFromRec2020(color * level), 1e-3);
+
+    return level;
 }
 
 
@@ -208,13 +253,13 @@ bool InsideSquare(int2 pixel, int2 center, int halfSide)
     return all(offset >= -halfSide) && all(offset < halfSide);
 }
 
-// Load light of a gray square, its brightest channel times its pixels.
-float SquareLight(float nits, int halfSide)
+// Tracked load of a gray square, in nit-pixels.
+float SquareLoad(float nits, int halfSide)
 {
-    return nits * 4.0 * halfSide * halfSide;
+    return GrayLoadNits(nits) * 4.0 * halfSide * halfSide;
 }
 
-float ScreenLight(float rawLoad)
+float ScreenLoad(float rawLoad)
 {
     return rawLoad * PANEL_LOAD_PEAK_NITS * BUFFER_WIDTH * BUFFER_HEIGHT;
 }
@@ -232,10 +277,10 @@ float PatchNits()
     return (Test == SHADOW_CHECK) ? SHADOW_PATCH_NITS : REFERENCE_PATCH_NITS;
 }
 
-// The panel dims a frame for the load of the frame before it, so the patches change a frame after the load does.
+// The boost follows the panel's response, so both change on the same frame.
 bool GridInStateB()
 {
-    return IsStateB(FrameCount - 1);
+    return IsStateB(FrameCount);
 }
 
 // GRID_STEP per patch in reading order, away from the middle patch.
@@ -250,14 +295,14 @@ int2 GridPatchCenter(int patch)
     return int2(BUFFER_WIDTH, BUFFER_HEIGHT) / 2 + cell * 3 * PatchHalfSide();
 }
 
-float GridLight()
+float GridLoad()
 {
     bool stateB = GridInStateB();
     float light = 0.0;
 
     [unroll]
     for (int patch = 0; patch < GRID_PATCHES; ++patch)
-        light += SquareLight(PatchNits() * GridFactor(patch, stateB), PatchHalfSide());
+        light += SquareLoad(PatchNits() * GridFactor(patch, stateB), PatchHalfSide());
 
     return light;
 }
@@ -277,10 +322,10 @@ float3 GridNits(int2 pixel)
     return nits.xxx;
 }
 
-// Light the load area carries for a raw load, with the grid's share taken out.
-float LoadLight(float rawLoad)
+// Load the area outside the grid carries, with the grid's tracked share taken out.
+float LoadAreaLoad(float rawLoad)
 {
-    return ScreenLight(rawLoad) - GridLight();
+    return ScreenLoad(rawLoad) - GridLoad();
 }
 
 float LoadPixels()
@@ -291,28 +336,29 @@ float LoadPixels()
 
 float FillNits(float rawLoad)
 {
-    return LoadLight(rawLoad) / LoadPixels();
+    return GrayLevelForLoad(LoadAreaLoad(rawLoad) / LoadPixels());
 }
 
 // The model check's light gathered into one square at the panel peak, left of the gap, against a gray fill of the
 // same light. The square's side rounds up, so the square holds that light at or under the peak.
 float3 WindowCheckNits(int2 pixel, bool stateB)
 {
-    float light = LoadLight(MODEL_CHECK_LOAD);
-    int halfSide = int(ceil(0.5 * sqrt(light / PANEL_SIGNAL_PEAK_NITS)));
-    float windowNits = light / (4.0 * halfSide * halfSide);
+    float load = LoadAreaLoad(MODEL_CHECK_LOAD);
+    int halfSide = int(ceil(0.5 * sqrt(load / GrayLoadNits(PANEL_SIGNAL_PEAK_NITS))));
+    float windowNits = GrayLevelForLoad(load / (4.0 * halfSide * halfSide));
 
     bool inWindow = InsideSquare(pixel, int2(BUFFER_WIDTH / 5, BUFFER_HEIGHT / 2), halfSide);
     return stateB ? (inWindow ? windowNits.xxx : 0.0.xxx) : FillNits(MODEL_CHECK_LOAD).xxx;
 }
 
-// Each color's brightest channel sits at the gray's level, so it loads the panel like the gray when the model is right.
+// Each color carries the gray's tracked load, evaluated at its actual level.
 float3 ColorCheckNits(bool stateB)
 {
     float grayNits = FillNits(MODEL_CHECK_LOAD);
     bool pastel = Test == PASTEL_CHECK;
     float3 color = pastel ? float3(1.0, 0.5, 0.5) : float3(Test == 1 ? 1.0 : 0.0, Test == 2 ? 1.0 : 0.0, Test == 3 ? 1.0 : 0.0);
-    return stateB ? color * grayNits : grayNits.xxx;
+    float levelNits = ColorLevelForLoad(color, GrayLoadNits(grayNits));
+    return stateB ? color * levelNits : grayNits.xxx;
 }
 
 // Raw loads of the two states of a check that fills the load area with gray.
@@ -337,14 +383,15 @@ float3 FillCheckNits(bool stateB)
 // Half the load's light gathered into one bright square left of the gap, with the rest spread over the fill.
 float3 BrightWindowCheckNits(int2 pixel, bool stateB)
 {
-    float light = LoadLight(BRIGHT_CHECK_LOAD);
-    int halfSide = int(round(0.5 * sqrt(0.5 * light / BRIGHT_WINDOW_NITS)));
+    float load = LoadAreaLoad(BRIGHT_CHECK_LOAD);
+    int halfSide = int(round(0.5 * sqrt(0.5 * load / GrayLoadNits(BRIGHT_WINDOW_NITS))));
     float windowPixels = 4.0 * halfSide * halfSide;
     bool inWindow = InsideSquare(pixel, int2(BUFFER_WIDTH / 5, BUFFER_HEIGHT / 2), halfSide);
 
     float nits = FillNits(BRIGHT_CHECK_LOAD);
     if (stateB)
-        nits = inWindow ? BRIGHT_WINDOW_NITS : (light - BRIGHT_WINDOW_NITS * windowPixels) / (LoadPixels() - windowPixels);
+        nits = inWindow ? BRIGHT_WINDOW_NITS
+            : GrayLevelForLoad((load - GrayLoadNits(BRIGHT_WINDOW_NITS) * windowPixels) / (LoadPixels() - windowPixels));
 
     return nits.xxx;
 }
@@ -367,7 +414,26 @@ float3 PatchCheckNits(int2 pixel, bool stateB)
     return nits;
 }
 
-float3 LatencyCheckNits(int2 pixel)
+// The load the panel sits at, filtered through time constants toward a higher and a lower load, from the switch
+// history.
+float FilteredCheckLoad(float dimMs, float undimMs)
+{
+    int framesBack = clamp(int(1000.0 / max(FrameTime, 1.0) + 0.5), 16, 240);
+    float dimAlpha = (dimMs > 0.0) ? 1.0 - exp(-FrameTime / dimMs) : 1.0;
+    float undimAlpha = (undimMs > 0.0) ? 1.0 - exp(-FrameTime / undimMs) : 1.0;
+    float load = 100.0 * (IsStateB(FrameCount - framesBack) ? RESPONSE_CHECK_RAW_LOAD.y : RESPONSE_CHECK_RAW_LOAD.x);
+
+    [loop]
+    for (int frame = framesBack - 1; frame >= 0; --frame)
+    {
+        float instant = 100.0 * (IsStateB(FrameCount - frame) ? RESPONSE_CHECK_RAW_LOAD.y : RESPONSE_CHECK_RAW_LOAD.x);
+        load += ((instant > load) ? dimAlpha : undimAlpha) * (instant - load);
+    }
+
+    return load;
+}
+
+float3 ResponseCheckNits(int2 pixel)
 {
     bool stateB = IsStateB(FrameCount);
     int2 center = int2(BUFFER_WIDTH, BUFFER_HEIGHT) / 2;
@@ -378,23 +444,23 @@ float3 LatencyCheckNits(int2 pixel)
     float patchNits = -1.0;
 
     [unroll]
-    for (int framesBack = 0; framesBack < LATENCY_PATCH_COUNT; ++framesBack)
+    for (int patch = 0; patch < RESPONSE_PATCH_COUNT; ++patch)
     {
-        float2 rawLoad = LATENCY_CHECK_RAW_LOAD;
-        float loadPercent = 100.0 * (IsStateB(FrameCount - framesBack) ? rawLoad.y : rawLoad.x);
-        float levelNits = REFERENCE_PATCH_NITS * PanelCompensation(loadPercent);
-        int2 patchCenter = int2((framesBack + 1) * BUFFER_WIDTH / (LATENCY_PATCH_COUNT + 1), center.y);
-        patchLight += SquareLight(levelNits, patchHalf);
+        float dimMs = (Test == UNDIM_CHECK) ? 1000.0 * PANEL_DIM_SECONDS : RESPONSE_PATCH_MS[patch];
+        float undimMs = (Test == UNDIM_CHECK) ? UNDIM_PATCH_MS[patch] : 1000.0 * PANEL_UNDIM_SECONDS;
+        float levelNits = REFERENCE_PATCH_NITS * EvaluatePanelCompensation(FilteredCheckLoad(dimMs, undimMs));
+        int2 patchCenter = int2((patch + 1) * BUFFER_WIDTH / (RESPONSE_PATCH_COUNT + 1), center.y);
+        patchLight += SquareLoad(levelNits, patchHalf);
 
         if (InsideSquare(pixel, patchCenter, patchHalf))
             patchNits = levelNits;
     }
 
-    float rawLoad = stateB ? LATENCY_CHECK_RAW_LOAD.y : LATENCY_CHECK_RAW_LOAD.x;
+    float rawLoad = stateB ? RESPONSE_CHECK_RAW_LOAD.y : RESPONSE_CHECK_RAW_LOAD.x;
     float fillPixels = BUFFER_WIDTH * (BUFFER_HEIGHT - 2.0 * bandHalf);
     int bandOffset = pixel.y - center.y;
 
-    float nits = (ScreenLight(rawLoad) - patchLight) / fillPixels;
+    float nits = GrayLevelForLoad((ScreenLoad(rawLoad) - patchLight) / fillPixels);
     if (patchNits >= 0.0)
         nits = patchNits;
     else if (bandOffset >= -bandHalf && bandOffset < bandHalf)
@@ -407,7 +473,8 @@ float3 LatencyCheckNits(int2 pixel)
 float4 PS_NullTest(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
 {
     int2 pixel = int2(position.xy);
-    float3 nits = (Test == LATENCY_CHECK) ? LatencyCheckNits(pixel) : PatchCheckNits(pixel, IsStateB(FrameCount));
+    bool responseCheck = Test == RESPONSE_CHECK || Test == UNDIM_CHECK;
+    float3 nits = responseCheck ? ResponseCheckNits(pixel) : PatchCheckNits(pixel, IsStateB(FrameCount));
     return float4(EncodeRec2020Nits(nits), 1.0);
 }
 

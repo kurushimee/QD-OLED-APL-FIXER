@@ -1,7 +1,8 @@
 // Runs the DWM hook's boost pipeline on a saved HDR frame, as if the frame stayed on screen until the gain settles,
 // and writes the boosted frame. Input and output are 16-bit PQ BT.2020 PNGs like ReShade's HDR screenshots.
 //
-//   RenderFrame <source.png> <boosted.png>
+//   RenderFrame <source.png> <boosted.png> [--from previous.png]
+// With --from, settle on the previous frame and write only the first output after switching to the source.
 
 #include "pipeline.h"
 
@@ -14,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cwchar>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -273,7 +275,8 @@ int SettleFrames(const std::vector<float>& gains)
 double Wobble(const std::vector<float>& gains)
 {
     double wobble = 0.0;
-    for (size_t i = gains.size() - WOBBLE_FRAMES; i < gains.size(); ++i)
+    const size_t first = gains.size() > WOBBLE_FRAMES ? gains.size() - WOBBLE_FRAMES : 0;
+    for (size_t i = first; i < gains.size(); ++i)
         wobble = std::max(wobble, RelativeGap(gains[i], gains.back()));
     return wobble;
 }
@@ -332,7 +335,7 @@ double TimeGpu(ID3D11Device* dev, ID3D11DeviceContext* ctx, Work work)
     return best;
 }
 
-int Run(const wchar_t* sourcePath, const wchar_t* outputPath)
+int Run(const wchar_t* sourcePath, const wchar_t* outputPath, const wchar_t* previousPath)
 {
     ComPtr<IWICImagingFactory> wic;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))))
@@ -371,17 +374,35 @@ int Run(const wchar_t* sourcePath, const wchar_t* outputPath)
     // keeps DWM composing, and some more to see how far the gain still moves.
     const float frameMs = RefreshMs();
     const int frames = SETTLE_RUNS + int(std::ceil(SETTLE_SECONDS * 1000.0 / frameMs)) + WOBBLE_FRAMES;
-    std::vector<float> gains;
-    for (int frame = 0; frame < frames; ++frame)
+    if (previousPath)
     {
-        pipe.Run(ctx.Get(), rtv.Get(), frame == 0, 1.0f, frameMs);
+        Image previous;
+        if (!LoadPng(wic.Get(), previousPath, previous) || previous.width != source.width || previous.height != source.height)
+        {
+            fwprintf(stderr, L"cannot read %s at the source's size\n", previousPath);
+            return 1;
+        }
+        std::vector<HALF> previousScRGB = ToScRGB(previous);
+        ctx->UpdateSubresource(pipe.clean.t, 0, nullptr, previousScRGB.data(), source.width * 8, 0);
+        for (int frame = 0; frame < frames; ++frame)
+            pipe.Run(ctx.Get(), rtv.Get(), frame == 0, 1.0f, frameMs);
+        ctx->UpdateSubresource(pipe.clean.t, 0, nullptr, scRGB.data(), source.width * 8, 0);
+    }
+
+    std::vector<float> gains;
+    const int outputFrames = previousPath ? 1 : frames;
+    for (int frame = 0; frame < outputFrames; ++frame)
+    {
+        pipe.Run(ctx.Get(), rtv.Get(), !previousPath && frame == 0, 1.0f, frameMs);
         gains.push_back(std::exp2(ReadBack<float>(dev.Get(), ctx.Get(), pipe.aplState.t, 4)[3]));
     }
 
-    // (smoothed mean PQ, out load, has history, log gain) and (raw load, full log gain, bend start nits, ceiling nits).
+    // (filtered load, content top PQ, has history, log gain), (raw, sent and panel load %, full log gain) and
+    // (bend start nits, ceiling nits, clipped share, whiteout blend).
     std::vector<float> state = ReadBack<float>(dev.Get(), ctx.Get(), pipe.aplState.t, 4);
-    double gpuMs = TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Run(ctx.Get(), rtv.Get(), false, 1.0f, frameMs); });
-    double solveMs = TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Solve(ctx.Get()); });
+    // Timing advances the state, so skip it when the requested output is the first transition frame.
+    double gpuMs = previousPath ? -1.0 : TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Run(ctx.Get(), rtv.Get(), false, 1.0f, frameMs); });
+    double solveMs = previousPath ? -1.0 : TimeGpu(dev.Get(), ctx.Get(), [&] { pipe.Solve(ctx.Get()); });
 
     Image boosted = FromScRGB(ReadBack<HALF>(dev.Get(), ctx.Get(), target.Get(), 4), source.width, source.height);
     if (!SavePng(wic.Get(), outputPath, boosted) || !CopyColorChunks(sourcePath, outputPath))
@@ -390,9 +411,10 @@ int Run(const wchar_t* sourcePath, const wchar_t* outputPath)
         return 1;
     }
 
-    wprintf(L"raw_load %.6f out_load %.6f gain %.6f full_gain %.6f knee_nits %.3f ceiling_nits %.3f settle_s %.3f wobble %.1e gpu_ms %.4f solve_ms %.4f\n",
-            state[4], state[1], std::exp2(state[3]), std::exp2(state[5]), state[6], state[7],
-            SettleFrames(gains) * frameMs / 1000.0, Wobble(gains), gpuMs, solveMs);
+    wprintf(L"raw_load %.6f out_load %.6f panel_load %.6f gain %.6f full_gain %.6f knee_nits %.3f ceiling_nits %.3f "
+            L"clipped %.4f whiteout %.4f settle_s %.3f wobble %.1e gpu_ms %.4f solve_ms %.4f\n",
+            state[4], state[5], state[6], std::exp2(state[3]), std::exp2(state[7]), state[8], state[9],
+            state[10], state[11], SettleFrames(gains) * frameMs / 1000.0, Wobble(gains), gpuMs, solveMs);
     return 0;
 }
 
@@ -400,16 +422,16 @@ int Run(const wchar_t* sourcePath, const wchar_t* outputPath)
 
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc != 3)
+    if (argc != 3 && !(argc == 5 && std::wcscmp(argv[3], L"--from") == 0))
     {
-        fwprintf(stderr, L"usage: RenderFrame <source.png> <boosted.png>\n");
+        fwprintf(stderr, L"usage: RenderFrame <source.png> <boosted.png> [--from previous.png]\n");
         return 2;
     }
 
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)))
         return 1;
 
-    int result = Run(argv[1], argv[2]);
+    int result = Run(argv[1], argv[2], argc == 5 ? argv[4] : nullptr);
     CoUninitialize();
     return result;
 }

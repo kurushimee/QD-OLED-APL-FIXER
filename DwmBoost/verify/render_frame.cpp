@@ -412,9 +412,9 @@ int Run(const wchar_t* sourcePath, const wchar_t* outputPath, const wchar_t* pre
     }
 
     wprintf(L"raw_load %.6f out_load %.6f panel_load %.6f gain %.6f full_gain %.6f knee_nits %.3f ceiling_nits %.3f "
-            L"clipped %.4f whiteout %.4f settle_s %.3f wobble %.1e gpu_ms %.4f solve_ms %.4f\n",
+            L"clipped %.4f whiteout %.4f settle_s %.3f wobble %.1e gpu_ms %.4f solve_ms %.4f frame_ms %.6f\n",
             state[4], state[5], state[6], std::exp2(state[3]), std::exp2(state[7]), state[8], state[9],
-            state[10], state[11], SettleFrames(gains) * frameMs / 1000.0, Wobble(gains), gpuMs, solveMs);
+            state[10], state[11], SettleFrames(gains) * frameMs / 1000.0, Wobble(gains), gpuMs, solveMs, frameMs);
     return 0;
 }
 

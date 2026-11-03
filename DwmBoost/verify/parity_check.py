@@ -24,6 +24,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "Shaders" / "verify"))
 import fit_panel_model as model_fit
+from eotf_check import PANEL
 
 PIPELINE_SOURCE = ROOT / "DwmBoost" / "hook" / "pipeline.h"
 CORE_SOURCE = ROOT / "Shaders" / "EOTF_BoostCore_27M2N6500.fxh"
@@ -362,27 +363,43 @@ def check_wide_histogram(folder):
 
 
 def check_tab_release(folder):
+    # First-frame parity in both directions with identical static patches and frame times.
+    # Patch luminance is replayed under the configured response, not claimed as physical panel verification.
     failures = 0
-    source = folder / "black_tab.png"
-    # The boost-off shader round-trips through the same FP16 input/output as the hook. This reference contains no
-    # temporal panel model, so a shared release-time assumption cannot hide residual first-frame compensation.
     for dark_nits in (0.0, 1.0):
-        dark = blank(dark_nits)
-        dark[200:260, 40:100] = 60.0
-        dark[280:340, 40:100] = 150.0
-        write_frame(source, dark)
-        reference = effect_codes(source, "scrgb", folder / "black_tab_reference.png", "EnableEOTFBoost=0")
-        for nits in (203.0, 1000.0):
-            previous = folder / "white_tab.png"
-            write_frame(previous, blank(nits))
-            output = folder / "black_tab_first.png"
-            stats = run([RENDER_FRAME, source, output, "--from", previous]).split()
-            stats = {key: float(value) for key, value in zip(stats[::2], stats[1::2])}
-            changed = float(np.any(read_codes(output) != reference, axis=2).mean())
-            ok = stats["gain"] == 1.0 and changed == 0.0
-            failures += not ok
-            print(f"{'ok  ' if ok else 'FAIL'} {nits:.0f} to {dark_nits:.0f} nit tab through DWM: first-frame gain "
-                  f"{stats['gain']:.6f}, {100.0 * changed:.3f}% of pixels changed")
+        for white_nits in (203.0, 1000.0):
+            dark, white = blank(dark_nits), blank(white_nits)
+            for frame in (dark, white):
+                frame[200:260, 40:100] = 60.0
+                frame[280:340, 40:100] = 150.0
+            for direction, before, after in (("release", white, dark), ("attack", dark, white)):
+                previous, source = folder / "previous_tab.png", folder / "next_tab.png"
+                output = folder / "tab_hook.png"
+                write_frame(previous, before)
+                write_frame(source, after)
+                previous_output = hook_codes(previous, folder / "previous_hook.png")
+                stats = run([RENDER_FRAME, source, output, "--from", previous]).split()
+                stats = {key: float(value) for key, value in zip(stats[::2], stats[1::2])}
+                shader_output = folder / "tab_shader.png"
+                run([RENDER_EFFECT, SHADER_SOURCE, "scrgb", source, shader_output,
+                     "--from", previous, "--frame-ms", stats["frame_ms"], "--frames", 1])
+                hook = read_codes(output)
+                shader = read_codes(folder / "tab_shader_0000.png")
+                parity = float(mismatch(hook, shader).max())
+                previous_nits = pq_to_nits(previous_output / 1023.0)
+                sent_nits = pq_to_nits(hook / 1023.0)
+                load = PANEL.panel_loads([sent_nits], PANEL.frame_load_percent(previous_nits), stats["frame_ms"])[0]
+                shown = sent_nits / PANEL.compensation(load)
+                source_nits = pq_to_nits(read_codes(source) / 1023.0)
+                errors = []
+                for top in (200, 280):
+                    patch = np.s_[top:top + 60, 40:100]
+                    errors.append(float(np.abs(nits_to_pq(shown[patch]) - nits_to_pq(source_nits[patch])).mean() * 1023.0))
+                worst = max(errors)
+                ok = parity < 1.0 and worst <= MAX_DIFF_CODES
+                failures += not ok
+                print(f"{'ok  ' if ok else 'FAIL'} {white_nits:.0f}/{dark_nits:.0f} nit tab {direction}: "
+                      f"first-frame gain {stats['gain']:.6f}, patches {worst:.3f} codes, parity {parity:.2f}")
     return failures
 
 

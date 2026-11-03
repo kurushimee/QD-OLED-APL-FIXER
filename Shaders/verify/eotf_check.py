@@ -6,7 +6,7 @@ Usage:
 
 Frames are 16-bit PQ BT.2020 PNGs, like RenderEffect's input and output. The panel shows each pixel's sent level over
 the compensation at its filtered load: the frame mean of each pixel's brightest weighted subpixel drive in the panel's
-native primaries, with assumed slow dimming and immediate release on a lower load. A single
+native primaries, with feedback-tuned attack and release times. A single
 frame is replayed at its steady state, its own load. The panel's static tracking only enters the load, since the boost
 doesn't change it.
 
@@ -14,7 +14,7 @@ doesn't change it.
     static       nothing sent past the signal peak, the curve rises, a dim frame shows exact, the overlays stay under
                  the peak
     temporal     fixed patches stay within a quarter code of target on every frame after a load change
-    tab switch   a white-to-black cut leaves no residual boost on the very first dark frame, including a quick return
+    tab switch   fixed patches track the configured response on both sides of white/black cuts and a quick return
     frame rate   the same change at 60 and 240 fps shows the same at the same moments
     midtones     a bright highlight at 5 to 20% coverage leaves the patches exact
     outlier      one 4000 nit pixel moves no other level by more than half a code
@@ -470,31 +470,26 @@ def check_midtones(renderer):
 
 
 def check_tab_release(renderer):
-    # Deliberately independent of PANEL.undim_seconds: test against immediate physical ABL release. Both dark
-    # frames' sent loads remain below the flat end even with the old residual boost, so their compensation is 1.
-    # Replaying the shader's own release time here would hide a hardware/model timing mismatch.
+    # Software consistency with the configured response, not a measurement of physical panel timing.
+    # Include the bright return: checking dark frames alone missed undercompensation on rising load.
     failures = []
     for rate, frame_ms in FRAME_MS.items():
         for dark_nits in (0.0, 1.0):
             dark = scene(dark_nits)
-            _, reference = renderer.settled(dark, "dark_reference", "EnableEOTFBoost=0")
             for white_nits in (203.0, 1000.0):
                 white = scene(white_nits)
-                steps = [(dark, 2), (white, 1), (dark, 2)]
-                outputs = renderer.sequence(white, steps, frame_ms, f"tab_release_{rate}_{white_nits:.0f}_{dark_nits:.0f}")
-                for index in (0, 1, 3, 4):
-                    output = outputs[index]
-                    sent_load = PANEL.frame_load_percent(output)
-                    if sent_load >= PANEL.curve[0]:
-                        failures.append(f"tab release fixture exceeds the flat load: {sent_load:.4f}%")
-                    worst = worst_patch_error(patch_errors_codes(output, 0.0, renderer.space))
-                    unchanged = np.array_equal(output, reference)
-                    ok = worst <= PATCH_TOLERANCE_CODES and unchanged
-                    print(f"{'ok  ' if ok else 'FAIL'} {white_nits:.0f} to {dark_nits:.0f} nit tab at {rate}, "
-                          f"dark frame {index}: {worst:.3f} codes off, unchanged={unchanged}")
-                    if not ok:
-                        failures.append(f"{white_nits:.0f} to {dark_nits:.0f} nit tab at {rate}, dark frame {index}: "
-                                        f"residual boost {worst:.3f} codes, unchanged={unchanged}")
+                for direction, previous, steps in (
+                        ("release", white, [(dark, 2), (white, 1), (dark, 2)]),
+                        ("attack", dark, [(white, 2), (dark, 1), (white, 2)])):
+                    label = f"tab_{direction}_{rate}_{white_nits:.0f}_{dark_nits:.0f}"
+                    errors = replay_sequence(renderer, previous, steps, frame_ms, label)
+                    for index, error in enumerate(errors):
+                        worst = worst_patch_error(error)
+                        ok = worst <= PATCH_TOLERANCE_CODES
+                        print(f"{'ok  ' if ok else 'FAIL'} {white_nits:.0f}/{dark_nits:.0f} nit tab {direction} "
+                              f"at {rate}, frame {index}: {worst:.3f} codes off under configured response")
+                        if not ok:
+                            failures.append(f"{label}, frame {index}: patches {worst:.3f} codes off")
     return failures
 
 

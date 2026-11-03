@@ -35,9 +35,9 @@
     check varies the one toward the lower load, an instant load, then 10, 20,
     40 and 80 ms, and reads at the switch to 3%. The panel dims every patch
     alike, so the patch whose time constant matches the panel's own holds
-    still through its switch. The boost's dimming, 80 ms, shows as the middle
-    patch of the dimming check. The boost now releases immediately, matching
-    the leftmost patch of the undimming check.
+    still through its switch. The boost's 20 ms attack falls between the instant
+    and 40 ms patches of the dimming check. Its 7.5 ms release falls between the
+    instant and 10 ms patches of the undimming check; both times are feedback-tuned.
 
     Curve checks run with the boost on. Each state's raw load is the one the
     boost settles on the named out load for, with the signal divided by its
